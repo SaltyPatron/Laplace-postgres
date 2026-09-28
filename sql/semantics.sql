@@ -1,24 +1,22 @@
--- Laplace semantics schema (experimental, for measuring; not specification).
--- Claims are tuples of entities with their own content IDs. Every attestation is kept in an append-only ledger; a
--- claim's standing is maintained as attestations arrive. Observations (counts) and a witness's own order of senses sit
--- beside a claim, never inside its standing.
-CREATE TABLE IF NOT EXISTS claim (
-  id uuid PRIMARY KEY, subject uuid NOT NULL, predicate uuid NOT NULL, object uuid NOT NULL);
-CREATE INDEX IF NOT EXISTS claim_subject ON claim (subject, predicate);
-CREATE INDEX IF NOT EXISTS claim_object ON claim (object, predicate);
-
-CREATE TABLE IF NOT EXISTS witness (                       -- a witness is an entity (its name is content)
-  id uuid PRIMARY KEY, name text NOT NULL, lineage uuid NOT NULL, trust real NOT NULL, kind text NOT NULL);
-
-CREATE TABLE IF NOT EXISTS attestation (                   -- the ledger: every matchup, in order, never updated
-  seq bigint GENERATED ALWAYS AS IDENTITY, claim uuid NOT NULL, witness uuid NOT NULL,
-  condition uuid,                                          -- an entity naming the conditions (a model component, a template)
-  score real NOT NULL, z real) ;
-CREATE INDEX IF NOT EXISTS attestation_claim ON attestation (claim);
-CREATE INDEX IF NOT EXISTS attestation_witness ON attestation (witness);
-
-CREATE TABLE IF NOT EXISTS standing (
-  claim uuid PRIMARY KEY, rating real NOT NULL, deviation real NOT NULL, volatility real NOT NULL,
-  matches int NOT NULL, witnesses uuid[] NOT NULL) WITH (fillfactor = 80);
-CREATE TABLE IF NOT EXISTS occurrence (claim uuid NOT NULL, witness uuid NOT NULL, count bigint NOT NULL, PRIMARY KEY (claim, witness));
-CREATE TABLE IF NOT EXISTS ordinal (claim uuid NOT NULL, witness uuid NOT NULL, position int NOT NULL, PRIMARY KEY (claim, witness));
+-- Laplace semantics schema.
+-- A claim is a composition: an entity with a physicality path of the entities it relates, hashed like any path, so it
+-- lives in entity and physicality with all other content and GIN finds every claim that touches an entity. What sits
+-- here is only what is not content: who witnessed, how much they are trusted, every attestation in the order it was
+-- read, and each claim's Glicko-2 standing after its matchups.
+CREATE TABLE IF NOT EXISTS witness (
+  id       uuid PRIMARY KEY,                     -- an entity: the source's trunk, or any entity that testifies
+  lineage  uuid,                                 -- the witness it derives from, so copies are not independent
+  trust    double precision NOT NULL             -- -1 .. 1: MANDATE is 1, no information 0, reliably wrong -1
+);
+CREATE TABLE IF NOT EXISTS attestation (         -- the ledger: append-only, in reading order
+  claim    uuid NOT NULL,
+  witness  uuid NOT NULL,
+  score    real NOT NULL                         -- win 1, draw 0.5, loss 0, or a score between
+);
+CREATE TABLE IF NOT EXISTS standing (            -- updated in place as matchups are played
+  claim       uuid PRIMARY KEY,
+  rating      double precision NOT NULL,
+  deviation   double precision NOT NULL,
+  volatility  double precision NOT NULL,
+  matches     integer NOT NULL
+) WITH (fillfactor = 80);
