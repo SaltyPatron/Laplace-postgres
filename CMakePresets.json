@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "configurePresets": [
+    { "name": "icx-release", "generator": "Ninja", "binaryDir": "/repos/build/Laplace-postgres/icx-release",
+      "cacheVariables": { "CMAKE_C_COMPILER": "icx", "CMAKE_CXX_COMPILER": "icpx", "CMAKE_BUILD_TYPE": "RelWithDebInfo" } }
+  ],
+  "buildPresets": [ { "name": "icx-release", "configurePreset": "icx-release" } ]
+}
