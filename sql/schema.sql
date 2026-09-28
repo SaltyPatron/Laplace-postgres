@@ -30,26 +30,32 @@ CREATE TABLE source (
   content  bytea  NOT NULL                       -- BLAKE3-256 of the source bytes
 );
 
+-- Every tier is split 16 ways by the first hex digit of the ID: an ID is a hash, so every part fills evenly, a lookup
+-- by ID prunes to one partition, and a load writes every part on its own connection. Tiers deeper than 15 share the
+-- default partition, split the same way.
 DO $$
-DECLARE t int; k int; lo text; hi text; big int[] := ARRAY[0, 2, 3];
+DECLARE t int; k int; lo text; hi text;
 BEGIN
-  FOR t IN 0..5 LOOP
-    IF t = ANY (big) THEN
+  FOR t IN 0..16 LOOP
+    IF t < 16 THEN
       EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s) PARTITION BY RANGE (id)', t, t);
       EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s) PARTITION BY RANGE (entity)', t, t);
-      FOR k IN 0..15 LOOP                        -- the first hex digit of the ID
-        lo := CASE WHEN k = 0 THEN 'MINVALUE' ELSE quote_literal(to_hex(k) || '0000000-0000-0000-0000-000000000000') END;
-        hi := CASE WHEN k = 15 THEN 'MAXVALUE' ELSE quote_literal(to_hex(k + 1) || '0000000-0000-0000-0000-000000000000') END;
+    ELSE
+      CREATE TABLE entity_tx PARTITION OF entity DEFAULT PARTITION BY RANGE (id);
+      CREATE TABLE physicality_tx PARTITION OF physicality DEFAULT PARTITION BY RANGE (entity);
+    END IF;
+    FOR k IN 0..15 LOOP                          -- the first hex digit of the ID
+      lo := CASE WHEN k = 0 THEN 'MINVALUE' ELSE quote_literal(to_hex(k) || '0000000-0000-0000-0000-000000000000') END;
+      hi := CASE WHEN k = 15 THEN 'MAXVALUE' ELSE quote_literal(to_hex(k + 1) || '0000000-0000-0000-0000-000000000000') END;
+      IF t < 16 THEN
         EXECUTE format('CREATE TABLE entity_t%s_%s PARTITION OF entity_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
         EXECUTE format('CREATE TABLE physicality_t%s_%s PARTITION OF physicality_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
-      END LOOP;
-    ELSE
-      EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s)', t, t);
-      EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s)', t, t);
-    END IF;
+      ELSE
+        EXECUTE format('CREATE TABLE entity_tx_%s PARTITION OF entity_tx FOR VALUES FROM (%s) TO (%s)', to_hex(k), lo, hi);
+        EXECUTE format('CREATE TABLE physicality_tx_%s PARTITION OF physicality_tx FOR VALUES FROM (%s) TO (%s)', to_hex(k), lo, hi);
+      END IF;
+    END LOOP;
   END LOOP;
-  CREATE TABLE entity_tx PARTITION OF entity DEFAULT;
-  CREATE TABLE physicality_tx PARTITION OF physicality DEFAULT;
 END $$;
 
 -- A path's X/Y/Z are packed IDs, not positions, so PostGIS's geometry statistics mean nothing for them and cost minutes
