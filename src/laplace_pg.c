@@ -227,37 +227,6 @@ Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
     PG_RETURN_BYTEA_P(b);
 }
 
-/* ---------------------------------------------------------------- paths as arrays (for comparing storage layouts) */
-PG_FUNCTION_INFO_V1(laplace_path_ids);
-Datum laplace_path_ids(PG_FUNCTION_ARGS){                 /* the path's vertices in order, runs not expanded */
-    Geo g = geo_of(PG_GETARG_DATUM(0)); lp_id *ids = palloc(sizeof(lp_id) * (g.n ? g.n : 1));
-    for (uint32 i = 0; i < g.n; i++) lp_xyz_to_id(g.xyzm + 4 * i, &ids[i]);
-    PG_RETURN_ARRAYTYPE_P(uuid_array(ids, (int)g.n));
-}
-PG_FUNCTION_INFO_V1(laplace_path_runs);
-Datum laplace_path_runs(PG_FUNCTION_ARGS){
-    Geo g = geo_of(PG_GETARG_DATUM(0)); Datum *d = palloc(sizeof(Datum) * (g.n ? g.n : 1));
-    for (uint32 i = 0; i < g.n; i++) d[i] = Int32GetDatum((int32)(g.xyzm[4 * i + 3] < 1 ? 1 : g.xyzm[4 * i + 3]));
-    PG_RETURN_ARRAYTYPE_P(construct_array(d, (int)g.n, INT4OID, 4, true, TYPALIGN_INT));
-}
-/* Continuations over an array path: the phrase matched against the IDs expanded by their runs. */
-PG_FUNCTION_INFO_V1(laplace_follows_ids);
-Datum laplace_follows_ids(PG_FUNCTION_ARGS){
-    int n, np; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n), *ph = ids_of(PG_GETARG_ARRAYTYPE_P(2), &np);
-    ArrayType *ra = PG_GETARG_ARRAYTYPE_P(1); int32 *runs = (int32 *)ARR_DATA_PTR(ra);
-    int total = 0; for (int i = 0; i < n; i++) total += runs[i];
-    int *seq = palloc(sizeof(int) * (total + 1)), t = 0;
-    for (int i = 0; i < n; i++) for (int r = 0; r < runs[i]; r++) seq[t++] = i;
-    lp_id *out = palloc(sizeof(lp_id) * (total + 1)); int k = 0;
-    for (int s0 = 0; s0 + np < total; s0++) {
-        if (memcmp(&ids[seq[s0]], &ph[0], 16)) continue;
-        int j = 1; while (j < np && !memcmp(&ids[seq[s0 + j]], &ph[j], 16)) j++;
-        if (j == np) out[k++] = ids[seq[s0 + np]];
-    }
-    if (!k) PG_RETURN_NULL();
-    PG_RETURN_ARRAYTYPE_P(uuid_array(out, k));
-}
-
 /* ---------------------------------------------------------------- recomposition: an entity back to its text */
 /* Atoms: tier-0 IDs to codepoints, an open-addressed table built once per backend from the perf-cache. */
 static uint32 *atom_slot; static const uint32 ATOM_CAP = 1u << 22;          /* holds codepoint + 1; 0 is empty */
