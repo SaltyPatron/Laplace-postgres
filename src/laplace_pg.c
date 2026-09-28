@@ -343,3 +343,31 @@ PG_FUNCTION_INFO_V1(laplace_path_contains);
 Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
 PG_FUNCTION_INFO_V1(laplace_path_overlaps);
 Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
+
+/* How many times a path holds each of the given IDs, runs included: one pass over the path, a binary search per vertex.
+ * Returns only the IDs it holds. */
+#include "funcapi.h"
+PG_FUNCTION_INFO_V1(laplace_path_times);
+Datum laplace_path_times(PG_FUNCTION_ARGS){
+    FuncCallContext *fx;
+    typedef struct { lp_id *id; int64 *times; int n, i; } State;
+    if (SRF_IS_FIRSTCALL()) {
+        fx = SRF_FIRSTCALL_INIT(); MemoryContext old = MemoryContextSwitchTo(fx->multi_call_memory_ctx);
+        Geo g = geo_of(PG_GETARG_DATUM(0)); int k; lp_id *q = ids_of(PG_GETARG_ARRAYTYPE_P(1), &k);
+        qsort(q, k, 16, cmp_id); int m = 0; for (int i = 0; i < k; i++) if (!m || memcmp(&q[i], &q[m - 1], 16)) q[m++] = q[i];
+        int64 *t = palloc0(sizeof(int64) * (m ? m : 1)); lp_id v;
+        for (uint32 i = 0; i < g.n; i++) {
+            lp_xyz_to_id(g.xyzm + 4 * i, &v); lp_id *hit = bsearch(&v, q, m, 16, cmp_id);
+            if (hit) t[hit - q] += g.xyzm[4 * i + 3] < 1 ? 1 : (int64)g.xyzm[4 * i + 3];
+        }
+        State *s = palloc(sizeof(State)); s->id = q; s->times = t; s->n = m; s->i = 0; fx->user_fctx = s;
+        TupleDesc td; if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("laplace_path_times: composite result expected")));
+        fx->tuple_desc = BlessTupleDesc(td);
+        MemoryContextSwitchTo(old);
+    }
+    fx = SRF_PERCALL_SETUP(); State *s = fx->user_fctx;
+    while (s->i < s->n && !s->times[s->i]) s->i++;
+    if (s->i >= s->n) SRF_RETURN_DONE(fx);
+    Datum v[2]; bool nl[2] = { false, false }; v[0] = uuid_datum(&s->id[s->i]); v[1] = Int64GetDatum(s->times[s->i]); s->i++;
+    SRF_RETURN_NEXT(fx, HeapTupleGetDatum(heap_form_tuple(fx->tuple_desc, v, nl)));
+}
