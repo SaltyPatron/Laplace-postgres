@@ -55,6 +55,14 @@ CREATE FUNCTION laplace_text_hilbert(text) RETURNS bigint
 CREATE FUNCTION laplace_cp_coord_ewkb(integer) RETURNS bytea
   AS 'MODULE_PATHNAME', 'laplace_cp_coord_ewkb' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
+-- Paths as arrays: ordered vertex IDs, run lengths, and continuations over them (for comparing storage layouts).
+CREATE FUNCTION laplace_path_ids(geometry) RETURNS uuid[]
+  AS 'MODULE_PATHNAME', 'laplace_path_ids' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path_runs(geometry) RETURNS int[]
+  AS 'MODULE_PATHNAME', 'laplace_path_runs' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_follows_ids(uuid[], int[], uuid[]) RETURNS uuid[]
+  AS 'MODULE_PATHNAME', 'laplace_follows_ids' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 100;
+
 -- Recomposition: any entity back to its text, walking physicality paths down to tier 0.
 CREATE FUNCTION laplace_text(uuid) RETURNS text
   AS 'MODULE_PATHNAME', 'laplace_text' LANGUAGE C STABLE STRICT PARALLEL SAFE;
