@@ -12,6 +12,9 @@
 #include "mb/pg_wchar.h"
 #include "varatt.h"
 #include "utils/guc.h"
+#include "executor/spi.h"
+#include "utils/memutils.h"
+#include "lib/stringinfo.h"
 #include "laplace/laplace.h"
 
 PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.1");
@@ -222,6 +225,49 @@ Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
     for (int d = 0; d < 4; d++) x[d] = (double)T[cp].m[d] / LP_FIXED_ONE;
     bytea *b = palloc(VARHDRSZ + 37); SET_VARSIZE(b, VARHDRSZ + 37); lp_ewkb_point4(x, (uint8 *)VARDATA(b), 37);
     PG_RETURN_BYTEA_P(b);
+}
+
+/* ---------------------------------------------------------------- recomposition: an entity back to its text */
+/* Atoms: tier-0 IDs to codepoints, an open-addressed table built once per backend from the perf-cache. */
+static uint32 *atom_slot; static const uint32 ATOM_CAP = 1u << 22;          /* holds codepoint + 1; 0 is empty */
+static int64 atom_of(const uint8 *id){
+    const lp_tier0_record *T = tier0();
+    if (!atom_slot) {
+        atom_slot = MemoryContextAllocZero(TopMemoryContext, sizeof(uint32) * ATOM_CAP);
+        for (uint32 cp = 0; cp < LP_NCP; cp++) {
+            uint64 h; memcpy(&h, T[cp].id.b, 8); uint32 s = (uint32)(h & (ATOM_CAP - 1));
+            while (atom_slot[s]) s = (s + 1) & (ATOM_CAP - 1);
+            atom_slot[s] = cp + 1;
+        }
+    }
+    uint64 h; memcpy(&h, id, 8); uint32 s = (uint32)(h & (ATOM_CAP - 1));
+    while (atom_slot[s]) { if (!memcmp(T[atom_slot[s] - 1].id.b, id, 16)) return atom_slot[s] - 1; s = (s + 1) & (ATOM_CAP - 1); }
+    return -1;
+}
+static SPIPlanPtr path_plan;
+static void recompose(const uint8 *id, StringInfo out, int depth){
+    int64 cp = atom_of(id);
+    if (cp >= 0) { unsigned char u[4]; unicode_to_utf8((pg_wchar)cp, u); appendBinaryStringInfo(out, (const char *)u, pg_utf_mblen(u)); return; }
+    if (depth > 64) ereport(ERROR, (errmsg("laplace_text: composition deeper than 64 tiers")));
+    Datum arg = UUIDPGetDatum((pg_uuid_t *)id);
+    if (SPI_execute_plan(path_plan, &arg, NULL, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
+        ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
+    bool isnull; Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+    bytea *e = DatumGetByteaPCopy(d); size_t len = VARSIZE_ANY_EXHDR(e); const uint8_t *v; size_t nv = lp_ewkb_vertices((const uint8_t *)VARDATA_ANY(e), len, &v);
+    for (size_t i = 0; i < nv; i++) {
+        double m; memcpy(&m, v + 32 * i + 24, 8); lp_id cid; lp_xyz_to_id((const double *)(v + 32 * i), &cid);
+        for (int r = 0; r < (m < 1 ? 1 : (int)m); r++) recompose(cid.b, out, depth + 1);
+    }
+}
+
+PG_FUNCTION_INFO_V1(laplace_text);
+Datum laplace_text(PG_FUNCTION_ARGS){
+    pg_uuid_t *u = PG_GETARG_UUID_P(0); StringInfoData out; initStringInfo(&out);
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
+    if (!path_plan) { Oid t = UUIDOID; path_plan = SPI_prepare("SELECT st_asewkb(path) FROM physicality WHERE entity = $1 LIMIT 1", 1, &t); SPI_keepplan(path_plan); }
+    recompose(u->data, &out, 0);
+    SPI_finish();
+    PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
 
 /* ---------------------------------------------------------------- observability */

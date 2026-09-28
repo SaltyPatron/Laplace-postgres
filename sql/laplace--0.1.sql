@@ -55,6 +55,10 @@ CREATE FUNCTION laplace_text_hilbert(text) RETURNS bigint
 CREATE FUNCTION laplace_cp_coord_ewkb(integer) RETURNS bytea
   AS 'MODULE_PATHNAME', 'laplace_cp_coord_ewkb' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
+-- Recomposition: any entity back to its text, walking physicality paths down to tier 0.
+CREATE FUNCTION laplace_text(uuid) RETURNS text
+  AS 'MODULE_PATHNAME', 'laplace_text' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
 -- Observability.
 CREATE FUNCTION laplace_isa() RETURNS text
   AS 'MODULE_PATHNAME', 'laplace_isa' LANGUAGE C STABLE PARALLEL SAFE;
