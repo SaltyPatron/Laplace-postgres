@@ -22,13 +22,6 @@ CREATE TABLE physicality (
   path     geometry NOT NULL                     -- children's IDs in X/Y/Z, run lengths in M
 ) PARTITION BY LIST (tier);
 
-CREATE TABLE entity_stats (
-  id           uuid     NOT NULL,
-  tier         smallint NOT NULL,
-  parents      bigint   NOT NULL,                -- distinct containers
-  occurrences  double precision NOT NULL          -- paths from every source down to it
-) PARTITION BY LIST (tier);
-
 CREATE TABLE source (
   trunk    uuid   NOT NULL,
   origin   text   NOT NULL,
@@ -44,23 +37,19 @@ BEGIN
     IF t = ANY (big) THEN
       EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s) PARTITION BY RANGE (id)', t, t);
       EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s) PARTITION BY RANGE (entity)', t, t);
-      EXECUTE format('CREATE TABLE entity_stats_t%s PARTITION OF entity_stats FOR VALUES IN (%s) PARTITION BY RANGE (id)', t, t);
       FOR k IN 0..15 LOOP                        -- the first hex digit of the ID
         lo := CASE WHEN k = 0 THEN 'MINVALUE' ELSE quote_literal(to_hex(k) || '0000000-0000-0000-0000-000000000000') END;
         hi := CASE WHEN k = 15 THEN 'MAXVALUE' ELSE quote_literal(to_hex(k + 1) || '0000000-0000-0000-0000-000000000000') END;
         EXECUTE format('CREATE TABLE entity_t%s_%s PARTITION OF entity_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
         EXECUTE format('CREATE TABLE physicality_t%s_%s PARTITION OF physicality_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
-        EXECUTE format('CREATE TABLE entity_stats_t%s_%s PARTITION OF entity_stats_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
       END LOOP;
     ELSE
       EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s)', t, t);
       EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s)', t, t);
-      EXECUTE format('CREATE TABLE entity_stats_t%s PARTITION OF entity_stats FOR VALUES IN (%s)', t, t);
     END IF;
   END LOOP;
   CREATE TABLE entity_tx PARTITION OF entity DEFAULT;
   CREATE TABLE physicality_tx PARTITION OF physicality DEFAULT;
-  CREATE TABLE entity_stats_tx PARTITION OF entity_stats DEFAULT;
 END $$;
 
 -- A path's X/Y/Z are packed IDs, not positions, so PostGIS's geometry statistics mean nothing for them and cost minutes

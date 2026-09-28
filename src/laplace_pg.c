@@ -277,3 +277,69 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
     snprintf(buf, sizeof buf, "cpu: %s; dispatch: %s", lp_cpu_describe(lp_cpu_features()), lp_cpu_describe(lp_cpu_active()));
     PG_RETURN_TEXT_P(cstring_to_text(buf));
 }
+
+/* ---------------------------------------------------------------- GIN over path geometry
+ * The keys of a path are the distinct IDs packed in its vertices. A path holds a set of IDs exactly when every key is
+ * present, so containment and overlap are answered by the index alone: no recheck, no path decoded twice. */
+#include "access/gin.h"
+#include "access/stratnum.h"
+#define LP_STRAT_CONTAINS 7        /* path @> uuid[] */
+#define LP_STRAT_OVERLAPS 3        /* path && uuid[] */
+
+static Datum *path_keys(Datum path, int32 *n){
+    Geo g = geo_of(path); lp_id *ids = palloc(sizeof(lp_id) * (g.n ? g.n : 1)); int m = 0;
+    for (uint32 i = 0; i < g.n; i++) lp_xyz_to_id(g.xyzm + 4 * i, &ids[i]);
+    qsort(ids, g.n, 16, cmp_id);
+    for (uint32 i = 0; i < g.n; i++) if (m == 0 || memcmp(&ids[i], &ids[m - 1], 16)) ids[m++] = ids[i];
+    Datum *k = palloc(sizeof(Datum) * (m ? m : 1)); for (int i = 0; i < m; i++) k[i] = uuid_datum(&ids[i]);
+    *n = m; return k;
+}
+PG_FUNCTION_INFO_V1(laplace_gin_extract_value);
+Datum laplace_gin_extract_value(PG_FUNCTION_ARGS){
+    int32 *n = (int32 *)PG_GETARG_POINTER(1); PG_RETURN_POINTER(path_keys(PG_GETARG_DATUM(0), n));
+}
+PG_FUNCTION_INFO_V1(laplace_gin_extract_query);
+Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
+    int32 *n = (int32 *)PG_GETARG_POINTER(1); StrategyNumber st = PG_GETARG_UINT16(2); int32 *mode = (int32 *)PG_GETARG_POINTER(6);
+    int k; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &k);
+    Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = uuid_datum(&ids[i]);
+    *n = k; if (k == 0) *mode = st == LP_STRAT_CONTAINS ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
+    PG_RETURN_POINTER(d);
+}
+PG_FUNCTION_INFO_V1(laplace_gin_consistent);
+Datum laplace_gin_consistent(PG_FUNCTION_ARGS){
+    bool *check = (bool *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
+    bool *recheck = (bool *)PG_GETARG_POINTER(5); *recheck = false;                /* keys are the exact IDs */
+    if (st == LP_STRAT_CONTAINS) { for (int i = 0; i < n; i++) if (!check[i]) PG_RETURN_BOOL(false); PG_RETURN_BOOL(true); }
+    for (int i = 0; i < n; i++) if (check[i]) PG_RETURN_BOOL(true);
+    PG_RETURN_BOOL(false);
+}
+PG_FUNCTION_INFO_V1(laplace_gin_triconsistent);
+Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
+    GinTernaryValue *check = (GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
+    if (st == LP_STRAT_CONTAINS) {
+        GinTernaryValue r = GIN_TRUE;
+        for (int i = 0; i < n; i++) { if (check[i] == GIN_FALSE) PG_RETURN_GIN_TERNARY_VALUE(GIN_FALSE); if (check[i] == GIN_MAYBE) r = GIN_MAYBE; }
+        PG_RETURN_GIN_TERNARY_VALUE(r);
+    }
+    GinTernaryValue r = GIN_FALSE;
+    for (int i = 0; i < n; i++) { if (check[i] == GIN_TRUE) PG_RETURN_GIN_TERNARY_VALUE(GIN_TRUE); if (check[i] == GIN_MAYBE) r = GIN_MAYBE; }
+    PG_RETURN_GIN_TERNARY_VALUE(r);
+}
+/* The operators themselves, for plans that do not use the index. */
+static bool path_has(Datum path, ArrayType *q, bool all){           /* the path decoded once, then binary search */
+    Geo g = geo_of(path); int k; lp_id *ids = ids_of(q, &k);
+    lp_id *v = palloc(sizeof(lp_id) * (g.n ? g.n : 1));
+    for (uint32 i = 0; i < g.n; i++) lp_xyz_to_id(g.xyzm + 4 * i, &v[i]);
+    qsort(v, g.n, 16, cmp_id);
+    for (int j = 0; j < k; j++) {
+        bool found = bsearch(&ids[j], v, g.n, 16, cmp_id) != NULL;
+        if (all && !found) { pfree(v); return false; }
+        if (!all && found) { pfree(v); return true; }
+    }
+    pfree(v); return all;
+}
+PG_FUNCTION_INFO_V1(laplace_path_contains);
+Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
+PG_FUNCTION_INFO_V1(laplace_path_overlaps);
+Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), false)); }

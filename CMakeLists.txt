@@ -20,4 +20,4 @@ target_link_libraries(laplace_pg PRIVATE laplace_static BLAKE3::blake3 m)
 target_link_options(laplace_pg PRIVATE -Wl,--exclude-libs,ALL)
 
 install(TARGETS laplace_pg LIBRARY DESTINATION ${PG_pkglibdir})
-install(FILES laplace.control sql/laplace--0.1.sql DESTINATION ${PG_sharedir}/extension)
+install(FILES laplace.control sql/laplace--0.1.sql sql/laplace--0.1--0.2.sql sql/laplace--0.2--0.3.sql sql/laplace--0.3--0.4.sql DESTINATION ${PG_sharedir}/extension)
