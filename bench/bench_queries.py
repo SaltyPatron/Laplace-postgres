@@ -5,14 +5,14 @@ the database is only asked to find and count. Each query runs once cold (Postgre
 several times warm; the report shows the server's execution time from EXPLAIN ANALYZE, the client round trip, the
 buffers read and hit, the partitions the plan touched, and the first rows of the result.
 
-Usage: python3 bench_queries.py [conninfo] [warm_runs]
+Usage: python3 bench_queries.py [conninfo] [warm_runs] [setting=value ...]      (settings apply to the session)
 """
 import json, statistics, sys, time
 import psycopg2
 
 DSN = sys.argv[1] if len(sys.argv) > 1 else "host=localhost port=5432 user=laplace dbname=laplace"
 RUNS = int(sys.argv[2]) if len(sys.argv) > 2 else 7
-con = psycopg2.connect(DSN); con.autocommit = True; cur = con.cursor()
+con = psycopg2.connect(DSN, options=" ".join(f"-c {s}" for s in sys.argv[3:])); con.autocommit = True; cur = con.cursor()
 
 def ids(*words): return "ARRAY[" + ", ".join(f"laplace_text_id({w!r})" for w in words) + "]"
 

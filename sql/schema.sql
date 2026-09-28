@@ -66,3 +66,15 @@ END $$;
 -- A path's X/Y/Z are packed IDs, not positions, so PostGIS's geometry statistics mean nothing for them and cost minutes
 -- (5.5 min on 3.9M paths, against 2.5 s without). The planner does not need them.
 ALTER TABLE physicality ALTER COLUMN path SET STATISTICS 0;
+
+-- Container lookups take a millisecond; starting parallel workers for one takes 15 (measured). No parallel scans of
+-- paths, and no parallel append across partitions: the database default, which an analytic session can turn back on.
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT c.relname FROM pg_class c JOIN pg_inherits i ON i.inhrelid = c.oid
+           WHERE c.relname LIKE 'physicality_t%' AND c.relkind = 'r' LOOP
+    EXECUTE format('ALTER TABLE %I SET (parallel_workers = 0)', r.relname);
+  END LOOP;
+  EXECUTE format('ALTER DATABASE %I SET enable_parallel_append = off', current_database());
+END $$;

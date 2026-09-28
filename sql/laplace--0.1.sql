@@ -16,10 +16,11 @@ CREATE FUNCTION laplace_path(uuid[]) RETURNS geometry
   AS $$ SELECT ST_GeomFromEWKB(laplace_path_ewkb($1)) $$ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
 
 -- The distinct IDs a path holds: the key of the GIN index that finds containers.
--- COST 50 (measured): high enough that the planner uses the GIN index even on the small partition of whole books, whose
--- paths are long, and low enough that it does not start parallel workers, which cost 15 ms on a 1 ms lookup.
+-- COST 10000 (measured): decoding a whole path is expensive for long paths (a book's trunk has thousands of vertices).
+-- At lower costs the planner scans the partition of whole books sequentially, decoding every book on every lookup
+-- (90 ms of a 111 ms query). The parallel workers the high cost would invite are prevented by the schema instead.
 CREATE FUNCTION laplace_vertex_ids(geometry) RETURNS uuid[]
-  AS 'MODULE_PATHNAME', 'laplace_vertex_ids' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 50;
+  AS 'MODULE_PATHNAME', 'laplace_vertex_ids' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 10000;
 
 -- Continuations: the ID after every run of the phrase inside the path.
 CREATE FUNCTION laplace_follows(geometry, uuid[]) RETURNS uuid[]
