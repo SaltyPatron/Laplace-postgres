@@ -368,7 +368,7 @@ static void recompose(const uint8 *id, StringInfo out, int depth){
     bytea *e = DatumGetByteaPCopy(d); size_t len = VARSIZE_ANY_EXHDR(e); const uint8_t *v; size_t nv = lp_ewkb_vertices((const uint8_t *)VARDATA_ANY(e), len, &v);
     for (size_t i = 0; i < nv; i++) {
         double m; memcpy(&m, v + 32 * i + 24, 8); lp_id cid; lp_xyz_to_id((const double *)(v + 32 * i), &cid);
-        for (int r = 0; r < (m < 1 ? 1 : (int)m); r++) recompose(cid.b, out, depth + 1);
+        for (int r = 0; r < (int)lp_m_run(m); r++) recompose(cid.b, out, depth + 1);
     }
 }
 
