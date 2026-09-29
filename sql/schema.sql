@@ -5,57 +5,49 @@
 -- partition. Partitions are not spatial: the 4D side is served by GiST on the real coordinates, whose index structure
 -- follows the content wherever it lies in the 4-ball, and the Hilbert value is a column and an index for ordering.
 --
--- IDs are uuid: 16 fixed bytes. Hilbert values are unsigned 64-bit, stored with the top bit flipped
+-- An ID is a blake3: the BLAKE3 hash, 128 bits. A file is no row of a table: it is a trunk in the DAG, with children
+-- for its metadata and for its content, like everything else. Hilbert values are unsigned 64-bit, stored with the top bit flipped
 -- (hilbert # -9223372036854775808) so that bigint order equals Hilbert order.
 
 CREATE TABLE entity (
-  id       uuid     NOT NULL,
+  id       blake3   NOT NULL,
   tier     smallint NOT NULL,
   coord    geometry(PointZM) NOT NULL,           -- the real 4D coordinate; M is W
   hilbert  bigint   NOT NULL
 ) PARTITION BY LIST (tier);
 
 CREATE TABLE physicality (
-  entity   uuid     NOT NULL,
+  entity   blake3   NOT NULL,
   tier     smallint NOT NULL,
   hilbert  bigint   NOT NULL,
   path     geometry NOT NULL                     -- children's IDs in X/Y/Z, run lengths in M
 ) PARTITION BY LIST (tier);
 
-CREATE TABLE source (
-  trunk    uuid   NOT NULL,
-  origin   text   NOT NULL,
-  format   text   NOT NULL,
-  bytes    bigint NOT NULL,
-  content  bytea  NOT NULL                       -- BLAKE3-256 of the source bytes
-);
-
--- Every tier is split 16 ways by the first hex digit of the ID: an ID is a hash, so every part fills evenly, a lookup
--- by ID prunes to one partition, and a load writes every part on its own connection. Tiers deeper than 15 share the
--- default partition, split the same way.
+-- The largest tiers are split again, 16 ways, by the first hex digit of the ID: an ID is a hash, so the parts fill
+-- evenly, and a lookup by ID prunes to one of them. The other tiers are one partition each, and tiers deeper than 15
+-- share the default: a lookup for containers visits every partition's index, so there are no more of them than the
+-- sizes call for. The tiers split here are the ones measured largest: atoms, words, sentences and their like, and
+-- the tiers claims and records fall in.
 DO $$
-DECLARE t int; k int; lo text; hi text;
+DECLARE t int; k int; lo text; hi text; big int[] := ARRAY[0, 2, 3, 4, 5, 6];
 BEGIN
-  FOR t IN 0..16 LOOP
-    IF t < 16 THEN
+  FOR t IN 0..15 LOOP
+    IF t = ANY (big) THEN
       EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s) PARTITION BY RANGE (id)', t, t);
       EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s) PARTITION BY RANGE (entity)', t, t);
-    ELSE
-      CREATE TABLE entity_tx PARTITION OF entity DEFAULT PARTITION BY RANGE (id);
-      CREATE TABLE physicality_tx PARTITION OF physicality DEFAULT PARTITION BY RANGE (entity);
-    END IF;
-    FOR k IN 0..15 LOOP                          -- the first hex digit of the ID
-      lo := CASE WHEN k = 0 THEN 'MINVALUE' ELSE quote_literal(to_hex(k) || '0000000-0000-0000-0000-000000000000') END;
-      hi := CASE WHEN k = 15 THEN 'MAXVALUE' ELSE quote_literal(to_hex(k + 1) || '0000000-0000-0000-0000-000000000000') END;
-      IF t < 16 THEN
+      FOR k IN 0..15 LOOP                        -- the first hex digit of the ID
+        lo := CASE WHEN k = 0 THEN 'MINVALUE' ELSE quote_literal(to_hex(k) || repeat('0', 31)) END;
+        hi := CASE WHEN k = 15 THEN 'MAXVALUE' ELSE quote_literal(to_hex(k + 1) || repeat('0', 31)) END;
         EXECUTE format('CREATE TABLE entity_t%s_%s PARTITION OF entity_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
         EXECUTE format('CREATE TABLE physicality_t%s_%s PARTITION OF physicality_t%s FOR VALUES FROM (%s) TO (%s)', t, to_hex(k), t, lo, hi);
-      ELSE
-        EXECUTE format('CREATE TABLE entity_tx_%s PARTITION OF entity_tx FOR VALUES FROM (%s) TO (%s)', to_hex(k), lo, hi);
-        EXECUTE format('CREATE TABLE physicality_tx_%s PARTITION OF physicality_tx FOR VALUES FROM (%s) TO (%s)', to_hex(k), lo, hi);
-      END IF;
-    END LOOP;
+      END LOOP;
+    ELSE
+      EXECUTE format('CREATE TABLE entity_t%s PARTITION OF entity FOR VALUES IN (%s)', t, t);
+      EXECUTE format('CREATE TABLE physicality_t%s PARTITION OF physicality FOR VALUES IN (%s)', t, t);
+    END IF;
   END LOOP;
+  CREATE TABLE entity_tx PARTITION OF entity DEFAULT;
+  CREATE TABLE physicality_tx PARTITION OF physicality DEFAULT;
 END $$;
 
 -- A path's X/Y/Z are packed IDs, not positions, so PostGIS's geometry statistics mean nothing for them and cost minutes

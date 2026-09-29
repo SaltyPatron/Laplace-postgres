@@ -2,13 +2,18 @@
  *
  * Standard geometry types stay as they are; these functions add what Laplace needs next to what PostGIS provides.
  * They read PostGIS's serialized geometry directly (a LINESTRING ZM's vertices are 32-byte X, Y, Z, M blocks, the same
- * layout the Laplace-Native kernels use), return IDs as uuid (16 fixed bytes), and call Laplace-Native for all math. */
+ * layout the Laplace-Native kernels use), and call Laplace-Native for all math.
+ *
+ * An ID is a BLAKE3 hash, 128 bits. It has a type of its own, blake3: 16 fixed bytes, written as 32 hexadecimal
+ * digits, ordered and compared as bytes. */
 #include "postgres.h"
 #include "fmgr.h"
 #include "catalog/pg_type.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/uuid.h"
+#include "utils/lsyscache.h"
+#include "libpq/pqformat.h"
+#include "common/hashfn.h"
 #include "mb/pg_wchar.h"
 #include "varatt.h"
 #include "utils/guc.h"
@@ -17,7 +22,7 @@
 #include "lib/stringinfo.h"
 #include "laplace/laplace.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.7");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.0");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #define G2_Z 0x01
@@ -53,54 +58,55 @@ static uint8 *as_ewkb(const Geo *g, size_t *len){
     return e;
 }
 
-static Datum uuid_datum(const lp_id *id){ pg_uuid_t *u = palloc(sizeof(pg_uuid_t)); memcpy(u->data, id->b, 16); return UUIDPGetDatum(u); }
-static ArrayType *uuid_array(const lp_id *ids, int n){
+static Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
+/* An array of IDs, of the type the function is declared to return. */
+static ArrayType *id_array(FunctionCallInfo fcinfo, const lp_id *ids, int n){
+    Oid el = get_element_type(get_fn_expr_rettype(fcinfo->flinfo));
+    if (!OidIsValid(el)) ereport(ERROR, (errmsg("laplace: the function does not return an array of IDs")));
     Datum *d = palloc(sizeof(Datum) * (n ? n : 1));
-    for (int i = 0; i < n; i++) d[i] = uuid_datum(&ids[i]);
-    return construct_array(d, n, UUIDOID, UUID_LEN, false, TYPALIGN_CHAR);
+    for (int i = 0; i < n; i++) d[i] = id_datum(&ids[i]);
+    return construct_array(d, n, el, 16, false, TYPALIGN_CHAR);
 }
 static lp_id *ids_of(ArrayType *a, int *n){
-    Datum *d; bool *nulls; deconstruct_array(a, UUIDOID, UUID_LEN, false, TYPALIGN_CHAR, &d, &nulls, n);
+    Datum *d; bool *nulls; deconstruct_array(a, ARR_ELEMTYPE(a), 16, false, TYPALIGN_CHAR, &d, &nulls, n);
     lp_id *ids = palloc(sizeof(lp_id) * (*n ? *n : 1));
     for (int i = 0; i < *n; i++) {
         if (nulls[i]) ereport(ERROR, (errmsg("laplace: IDs cannot be null")));
-        memcpy(ids[i].b, DatumGetUUIDP(d[i])->data, 16);
+        memcpy(ids[i].b, DatumGetPointer(d[i]), 16);
     }
     return ids;
 }
 
-/* ---------------------------------------------------------------- identity */
-PG_FUNCTION_INFO_V1(laplace_cp_id);
-Datum laplace_cp_id(PG_FUNCTION_ARGS){
-    int32 cp = PG_GETARG_INT32(0); lp_id id;
-    if (cp < 0 || (uint32)cp >= LP_NCP) ereport(ERROR, (errmsg("laplace_cp_id: %d is outside the codespace", cp)));
-    lp_id_codepoint((uint32)cp, &id); return uuid_datum(&id);
+/* ---------------------------------------------------------------- the type of an ID: blake3 */
+static int hexval(char c){ return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
+PG_FUNCTION_INFO_V1(blake3_in);
+Datum blake3_in(PG_FUNCTION_ARGS){
+    const char *t = PG_GETARG_CSTRING(0); uint8 *u = palloc(16);
+    if (strlen(t) != 32) ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("a blake3 ID is 32 hexadecimal digits: \"%s\"", t)));
+    for (int i = 0; i < 16; i++) { int h = hexval(t[2 * i]), l = hexval(t[2 * i + 1]);
+        if (h < 0 || l < 0) ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("a blake3 ID is 32 hexadecimal digits: \"%s\"", t)));
+        u[i] = (uint8)(h << 4 | l); }
+    PG_RETURN_POINTER(u);
 }
-
-PG_FUNCTION_INFO_V1(laplace_text_id);
-Datum laplace_text_id(PG_FUNCTION_ARGS){
-    text *t = PG_GETARG_TEXT_PP(0); lp_id id;
-    if (!lp_id_codepoints_utf8(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
-    return uuid_datum(&id);
+PG_FUNCTION_INFO_V1(blake3_out);
+Datum blake3_out(PG_FUNCTION_ARGS){
+    const uint8 *u = (const uint8 *)PG_GETARG_POINTER(0); char *t = palloc(33); static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) { t[2 * i] = hex[u[i] >> 4]; t[2 * i + 1] = hex[u[i] & 15]; } t[32] = 0;
+    PG_RETURN_CSTRING(t);
 }
-
-PG_FUNCTION_INFO_V1(laplace_compose);
-Datum laplace_compose(PG_FUNCTION_ARGS){
-    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n), id;
-    if (n == 0) PG_RETURN_NULL();
-    lp_id_compose(ids, (size_t)n, &id); return uuid_datum(&id);
-}
-
-/* ---------------------------------------------------------------- physicality paths */
-PG_FUNCTION_INFO_V1(laplace_path_ewkb);
-Datum laplace_path_ewkb(PG_FUNCTION_ARGS){
-    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
-    if (n == 0) PG_RETURN_NULL();
-    size_t need = lp_ewkb_path(ids, (size_t)n, NULL, 0);
-    bytea *b = palloc(VARHDRSZ + need); SET_VARSIZE(b, VARHDRSZ + need);
-    lp_ewkb_path(ids, (size_t)n, (uint8 *)VARDATA(b), need);
-    PG_RETURN_BYTEA_P(b);
-}
+PG_FUNCTION_INFO_V1(blake3_recv);
+Datum blake3_recv(PG_FUNCTION_ARGS){ StringInfo b = (StringInfo)PG_GETARG_POINTER(0); uint8 *u = palloc(16); memcpy(u, pq_getmsgbytes(b, 16), 16); PG_RETURN_POINTER(u); }
+PG_FUNCTION_INFO_V1(blake3_send);
+Datum blake3_send(PG_FUNCTION_ARGS){ StringInfoData b; pq_begintypsend(&b); pq_sendbytes(&b, PG_GETARG_POINTER(0), 16); PG_RETURN_BYTEA_P(pq_endtypsend(&b)); }
+#define ID_CMP(name, test) PG_FUNCTION_INFO_V1(name); Datum name(PG_FUNCTION_ARGS){ int c = memcmp(PG_GETARG_POINTER(0), PG_GETARG_POINTER(1), 16); PG_RETURN_BOOL(test); }
+ID_CMP(blake3_eq, c == 0) ID_CMP(blake3_ne, c != 0) ID_CMP(blake3_lt, c < 0) ID_CMP(blake3_le, c <= 0) ID_CMP(blake3_gt, c > 0) ID_CMP(blake3_ge, c >= 0)
+PG_FUNCTION_INFO_V1(blake3_cmp);
+Datum blake3_cmp(PG_FUNCTION_ARGS){ int c = memcmp(PG_GETARG_POINTER(0), PG_GETARG_POINTER(1), 16); PG_RETURN_INT32(c < 0 ? -1 : c > 0); }
+/* A hash is already evenly spread: its own bytes are the hash a hash index or a hash join asks for. */
+PG_FUNCTION_INFO_V1(blake3_hash);
+Datum blake3_hash(PG_FUNCTION_ARGS){ uint32 h; memcpy(&h, PG_GETARG_POINTER(0), 4); PG_RETURN_UINT32(h); }
+PG_FUNCTION_INFO_V1(blake3_hash_extended);
+Datum blake3_hash_extended(PG_FUNCTION_ARGS){ return hash_any_extended((const unsigned char *)PG_GETARG_POINTER(0), 16, PG_GETARG_INT64(1)); }
 
 static int cmp_id(const void *a, const void *b){ return memcmp(a, b, 16); }
 
@@ -111,7 +117,7 @@ Datum laplace_vertex_ids(PG_FUNCTION_ARGS){
     for (uint32 i = 0; i < g.n; i++) lp_xyz_to_id(g.xyzm + 4 * i, &ids[i]);
     qsort(ids, g.n, 16, cmp_id);
     for (uint32 i = 0; i < g.n; i++) if (m == 0 || memcmp(&ids[i], &ids[m - 1], 16)) ids[m++] = ids[i];
-    PG_RETURN_ARRAYTYPE_P(uuid_array(ids, m));
+    PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, ids, m));
 }
 
 PG_FUNCTION_INFO_V1(laplace_follows);
@@ -121,7 +127,7 @@ Datum laplace_follows(PG_FUNCTION_ARGS){
     size_t cap = g.n * 4 + 16; lp_id *out = palloc(sizeof(lp_id) * cap);
     size_t k = lp_follows(e, len, phrase, (size_t)np, out, cap);
     if (k == 0) PG_RETURN_NULL();
-    PG_RETURN_ARRAYTYPE_P(uuid_array(out, (int)(k < cap ? k : cap)));
+    PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, out, (int)(k < cap ? k : cap)));
 }
 
 /* ---------------------------------------------------------------- 4D geometry on real coordinates */
@@ -243,7 +249,7 @@ static const lp_field *field_of(text *t){
     if (!f) ereport(ERROR, (errmsg("laplace: the standard lists no property \"%s\"", n)));
     return f;
 }
-static int64 cp_of_id(pg_uuid_t *u){ return lp_tier0_codepoint(tier0(), (const lp_id *)u->data); }
+static int64 cp_of_id(const uint8 *u){ return lp_tier0_codepoint(tier0(), (const lp_id *)u); }
 static Datum said(int64 cp, text *property){
     if (cp < 0 || cp >= LP_NCP) return (Datum)0;
     const lp_layout *l = flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
@@ -263,13 +269,13 @@ Datum laplace_cp_flags(PG_FUNCTION_ARGS){
 PG_FUNCTION_INFO_V1(laplace_cp_said);
 Datum laplace_cp_said(PG_FUNCTION_ARGS){ Datum d = said(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }
 PG_FUNCTION_INFO_V1(laplace_said);
-Datum laplace_said(PG_FUNCTION_ARGS){ Datum d = said(cp_of_id(PG_GETARG_UUID_P(0)), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }
+Datum laplace_said(PG_FUNCTION_ARGS){ Datum d = said(cp_of_id((const uint8 *)PG_GETARG_POINTER(0)), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }
 PG_FUNCTION_INFO_V1(laplace_cp_is);
 Datum laplace_cp_is(PG_FUNCTION_ARGS){ int r = is(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
 PG_FUNCTION_INFO_V1(laplace_is);
-Datum laplace_is(PG_FUNCTION_ARGS){ int r = is(cp_of_id(PG_GETARG_UUID_P(0)), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
+Datum laplace_is(PG_FUNCTION_ARGS){ int r = is(cp_of_id((const uint8 *)PG_GETARG_POINTER(0)), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
 PG_FUNCTION_INFO_V1(laplace_codepoint);
-Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id(PG_GETARG_UUID_P(0)); if (cp < 0) PG_RETURN_NULL(); PG_RETURN_INT32((int32)cp); }
+Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id((const uint8 *)PG_GETARG_POINTER(0)); if (cp < 0) PG_RETURN_NULL(); PG_RETURN_INT32((int32)cp); }
 
 /* ---------------------------------------------------------------- a text's entity, computed in place
  * The one decomposition of text (UAX #29, Laplace-Native), composed without recording: the ID, tier, coordinate and
@@ -285,7 +291,7 @@ static lp_ref trunk_of(text *t, lp_ref *parts, size_t cap, size_t *np){
 PG_FUNCTION_INFO_V1(laplace_id);
 Datum laplace_id(PG_FUNCTION_ARGS){
     text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
-    lp_ref r = trunk_of(t, NULL, 0, NULL); return uuid_datum(&r.id);
+    lp_ref r = trunk_of(t, NULL, 0, NULL); return id_datum(&r.id);
 }
 
 PG_FUNCTION_INFO_V1(laplace_tier);
@@ -318,7 +324,7 @@ Datum laplace_parts(PG_FUNCTION_ARGS){
     size_t cap = VARSIZE_ANY_EXHDR(t) + 1, n; lp_ref *parts = palloc(sizeof(lp_ref) * cap);
     trunk_of(t, parts, cap, &n); if (n > cap) n = cap;
     lp_id *ids = palloc(sizeof(lp_id) * n); for (size_t i = 0; i < n; i++) ids[i] = parts[i].id;
-    PG_RETURN_ARRAYTYPE_P(uuid_array(ids, (int)n));
+    PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, ids, (int)n));
 }
 
 /* Which tier 0 this database computes with. */
@@ -361,7 +367,7 @@ static void recompose(const uint8 *id, StringInfo out, int depth){
     int64 cp = atom_of(id);
     if (cp >= 0) { unsigned char u[4]; unicode_to_utf8((pg_wchar)cp, u); appendBinaryStringInfo(out, (const char *)u, pg_utf_mblen(u)); return; }
     if (depth > 64) ereport(ERROR, (errmsg("laplace_text: composition deeper than 64 tiers")));
-    Datum arg = UUIDPGetDatum((pg_uuid_t *)id);
+    Datum arg = PointerGetDatum(id);
     if (SPI_execute_plan(path_plan, &arg, NULL, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
         ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
     bool isnull; Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
@@ -374,10 +380,10 @@ static void recompose(const uint8 *id, StringInfo out, int depth){
 
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
-    pg_uuid_t *u = PG_GETARG_UUID_P(0); StringInfoData out; initStringInfo(&out);
+    const uint8 *u = (const uint8 *)PG_GETARG_POINTER(0); StringInfoData out; initStringInfo(&out);
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
-    if (!path_plan) { Oid t = UUIDOID; path_plan = SPI_prepare("SELECT st_asewkb(path) FROM physicality WHERE entity = $1 LIMIT 1", 1, &t); SPI_keepplan(path_plan); }
-    recompose(u->data, &out, 0);
+    if (!path_plan) { Oid t = get_fn_expr_argtype(fcinfo->flinfo, 0); path_plan = SPI_prepare("SELECT st_asewkb(path) FROM physicality WHERE entity = $1 LIMIT 1", 1, &t); SPI_keepplan(path_plan); }
+    recompose(u, &out, 0);
     SPI_finish();
     PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
@@ -395,15 +401,15 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
  * present, so containment and overlap are answered by the index alone: no recheck, no path decoded twice. */
 #include "access/gin.h"
 #include "access/stratnum.h"
-#define LP_STRAT_CONTAINS 7        /* path @> uuid[] */
-#define LP_STRAT_OVERLAPS 3        /* path && uuid[] */
+#define LP_STRAT_CONTAINS 7        /* path @> blake3[] */
+#define LP_STRAT_OVERLAPS 3        /* path && blake3[] */
 
 static Datum *path_keys(Datum path, int32 *n){
     Geo g = geo_of(path); lp_id *ids = palloc(sizeof(lp_id) * (g.n ? g.n : 1)); int m = 0;
     for (uint32 i = 0; i < g.n; i++) lp_xyz_to_id(g.xyzm + 4 * i, &ids[i]);
     qsort(ids, g.n, 16, cmp_id);
     for (uint32 i = 0; i < g.n; i++) if (m == 0 || memcmp(&ids[i], &ids[m - 1], 16)) ids[m++] = ids[i];
-    Datum *k = palloc(sizeof(Datum) * (m ? m : 1)); for (int i = 0; i < m; i++) k[i] = uuid_datum(&ids[i]);
+    Datum *k = palloc(sizeof(Datum) * (m ? m : 1)); for (int i = 0; i < m; i++) k[i] = id_datum(&ids[i]);
     *n = m; return k;
 }
 PG_FUNCTION_INFO_V1(laplace_gin_extract_value);
@@ -414,7 +420,7 @@ PG_FUNCTION_INFO_V1(laplace_gin_extract_query);
 Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
     int32 *n = (int32 *)PG_GETARG_POINTER(1); StrategyNumber st = PG_GETARG_UINT16(2); int32 *mode = (int32 *)PG_GETARG_POINTER(6);
     int k; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &k);
-    Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = uuid_datum(&ids[i]);
+    Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = id_datum(&ids[i]);
     *n = k; if (k == 0) *mode = st == LP_STRAT_CONTAINS ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
     PG_RETURN_POINTER(d);
 }
@@ -470,7 +476,7 @@ Datum laplace_path_times(PG_FUNCTION_ARGS){
         int64 *t = palloc0(sizeof(int64) * (m ? m : 1)); lp_id v;
         for (uint32 i = 0; i < g.n; i++) {
             lp_xyz_to_id(g.xyzm + 4 * i, &v); lp_id *hit = bsearch(&v, q, m, 16, cmp_id);
-            if (hit) t[hit - q] += g.xyzm[4 * i + 3] < 1 ? 1 : (int64)g.xyzm[4 * i + 3];
+            if (hit) { uint32 run = lp_m_run(g.xyzm[4 * i + 3]); t[hit - q] += run < 1 ? 1 : (int64)run; }
         }
         State *s = palloc(sizeof(State)); s->id = q; s->times = t; s->n = m; s->i = 0; fx->user_fctx = s;
         TupleDesc td; if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("laplace_path_times: composite result expected")));
@@ -480,6 +486,6 @@ Datum laplace_path_times(PG_FUNCTION_ARGS){
     fx = SRF_PERCALL_SETUP(); State *s = fx->user_fctx;
     while (s->i < s->n && !s->times[s->i]) s->i++;
     if (s->i >= s->n) SRF_RETURN_DONE(fx);
-    Datum v[2]; bool nl[2] = { false, false }; v[0] = uuid_datum(&s->id[s->i]); v[1] = Int64GetDatum(s->times[s->i]); s->i++;
+    Datum v[2]; bool nl[2] = { false, false }; v[0] = id_datum(&s->id[s->i]); v[1] = Int64GetDatum(s->times[s->i]); s->i++;
     SRF_RETURN_NEXT(fx, HeapTupleGetDatum(heap_form_tuple(fx->tuple_desc, v, nl)));
 }

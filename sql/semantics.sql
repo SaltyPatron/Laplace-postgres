@@ -4,17 +4,17 @@
 -- here is only what is not content: who witnessed, how much they are trusted, every attestation in the order it was
 -- read, and the consensus on each claim: its Glicko-2 rating after its matchups.
 CREATE TABLE IF NOT EXISTS witness (
-  id       uuid PRIMARY KEY,                     -- an entity: the source's trunk, or any entity that testifies
-  lineage  uuid,                                 -- the witness it derives from, so copies are not independent
+  id       blake3 PRIMARY KEY,                     -- an entity: whatever testifies, named as content
+  lineage  blake3,                                 -- the witness it derives from, so copies are not independent
   trust    double precision NOT NULL             -- -1 .. 1: MANDATE is 1, no information 0, reliably wrong -1
 );
 CREATE TABLE IF NOT EXISTS attestation (         -- the ledger: append-only, in reading order
-  claim    uuid NOT NULL,
-  witness  uuid NOT NULL,
+  claim    blake3 NOT NULL,
+  witness  blake3 NOT NULL,
   score    real NOT NULL                         -- win 1, draw 0.5, loss 0, or a score between
 );
 CREATE TABLE IF NOT EXISTS consensus (           -- updated in place as matchups are played
-  claim       uuid PRIMARY KEY,
+  claim       blake3 PRIMARY KEY,
   rating      double precision NOT NULL,
   deviation   double precision NOT NULL,
   volatility  double precision NOT NULL,
