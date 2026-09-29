@@ -7,45 +7,46 @@ buffers read and hit, the partitions the plan touched, and the first rows of the
 
 Usage: python3 bench_queries.py [conninfo] [warm_runs] [setting=value ...]      (settings apply to the session)
 """
-import json, statistics, sys, time
+import json, os, statistics, sys, time
 import psycopg2
 
-DSN = sys.argv[1] if len(sys.argv) > 1 else "host=localhost port=5432 user=laplace dbname=laplace"
+DSN = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LAPLACE_CONNINFO", "host=/tmp port=5432 user=laplace dbname=laplace")
 RUNS = int(sys.argv[2]) if len(sys.argv) > 2 else 7
 con = psycopg2.connect(DSN, options=" ".join(f"-c {s}" for s in sys.argv[3:])); con.autocommit = True; cur = con.cursor()
 
-def ids(*words): return "ARRAY[" + ", ".join(f"laplace_text_id({w!r})" for w in words) + "]"
+def ids(*words): return "ARRAY[" + ", ".join(f"laplace_id({w!r})" for w in words) + "]"
 
 Q = [
     ("lookup a word by computed ID, every partition",
-     "SELECT e.tier, s.parents, s.occurrences FROM entity e JOIN entity_stats s ON s.id = e.id AND s.tier = e.tier "
-     "WHERE e.id = laplace_text_id('Holmes')"),
-    ("lookup a word by computed ID and Hilbert key, one partition",
-     "SELECT e.tier, s.parents, s.occurrences FROM entity e JOIN entity_stats s ON s.id = e.id AND s.tier = e.tier "
-     "WHERE e.tier = 2 AND e.hilbert = laplace_text_hilbert('Holmes') AND e.id = laplace_text_id('Holmes')"),
+     "SELECT e.tier, e.hilbert FROM entity e WHERE e.id = laplace_id('Holmes')"),
+    ("lookup a word by computed ID and tier, one partition",
+     "SELECT e.tier, e.hilbert FROM entity e WHERE e.tier = laplace_tier('Holmes') AND e.id = laplace_id('Holmes')"),
+    ("a phrase by the ID of its own tree: [[S,h,e,r,l,o,c,k], ' ', [H,o,l,m,e,s]]",
+     "SELECT e.tier, e.hilbert FROM entity e WHERE e.tier = laplace_tier('Sherlock Holmes') AND e.id = laplace_id('Sherlock Holmes')"),
     ("a word that was never recorded",
-     "SELECT count(*) FROM entity WHERE tier = 2 AND hilbert = laplace_text_hilbert('Xyzzyq') AND id = laplace_text_id('Xyzzyq')"),
+     "SELECT count(*) FROM entity WHERE tier = 2 AND id = laplace_id('Xyzzyq')"),
     ("every container of 'Holmes' (GIN)",
-     f"SELECT count(*) FROM physicality WHERE laplace_vertex_ids(path) @> {ids('Holmes')}"),
+     f"SELECT count(*) FROM physicality WHERE path @> {ids('Holmes')}"),
     ("the run 'Sherlock Holmes' inside containers",
-     f"SELECT count(*) FROM physicality p, unnest(laplace_follows(p.path, {ids('Sherlock', ' ')})) f "
-     f"WHERE laplace_vertex_ids(p.path) @> {ids('Sherlock', ' ', 'Holmes')} AND f = laplace_text_id('Holmes')"),
+     "SELECT count(*) FROM physicality p, unnest(laplace_follows(p.path, laplace_parts('Sherlock '))) f "
+     "WHERE p.path @> laplace_parts('Sherlock Holmes') AND f = laplace_id('Holmes')"),
     ("what follows 'the capital of '",
-     f"SELECT f, count(*) FROM physicality p, unnest(laplace_follows(p.path, {ids('the', ' ', 'capital', ' ', 'of', ' ')})) f "
-     f"WHERE laplace_vertex_ids(p.path) @> {ids('the', ' ', 'capital', ' ', 'of')} GROUP BY f ORDER BY 2 DESC LIMIT 12"),
+     "SELECT f, count(*) FROM physicality p, unnest(laplace_follows(p.path, laplace_parts('the capital of '))) f "
+     f"WHERE p.path @> {ids('the', 'capital', 'of')} GROUP BY f ORDER BY 2 DESC LIMIT 12"),
     ("what fills '[Captain, ' ', ?]' across the corpus",
-     f"SELECT f, count(*) FROM physicality p, unnest(laplace_follows(p.path, {ids('Captain', ' ')})) f "
-     f"WHERE laplace_vertex_ids(p.path) @> {ids('Captain', ' ')} GROUP BY f ORDER BY 2 DESC LIMIT 12"),
+     "SELECT f, count(*) FROM physicality p, unnest(laplace_follows(p.path, laplace_parts('Captain '))) f "
+     f"WHERE p.path @> {ids('Captain')} GROUP BY f ORDER BY 2 DESC LIMIT 12"),
     ("the 16 word segments nearest 'king' in 4D (GiST)",
-     "SELECT id, coord <<->> laplace_text_coord('king') AS d FROM entity WHERE tier = 2 "
-     "ORDER BY coord <<->> laplace_text_coord('king') LIMIT 16"),
-    ("the 20 most frequent word segments",
-     "SELECT id, occurrences FROM entity_stats WHERE tier = 2 ORDER BY occurrences DESC LIMIT 20"),
+     "SELECT id, coord <<->> laplace_coord('king') AS d FROM entity WHERE tier = 2 "
+     "ORDER BY coord <<->> laplace_coord('king') LIMIT 16"),
+    ("everything attested about 'dog', with how hard each strand tugs back",
+     "SELECT p.entity, laplace_confidence(s.rating, s.deviation) FROM physicality p JOIN standing s ON s.claim = p.entity "
+     "WHERE p.path @> ARRAY[laplace_id('dog')] ORDER BY 2 DESC LIMIT 24"),
 ]
 
 WORDS = ["the", "a", "an", "his", "one", "Italy", "Armenia", "Ahab", "Peleg", "Bildad", "Sleet", "Pollard", "Mayhew",
          "Scoresby", "Boomer", "Butler", "of", "and", "to", "in", "that", "king", "gin", "nig", "ing", "Holmes"]
-cur.execute("SELECT " + ", ".join(f"laplace_text_id(%s)" for _ in WORDS), WORDS)
+cur.execute("SELECT " + ", ".join(f"laplace_id(%s)" for _ in WORDS), WORDS)
 NAME = {str(u): w for u, w in zip(cur.fetchone(), WORDS)}
 
 def walk(plan, acc):

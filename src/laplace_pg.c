@@ -17,7 +17,7 @@
 #include "lib/stringinfo.h"
 #include "laplace/laplace.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.1");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.6");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #define G2_Z 0x01
@@ -185,7 +185,7 @@ static const lp_tier0_record *tier0(void){
 void _PG_init(void);
 void _PG_init(void){
     DefineCustomStringVariable("laplace.tier0", "Path of the tier-0 perf-cache (1,114,112 64-byte records).", NULL, &tier0_path,
-                               "/repos/src/Laplace-Prototype/tier0/tier0.bin", PGC_SUSET, 0, NULL, NULL, NULL);
+                               lp_tier0_path(), PGC_SUSET, 0, NULL, NULL, NULL);
 }
 
 /* The coordinate of a text taken as one composition of its codepoints: the exact centroid of their tier-0 points. */
@@ -227,23 +227,91 @@ Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
     PG_RETURN_BYTEA_P(b);
 }
 
-/* ---------------------------------------------------------------- recomposition: an entity back to its text */
-/* Atoms: tier-0 IDs to codepoints, an open-addressed table built once per backend from the perf-cache. */
-static uint32 *atom_slot; static const uint32 ATOM_CAP = 1u << 22;          /* holds codepoint + 1; 0 is empty */
-static int64 atom_of(const uint8 *id){
-    const lp_tier0_record *T = tier0();
-    if (!atom_slot) {
-        atom_slot = MemoryContextAllocZero(TopMemoryContext, sizeof(uint32) * ATOM_CAP);
-        for (uint32 cp = 0; cp < LP_NCP; cp++) {
-            uint64 h; memcpy(&h, T[cp].id.b, 8); uint32 s = (uint32)(h & (ATOM_CAP - 1));
-            while (atom_slot[s]) s = (s + 1) & (ATOM_CAP - 1);
-            atom_slot[s] = cp + 1;
-        }
-    }
-    uint64 h; memcpy(&h, id, 8); uint32 s = (uint32)(h & (ATOM_CAP - 1));
-    while (atom_slot[s]) { if (!memcmp(T[atom_slot[s] - 1].id.b, id, 16)) return atom_slot[s] - 1; s = (s + 1) & (ATOM_CAP - 1); }
-    return -1;
+/* ---------------------------------------------------------------- a text's entity, computed in place
+ * The one decomposition of text (UAX #29, Laplace-Native), composed without recording: the ID, tier, coordinate and
+ * constituents the engine gives the same text. A constant argument folds at plan time, so the query becomes an index
+ * lookup on the result. */
+static lp_text *TX;
+static lp_ref trunk_of(text *t, lp_ref *parts, size_t cap, size_t *np){
+    if (!TX) { TX = lp_text_new(tier0()); if (!TX) ereport(ERROR, (errmsg("laplace: cannot open ICU's break iterators"))); }
+    lp_ref one; size_t n;
+    return lp_text_parts(TX, (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), parts ? parts : &one, parts ? cap : 1, np ? np : &n);
 }
+
+PG_FUNCTION_INFO_V1(laplace_id);
+Datum laplace_id(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
+    lp_ref r = trunk_of(t, NULL, 0, NULL); return uuid_datum(&r.id);
+}
+
+PG_FUNCTION_INFO_V1(laplace_tier);
+Datum laplace_tier(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
+    PG_RETURN_INT16((int16)trunk_of(t, NULL, 0, NULL).tier);
+}
+
+PG_FUNCTION_INFO_V1(laplace_coord_ewkb);
+Datum laplace_coord_ewkb(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
+    lp_ref r = trunk_of(t, NULL, 0, NULL);
+    double x[4]; for (int d = 0; d < 4; d++) x[d] = (double)r.c.m[d] / LP_FIXED_ONE;
+    bytea *b = palloc(VARHDRSZ + 37); SET_VARSIZE(b, VARHDRSZ + 37); lp_ewkb_point4(x, (uint8 *)VARDATA(b), 37);
+    PG_RETURN_BYTEA_P(b);
+}
+
+/* The stored Hilbert key of a text's entity. */
+PG_FUNCTION_INFO_V1(laplace_hilbert);
+Datum laplace_hilbert(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
+    lp_ref r = trunk_of(t, NULL, 0, NULL);
+    PG_RETURN_INT64((int64)(lp_hilbert4(&r.c) ^ 0x8000000000000000ull));
+}
+
+/* The constituents of a text's entity, in order, repeats included: the phrase to look for inside paths. */
+PG_FUNCTION_INFO_V1(laplace_parts);
+Datum laplace_parts(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL();
+    size_t cap = VARSIZE_ANY_EXHDR(t) + 1, n; lp_ref *parts = palloc(sizeof(lp_ref) * cap);
+    trunk_of(t, parts, cap, &n); if (n > cap) n = cap;
+    lp_id *ids = palloc(sizeof(lp_id) * n); for (size_t i = 0; i < n; i++) ids[i] = parts[i].id;
+    PG_RETURN_ARRAYTYPE_P(uuid_array(ids, (int)n));
+}
+
+/* Which tier 0 this database computes with. */
+PG_FUNCTION_INFO_V1(laplace_fingerprint);
+Datum laplace_fingerprint(PG_FUNCTION_ARGS){
+    uint8 h[32]; char hex[65]; lp_tier0_fingerprint(tier0(), h);
+    for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+    PG_RETURN_TEXT_P(cstring_to_text(hex));
+}
+
+/* ---------------------------------------------------------------- shape measures on real coordinates */
+PG_FUNCTION_INFO_V1(laplace_frechet4d_outliers);
+Datum laplace_frechet4d_outliers(PG_FUNCTION_ARGS){
+    Geo a = geo_of(PG_GETARG_DATUM(0)), b = geo_of(PG_GETARG_DATUM(1)); int32 k = PG_GETARG_INT32(2);
+    if (k < 0 || k > 8) ereport(ERROR, (errmsg("laplace_frechet4d: between 0 and 8 vertices can be skipped")));
+    PG_RETURN_FLOAT8(lp_frechet4_outliers(a.xyzm, a.n, b.xyzm, b.n, (unsigned)k));
+}
+PG_FUNCTION_INFO_V1(laplace_dtw4d);
+Datum laplace_dtw4d(PG_FUNCTION_ARGS){
+    Geo a = geo_of(PG_GETARG_DATUM(0)), b = geo_of(PG_GETARG_DATUM(1));
+    PG_RETURN_FLOAT8(lp_dtw4(a.xyzm, a.n, b.xyzm, b.n, NULL));
+}
+PG_FUNCTION_INFO_V1(laplace_edr4d);
+Datum laplace_edr4d(PG_FUNCTION_ARGS){
+    Geo a = geo_of(PG_GETARG_DATUM(0)), b = geo_of(PG_GETARG_DATUM(1));
+    PG_RETURN_INT64((int64)lp_edr4(a.xyzm, a.n, b.xyzm, b.n, PG_GETARG_FLOAT8(2)));
+}
+
+/* How hard a strand tugs back, from a standing. */
+PG_FUNCTION_INFO_V1(laplace_confidence);
+Datum laplace_confidence(PG_FUNCTION_ARGS){
+    lp_rating r = { PG_GETARG_FLOAT8(0), PG_GETARG_FLOAT8(1), 0.06 };
+    PG_RETURN_FLOAT8(lp_confidence(&r, PG_GETARG_FLOAT8(2)));
+}
+
+/* ---------------------------------------------------------------- recomposition: an entity back to its text */
+static int64 atom_of(const uint8 *id){ return lp_tier0_codepoint(tier0(), (const lp_id *)id); }
 static SPIPlanPtr path_plan;
 static void recompose(const uint8 *id, StringInfo out, int depth){
     int64 cp = atom_of(id);
