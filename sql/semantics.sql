@@ -2,7 +2,7 @@
 -- A claim is a composition: an entity with a physicality path of the entities it relates, hashed like any path, so it
 -- lives in entity and physicality with all other content and GIN finds every claim that touches an entity. What sits
 -- here is only what is not content: who witnessed, how much they are trusted, every attestation in the order it was
--- read, and each claim's Glicko-2 standing after its matchups.
+-- read, and the consensus on each claim: its Glicko-2 rating after its matchups.
 CREATE TABLE IF NOT EXISTS witness (
   id       uuid PRIMARY KEY,                     -- an entity: the source's trunk, or any entity that testifies
   lineage  uuid,                                 -- the witness it derives from, so copies are not independent
@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS attestation (         -- the ledger: append-only, in 
   witness  uuid NOT NULL,
   score    real NOT NULL                         -- win 1, draw 0.5, loss 0, or a score between
 );
-CREATE TABLE IF NOT EXISTS standing (            -- updated in place as matchups are played
+CREATE TABLE IF NOT EXISTS consensus (           -- updated in place as matchups are played
   claim       uuid PRIMARY KEY,
   rating      double precision NOT NULL,
   deviation   double precision NOT NULL,
