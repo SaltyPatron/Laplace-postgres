@@ -20,3 +20,5 @@ CREATE TABLE IF NOT EXISTS standing (            -- updated in place as matchups
   volatility  double precision NOT NULL,
   matches     integer NOT NULL
 ) WITH (fillfactor = 80);
+-- The position a witness gave a claim among its like (the order it lists a word's senses in), recorded as given.
+ALTER TABLE attestation ADD COLUMN IF NOT EXISTS position integer;

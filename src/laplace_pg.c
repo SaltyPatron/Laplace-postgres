@@ -17,7 +17,7 @@
 #include "lib/stringinfo.h"
 #include "laplace/laplace.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.6");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "0.7");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #define G2_Z 0x01
@@ -174,6 +174,7 @@ Datum laplace_centroid4d_final(PG_FUNCTION_ARGS){
 
 /* ---------------------------------------------------------------- the tier-0 perf-cache: coordinates computed in place */
 static char *tier0_path = NULL;
+static char *flags_path = NULL;
 static const lp_tier0_record *T0;
 static const lp_tier0_record *tier0(void){
     if (!T0) {
@@ -186,6 +187,8 @@ void _PG_init(void);
 void _PG_init(void){
     DefineCustomStringVariable("laplace.tier0", "Path of the tier-0 perf-cache (1,114,112 64-byte records).", NULL, &tier0_path,
                                lp_tier0_path(), PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomStringVariable("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", NULL, &flags_path,
+                               lp_flags_path(), PGC_SUSET, 0, NULL, NULL, NULL);
 }
 
 /* The coordinate of a text taken as one composition of its codepoints: the exact centroid of their tier-0 points. */
@@ -226,6 +229,47 @@ Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
     bytea *b = palloc(VARHDRSZ + 37); SET_VARSIZE(b, VARHDRSZ + 37); lp_ewkb_point4(x, (uint8 *)VARDATA(b), 37);
     PG_RETURN_BYTEA_P(b);
 }
+
+/* ---------------------------------------------------------------- the flags that go with tier 0
+ * What the Unicode Standard says of a codepoint, from the memory-mapped flags: by the property's name and the value's
+ * name as the standard writes them, short or as they are said. Nothing is read from a table. */
+static const lp_layout *FL;
+static const lp_layout *flags(void){
+    if (!FL) { FL = lp_flags_map(flags_path); if (!FL) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", flags_path ? flags_path : lp_flags_path()))); }
+    return FL;
+}
+static const lp_field *field_of(text *t){
+    char *n = text_to_cstring(t); const lp_field *f = lp_flags_field(flags(), n);
+    if (!f) ereport(ERROR, (errmsg("laplace: the standard lists no property \"%s\"", n)));
+    return f;
+}
+static int64 cp_of_id(pg_uuid_t *u){ return lp_tier0_codepoint(tier0(), (const lp_id *)u->data); }
+static Datum said(int64 cp, text *property){
+    if (cp < 0 || cp >= LP_NCP) return (Datum)0;
+    const lp_layout *l = flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
+    return PointerGetDatum(cstring_to_text(f->nvalues ? l->value[f->first + v].say : v ? "Yes" : "No"));
+}
+static int is(int64 cp, text *property, text *value){
+    if (cp < 0 || cp >= LP_NCP) return -1;
+    const lp_layout *l = flags(); const lp_field *f = field_of(property); char *vn = text_to_cstring(value); int32 want = lp_flags_value(l, f, vn);
+    if (want < 0) ereport(ERROR, (errmsg("laplace: the standard lists no value \"%s\" for %s", vn, f->say)));
+    return lp_flags_get(l, (uint32)cp, f) == (uint32)want;
+}
+PG_FUNCTION_INFO_V1(laplace_cp_flags);
+Datum laplace_cp_flags(PG_FUNCTION_ARGS){
+    int32 cp = PG_GETARG_INT32(0); if (cp < 0 || (uint32)cp >= LP_NCP) PG_RETURN_NULL();
+    bytea *b = palloc(VARHDRSZ + 32); SET_VARSIZE(b, VARHDRSZ + 32); memcpy(VARDATA(b), flags()->flags[cp].b, 32); PG_RETURN_BYTEA_P(b);
+}
+PG_FUNCTION_INFO_V1(laplace_cp_said);
+Datum laplace_cp_said(PG_FUNCTION_ARGS){ Datum d = said(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }
+PG_FUNCTION_INFO_V1(laplace_said);
+Datum laplace_said(PG_FUNCTION_ARGS){ Datum d = said(cp_of_id(PG_GETARG_UUID_P(0)), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }
+PG_FUNCTION_INFO_V1(laplace_cp_is);
+Datum laplace_cp_is(PG_FUNCTION_ARGS){ int r = is(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
+PG_FUNCTION_INFO_V1(laplace_is);
+Datum laplace_is(PG_FUNCTION_ARGS){ int r = is(cp_of_id(PG_GETARG_UUID_P(0)), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
+PG_FUNCTION_INFO_V1(laplace_codepoint);
+Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id(PG_GETARG_UUID_P(0)); if (cp < 0) PG_RETURN_NULL(); PG_RETURN_INT32((int32)cp); }
 
 /* ---------------------------------------------------------------- a text's entity, computed in place
  * The one decomposition of text (UAX #29, Laplace-Native), composed without recording: the ID, tier, coordinate and
