@@ -40,7 +40,7 @@ Q = [
      "SELECT id, coord <<->> laplace_coord('king') AS d FROM entity WHERE tier = 2 "
      "ORDER BY coord <<->> laplace_coord('king') LIMIT 16"),
     ("everything attested about 'dog', with how hard each strand tugs back",
-     "SELECT p.entity, laplace_confidence(s.rating, s.deviation) FROM physicality p JOIN standing s ON s.claim = p.entity "
+     "SELECT p.entity, laplace_confidence(s.rating, s.deviation) FROM physicality p JOIN consensus s ON s.claim = p.entity "
      "WHERE p.path @> ARRAY[laplace_id('dog')] ORDER BY 2 DESC LIMIT 24"),
 ]
 
