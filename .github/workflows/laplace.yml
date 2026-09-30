@@ -1,0 +1,33 @@
+# Laplace-postgres on its runner: the extension built with icx against the machine's PostgreSQL, installed into its
+# extension directories by rename (the group's right; no root; a backend holding the old library keeps its inode), and
+# the extension updated in the database. Laplace-Native is checked out beside it (private: the secret LAPLACE_CHECKOUT).
+name: Laplace-postgres
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  extension:
+    runs-on: [self-hosted, laplace, Laplace-postgres]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: Laplace-postgres }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", path: Laplace-Native, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+      - name: build
+        run: |
+          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+          export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
+          cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
+      - name: install by rename
+        run: |
+          stage=$(mktemp -d); DESTDIR=$stage cmake --install "$LAPLACE_BUILD/Laplace-postgres/icx-release" >/dev/null
+          (cd "$stage" && find . -type f) | while read -r f; do mv -f "$stage/$f" "/${f#./}"; echo "/${f#./}"; done; rm -rf "$stage"
+      - name: the extension in the database
+        run: |
+          db=$(echo "$LAPLACE_CONNINFO" | sed -n 's/.*dbname=\([^ ]*\).*/\1/p')
+          if "$LAPLACE_PG_DIR/bin/psql" "${LAPLACE_CONNINFO/dbname=$db/dbname=postgres}" -XAtc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1; then
+            "$LAPLACE_PG_DIR/bin/psql" "$LAPLACE_CONNINFO" -X -v ON_ERROR_STOP=1 -c "ALTER EXTENSION laplace UPDATE" -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'laplace'"
+          else echo "no database $db yet: the Engine's deploy makes it"; fi
