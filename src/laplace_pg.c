@@ -215,6 +215,15 @@ Datum laplace_centroid4d_final(PG_FUNCTION_ARGS){
 /* ---------------------------------------------------------------- the tier-0 perf-cache: coordinates computed in place */
 static char *tier0_path = NULL;
 static char *flags_path = NULL;
+static char *highway_path = NULL;
+static const lp_highway *HW;
+static const lp_highway *highway(void){
+    if (!HW) {
+        HW = lp_highway_map(highway_path);
+        if (!HW) ereport(ERROR, (errmsg("laplace: cannot map the highway at \"%s\" (laplace.highway; generate it with: laplace highway)", highway_path)));
+    }
+    return HW;
+}
 static const lp_tier0_record *T0;
 static const lp_tier0_record *tier0(void){
     if (!T0) {
@@ -229,6 +238,8 @@ void _PG_init(void){
                                lp_tier0_path(), PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", NULL, &flags_path,
                                lp_flags_path(), PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomStringVariable("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", NULL, &highway_path,
+                               lp_highway_path(), PGC_SUSET, 0, NULL, NULL, NULL);
 }
 
 /* The coordinate of a text taken as one composition of its codepoints: the exact centroid of their tier-0 points. */
@@ -528,6 +539,41 @@ Datum laplace_paths(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_b
 static Kept attested_kept = { "laplace_attested", "SELECT a.claim, a.witness, a.position, w.trust FROM attestation a JOIN witness w ON w.id = a.witness WHERE a.claim = ANY($1)", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_attested);
 Datum laplace_attested(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attested", &td); set_run(fcinfo, &attested_kept, ts, td); PG_RETURN_NULL(); }
+
+/* ---------------------------------------------------------------- the highway: the types, in place
+ * A type is a slot of a list; its content's ID is the record's. laplace_type(list, text) gives the slot of the type
+ * whose content is that text (the text taken as one composition of its codepoints, as laplace_text_id does), -1 when
+ * the list has none; laplace_type_id(list, slot) the content's ID; laplace_type_edges(a, slot, b) the slots of list b
+ * a slot of list a maps to. */
+static lp_ref trunk_of(text *t, lp_ref *parts, size_t cap, size_t *np);
+PG_FUNCTION_INFO_V1(laplace_type);
+Datum laplace_type(PG_FUNCTION_ARGS){
+    const lp_highway *h = highway(); char *ln = text_to_cstring(PG_GETARG_TEXT_PP(0)); const lp_list *l = lp_highway_list(h, ln);
+    if (!l) ereport(ERROR, (errmsg("laplace: the highway has no list named \"%s\"", ln)));
+    text *t = PG_GETARG_TEXT_PP(1); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_INT32(-1);
+    lp_ref r = trunk_of(t, NULL, 0, NULL);
+    PG_RETURN_INT32((int32)lp_highway_slot(h, l, &r.id));
+}
+PG_FUNCTION_INFO_V1(laplace_type_id);
+Datum laplace_type_id(PG_FUNCTION_ARGS){
+    const lp_highway *h = highway(); char *ln = text_to_cstring(PG_GETARG_TEXT_PP(0)); const lp_list *l = lp_highway_list(h, ln);
+    if (!l) ereport(ERROR, (errmsg("laplace: the highway has no list named \"%s\"", ln)));
+    int32 slot = PG_GETARG_INT32(1); const lp_tier0_record *r = slot >= 0 ? lp_highway_at(h, l, (uint32)slot) : NULL;
+    if (!r) PG_RETURN_NULL();
+    return id_datum(&r->id);
+}
+PG_FUNCTION_INFO_V1(laplace_type_edges);
+Datum laplace_type_edges(PG_FUNCTION_ARGS){
+    const lp_highway *h = highway(); char *a = text_to_cstring(PG_GETARG_TEXT_PP(0)), *b = text_to_cstring(PG_GETARG_TEXT_PP(2)); int32 slot = PG_GETARG_INT32(1);
+    const lp_edge *e; size_t n = slot >= 0 ? lp_highway_edges(h, a, (uint32)slot, b, &e) : 0;
+    Datum *d = palloc(sizeof(Datum) * (n ? n : 1)); for (size_t i = 0; i < n; i++) d[i] = Int32GetDatum((int32)e[i].to);
+    PG_RETURN_ARRAYTYPE_P(construct_array(d, (int)n, INT4OID, 4, true, TYPALIGN_INT));
+}
+PG_FUNCTION_INFO_V1(laplace_highway_fingerprint);
+Datum laplace_highway_fingerprint(PG_FUNCTION_ARGS){
+    uint8_t fp[32]; lp_highway_fingerprint(highway(), fp); char hex[65]; for (int i = 0; i < 32; i++) snprintf(hex + 2 * i, 3, "%02x", fp[i]);
+    PG_RETURN_TEXT_P(cstring_to_text(hex));
+}
 
 /* ---------------------------------------------------------------- observability */
 PG_FUNCTION_INFO_V1(laplace_isa);
