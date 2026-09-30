@@ -108,6 +108,40 @@ Datum blake3_hash(PG_FUNCTION_ARGS){ uint32 h; memcpy(&h, PG_GETARG_POINTER(0), 
 PG_FUNCTION_INFO_V1(blake3_hash_extended);
 Datum blake3_hash_extended(PG_FUNCTION_ARGS){ return hash_any_extended((const unsigned char *)PG_GETARG_POINTER(0), 16, PG_GETARG_INT64(1)); }
 
+
+/* ---------------------------------------------------------------- identity */
+PG_FUNCTION_INFO_V1(laplace_cp_id);
+Datum laplace_cp_id(PG_FUNCTION_ARGS){
+    int32 cp = PG_GETARG_INT32(0); lp_id id;
+    if (cp < 0 || (uint32)cp >= LP_NCP) ereport(ERROR, (errmsg("laplace_cp_id: %d is outside the codespace", cp)));
+    lp_id_codepoint((uint32)cp, &id); return id_datum(&id);
+}
+
+PG_FUNCTION_INFO_V1(laplace_text_id);
+Datum laplace_text_id(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); lp_id id;
+    if (!lp_id_codepoints_utf8(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
+    return id_datum(&id);
+}
+
+PG_FUNCTION_INFO_V1(laplace_compose);
+Datum laplace_compose(PG_FUNCTION_ARGS){
+    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n), id;
+    if (n == 0) PG_RETURN_NULL();
+    lp_id_compose(ids, (size_t)n, &id); return id_datum(&id);
+}
+
+/* ---------------------------------------------------------------- physicality paths */
+PG_FUNCTION_INFO_V1(laplace_path_ewkb);
+Datum laplace_path_ewkb(PG_FUNCTION_ARGS){
+    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    if (n == 0) PG_RETURN_NULL();
+    size_t need = lp_ewkb_path(ids, (size_t)n, NULL, 0);
+    bytea *b = palloc(VARHDRSZ + need); SET_VARSIZE(b, VARHDRSZ + need);
+    lp_ewkb_path(ids, (size_t)n, (uint8 *)VARDATA(b), need);
+    PG_RETURN_BYTEA_P(b);
+}
+
 static int cmp_id(const void *a, const void *b){ return memcmp(a, b, 16); }
 
 PG_FUNCTION_INFO_V1(laplace_vertex_ids);
