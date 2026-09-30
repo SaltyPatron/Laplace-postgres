@@ -2,7 +2,6 @@
 
 Laplace's 4D expansion of PostgreSQL and PostGIS: identity, physicality paths, the GIN key that finds containers, continuations, 4D distance, the shape measures, Hilbert order, the wall, an exact 4D centroid aggregate, a standing's confidence, and a text's entity (its ID, tier, coordinate and constituents) computed in place from the memory-mapped tier-0 perf-cache. Standard geometry types are used as they are; the math is Laplace-Native, built in.
 
-`sql/` also holds the content schema (`schema.sql`), the semantics (`semantics.sql`), the lookups ingestion needs (`lookup.sql`), and the indexes built after a bulk load (`indexes.sql`). [Laplace-Engine](https://github.com/SaltyPatron/Laplace-Engine) runs them: `laplace deploy`, `laplace index`. The documentation is [Laplace-Wiki](https://github.com/SaltyPatron/Laplace-Wiki), published at <https://saltypatron.github.io/Laplace-Wiki/>.
 
 ## Build and install
 
@@ -16,3 +15,7 @@ python3 bench/bench_queries.py    # query benchmark: cold and warm execution, bu
 ```
 
 Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace UPDATE`, which `laplace deploy` runs), never by dropping it: indexes such as the GIN container index depend on its functions.
+
+## The schema
+
+`CREATE EXTENSION laplace` makes the five tables (entity, physicality, witness, attestation, consensus), their partitions, their indexes and the lookups, as PostGIS makes `spatial_ref_sys`; their data goes with a dump. `physicality.mask` holds what a row is and the types it holds, indexed with the path's constituents in one GIN (`laplace_path_ops`, `laplace_mask_ops`). The highway (`laplace.highway`) gives a type's slot, bit and mappings in place. `laplace_schema_indexes()` makes every index again if one was dropped.
