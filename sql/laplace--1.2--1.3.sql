@@ -129,3 +129,7 @@ CREATE FUNCTION laplace_claims_each(ids blake3[], fan bigint, bits smallint[], O
   AS 'MODULE_PATHNAME', 'laplace_claims_each' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 1024;
 CREATE FUNCTION laplace_containers(parts blake3[], bits smallint[], OUT entity blake3, OUT path geometry, OUT tier smallint, OUT mask bit) RETURNS SETOF record
   AS 'MODULE_PATHNAME', 'laplace_containers' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256;
+
+-- a type by the key a resource points at it with (from the keys beside the highway)
+CREATE FUNCTION laplace_type_key(list text, key text) RETURNS integer
+  AS 'MODULE_PATHNAME', 'laplace_type_key' LANGUAGE C STABLE STRICT PARALLEL SAFE;

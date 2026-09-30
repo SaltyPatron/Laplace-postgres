@@ -554,6 +554,12 @@ Datum laplace_type(PG_FUNCTION_ARGS){
     lp_ref r = trunk_of(t, NULL, 0, NULL);
     PG_RETURN_INT32((int32)lp_highway_slot(h, l, &r.id));
 }
+PG_FUNCTION_INFO_V1(laplace_type_key);
+Datum laplace_type_key(PG_FUNCTION_ARGS){
+    const lp_highway *h = highway(); char *ln = text_to_cstring(PG_GETARG_TEXT_PP(0)); const lp_list *l = lp_highway_list(h, ln);
+    if (!l) ereport(ERROR, (errmsg("laplace: the highway has no list named \"%s\"", ln)));
+    PG_RETURN_INT32((int32)lp_highway_key(h, l, text_to_cstring(PG_GETARG_TEXT_PP(1))));
+}
 PG_FUNCTION_INFO_V1(laplace_type_id);
 Datum laplace_type_id(PG_FUNCTION_ARGS){
     const lp_highway *h = highway(); char *ln = text_to_cstring(PG_GETARG_TEXT_PP(0)); const lp_list *l = lp_highway_list(h, ln);
