@@ -1,4 +1,4 @@
--- Indexes, built after a bulk load. Each is created on the partitioned parent, which builds one per partition.
+-- The indexes. laplace deploy makes them all from the start and every load keeps them; laplace index makes them again. Each is created on the partitioned parent, which builds one per partition.
 -- GIN over each path's packed IDs (laplace_path_ops) finds containers exactly; GiST on the real coordinates serves 4D
 -- nearest-neighbor; the semantics tables are indexed by claim and witness. The ID lookups are in lookup.sql.
 \timing on
