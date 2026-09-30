@@ -396,31 +396,138 @@ Datum laplace_confidence(PG_FUNCTION_ARGS){
 
 /* ---------------------------------------------------------------- recomposition: an entity back to its text */
 static int64 atom_of(const uint8 *id){ return lp_tier0_codepoint(tier0(), (const lp_id *)id); }
-static SPIPlanPtr path_plan;
-static void recompose(const uint8 *id, StringInfo out, int depth){
-    int64 cp = atom_of(id);
-    if (cp >= 0) { unsigned char u[4]; unicode_to_utf8((pg_wchar)cp, u); appendBinaryStringInfo(out, (const char *)u, pg_utf_mblen(u)); return; }
-    if (depth > 64) ereport(ERROR, (errmsg("laplace_text: composition deeper than 64 tiers")));
-    Datum arg = PointerGetDatum(id);
-    if (SPI_execute_plan(path_plan, &arg, NULL, true, 1) != SPI_OK_SELECT || SPI_processed == 0)
-        ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
-    bool isnull; Datum d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-    bytea *e = DatumGetByteaPCopy(d); size_t len = VARSIZE_ANY_EXHDR(e); const uint8_t *v; size_t nv = lp_ewkb_vertices((const uint8_t *)VARDATA_ANY(e), len, &v);
-    for (size_t i = 0; i < nv; i++) {
-        double m; memcpy(&m, v + 32 * i + 24, 8); lp_id cid; lp_xyz_to_id((const double *)(v + 32 * i), &cid);
-        for (int r = 0; r < (int)lp_m_run(m); r++) recompose(cid.b, out, depth + 1);
+/* The composition is read one DAG level per statement: every entity a level names that is not an atom and not yet
+ * read is fetched in one set, from the trunk down, and the text is then written out of memory in path order. */
+typedef struct { lp_id id; uint32 *kid; uint32 nkid; uint8 have; } TNode;     /* kid: indexes into the node table, one per occurrence */
+typedef struct { TNode *n; uint32 cnt, cap; uint32 *slot; uint32 nslot; MemoryContext ctx; } Tree;
+static uint32 tnode(Tree *t, const lp_id *id){
+    uint64 h; memcpy(&h, id->b, 8); uint32 k = (uint32)(h & (t->nslot - 1));
+    while (t->slot[k] != UINT32_MAX) { if (!memcmp(&t->n[t->slot[k]].id, id, 16)) return t->slot[k]; k = (k + 1) & (t->nslot - 1); }
+    if (t->cnt == t->cap) { t->cap *= 2; t->n = repalloc(t->n, sizeof(TNode) * t->cap); }
+    if (t->cnt * 2 >= t->nslot) {                                                 /* grow the slots, rehash */
+        t->nslot *= 2; t->slot = repalloc(t->slot, sizeof(uint32) * t->nslot); memset(t->slot, 0xff, sizeof(uint32) * t->nslot);
+        for (uint32 i = 0; i < t->cnt; i++) { uint64 g; memcpy(&g, t->n[i].id.b, 8); uint32 q = (uint32)(g & (t->nslot - 1)); while (t->slot[q] != UINT32_MAX) q = (q + 1) & (t->nslot - 1); t->slot[q] = i; }
+        k = (uint32)(h & (t->nslot - 1)); while (t->slot[k] != UINT32_MAX) k = (k + 1) & (t->nslot - 1);
+    }
+    TNode *x = &t->n[t->cnt]; x->id = *id; x->kid = NULL; x->nkid = 0; x->have = lp_tier0_codepoint(tier0(), id) >= 0;
+    t->slot[k] = t->cnt; return t->cnt++;
+}
+static SPIPlanPtr level_plan;
+static void read_levels(Tree *t, Oid idarr){
+    for (int depth = 0; ; depth++) {
+        if (depth > 64) ereport(ERROR, (errmsg("laplace_text: composition deeper than 64 tiers")));
+        uint32 want = 0; for (uint32 i = 0; i < t->cnt; i++) want += !t->n[i].have;
+        if (!want) return;
+        Datum *ids = palloc(sizeof(Datum) * want); uint32 w = 0;
+        for (uint32 i = 0; i < t->cnt; i++) if (!t->n[i].have) ids[w++] = PointerGetDatum(t->n[i].id.b);
+        ArrayType *arr = construct_array(ids, (int)want, get_element_type(idarr), 16, false, TYPALIGN_CHAR);
+        Datum arg = PointerGetDatum(arr);
+        if (!level_plan) { level_plan = SPI_prepare("SELECT entity, st_asewkb(path) FROM physicality WHERE entity = ANY($1)", 1, &idarr); SPI_keepplan(level_plan); }
+        if (SPI_execute_plan(level_plan, &arg, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_text: %s", SPI_result_code_string(SPI_result))));
+        if (SPI_processed < want) ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
+        for (uint64 j = 0; j < SPI_processed; j++) {
+            bool nl; lp_id id; memcpy(&id, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nl)), 16);
+            bytea *e = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nl));
+            const uint8_t *v; size_t nv = lp_ewkb_vertices((const uint8_t *)VARDATA_ANY(e), VARSIZE_ANY_EXHDR(e), &v);
+            uint32 n = 0; for (size_t i = 0; i < nv; i++) { double m; memcpy(&m, v + 32 * i + 24, 8); n += lp_m_run(m); }
+            uint32 *kid = MemoryContextAlloc(t->ctx, sizeof(uint32) * (n ? n : 1)), k = 0;
+            for (size_t i = 0; i < nv; i++) {
+                double m; memcpy(&m, v + 32 * i + 24, 8); lp_id cid; lp_xyz_to_id((const double *)(v + 32 * i), &cid);
+                uint32 c = tnode(t, &cid); for (uint32 r = 0; r < lp_m_run(m); r++) kid[k++] = c;
+            }
+            uint32 me = tnode(t, &id); t->n[me].kid = kid; t->n[me].nkid = n; t->n[me].have = 1;
+        }
+        SPI_freetuptable(SPI_tuptable); pfree(ids);
     }
 }
-
+static void render(const Tree *t, uint32 i, StringInfo out){
+    const TNode *x = &t->n[i]; int64 cp = x->nkid ? -1 : lp_tier0_codepoint(tier0(), &x->id);
+    if (cp >= 0) { unsigned char u[4]; unicode_to_utf8((pg_wchar)cp, u); appendBinaryStringInfo(out, (const char *)u, pg_utf_mblen(u)); return; }
+    for (uint32 k = 0; k < x->nkid; k++) render(t, x->kid[k], out);
+}
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
     const uint8 *u = (const uint8 *)PG_GETARG_POINTER(0); StringInfoData out; initStringInfo(&out);
+    Tree t; t.ctx = CurrentMemoryContext; t.cap = 256; t.cnt = 0; t.n = palloc(sizeof(TNode) * t.cap); t.nslot = 1024; t.slot = palloc(sizeof(uint32) * t.nslot); memset(t.slot, 0xff, sizeof(uint32) * t.nslot);
+    uint32 root = tnode(&t, (const lp_id *)u);
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
-    if (!path_plan) { Oid t = get_fn_expr_argtype(fcinfo->flinfo, 0); path_plan = SPI_prepare("SELECT st_asewkb(path) FROM physicality WHERE entity = $1 LIMIT 1", 1, &t); SPI_keepplan(path_plan); }
-    recompose(u, &out, 0);
+    read_levels(&t, get_array_type(get_fn_expr_argtype(fcinfo->flinfo, 0)));
     SPI_finish();
+    render(&t, root, &out);
     PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
+
+/* ---------------------------------------------------------------- the web: what tugs back when a strand is pulled
+ * A claim is content like any other, hashed over its parts; its tier is one above its highest part. So the claims that
+ * hold an entity are the paths above the entity's tier that contain it (the tiers at and below are pruned) that the
+ * consensus knows. Each statement is planned once per backend and the plan kept; every call is one executor run over
+ * a set, returned through a tuplestore. */
+#include "funcapi.h"
+typedef struct { const char *name; const char *sql; int nargs; SPIPlanPtr plan; } Kept;
+static Tuplestorestate *set_begin(FunctionCallInfo fcinfo, const char *name, TupleDesc *td){
+    ReturnSetInfo *rsi = (ReturnSetInfo *)fcinfo->resultinfo;
+    if (!rsi || !IsA(rsi, ReturnSetInfo) || !(rsi->allowedModes & SFRM_Materialize)) ereport(ERROR, (errmsg("%s: set-valued function called in a context that cannot accept a set", name)));
+    if (get_call_result_type(fcinfo, NULL, td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("%s: composite result expected", name)));
+    MemoryContext old = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
+    Tuplestorestate *ts = tuplestore_begin_heap(true, false, 65536); *td = CreateTupleDescCopy(*td); MemoryContextSwitchTo(old);
+    rsi->returnMode = SFRM_Materialize; rsi->setResult = ts; rsi->setDesc = *td;
+    return ts;
+}
+/* Run a kept statement over the call's arguments and hand every row through. */
+static void set_run(FunctionCallInfo fcinfo, Kept *k, Tuplestorestate *ts, TupleDesc td){
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("%s: SPI_connect", k->name)));
+    if (!k->plan) {
+        Oid t[4]; for (int i = 0; i < k->nargs; i++) t[i] = get_fn_expr_argtype(fcinfo->flinfo, i);
+        k->plan = SPI_prepare(k->sql, k->nargs, t);
+        if (!k->plan) ereport(ERROR, (errmsg("%s: SPI_prepare: %s", k->name, SPI_result_code_string(SPI_result))));
+        SPI_keepplan(k->plan);
+    }
+    Datum a[4]; for (int i = 0; i < k->nargs; i++) a[i] = PG_GETARG_DATUM(i);
+    if (SPI_execute_plan(k->plan, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("%s: %s", k->name, SPI_result_code_string(SPI_result))));
+    int nc = SPI_tuptable->tupdesc->natts;
+    for (uint64 j = 0; j < SPI_processed; j++) {
+        Datum v[8]; bool nl[8];
+        for (int c = 0; c < nc; c++) v[c] = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, c + 1, &nl[c]);
+        tuplestore_putvalues(ts, td, v, nl);
+    }
+    SPI_finish();
+}
+/* laplace_claims(parts, fan): the claims holding every one of the parts, with the consensus on each: at most fan of
+ * them. A claim sits above its highest part, so only the tiers above the parts' are read. */
+static Kept claims_kept = { "laplace_claims",
+    "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 LIMIT $2", 2, NULL };
+PG_FUNCTION_INFO_V1(laplace_claims);
+Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims", &td); set_run(fcinfo, &claims_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_claims_each(ids, fan): for each of a set of entities, the claims holding it: one call for a whole level of
+ * a walk. i is the entity's place in the set. */
+static Kept each_kept = { "laplace_claims_each",
+    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
+    "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
+    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] LIMIT $2) c", 2, NULL };
+PG_FUNCTION_INFO_V1(laplace_claims_each);
+Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims_each", &td); set_run(fcinfo, &each_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_containers(parts): every path that holds all of the parts, claims and observations alike, above them. */
+static Kept containers_kept = { "laplace_containers",
+    "SELECT p.entity, p.path, p.tier, s.claim IS NOT NULL FROM physicality p LEFT JOIN consensus s ON s.claim = p.entity "
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
+PG_FUNCTION_INFO_V1(laplace_containers);
+Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td); set_run(fcinfo, &containers_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by the
+ * next vertex of that path: what fills the gap after it. */
+static Kept fills_kept = { "laplace_fills",
+    "SELECT p.entity, t.id, t.times, p.tier FROM physicality p, laplace_path_times(p.path, $1) t "
+    "WHERE p.tier > (SELECT min(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path && $1", 1, NULL };
+PG_FUNCTION_INFO_V1(laplace_fills);
+Datum laplace_fills(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_fills", &td); set_run(fcinfo, &fills_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_paths(ids): the paths of a set of entities: one DAG level per call. */
+static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicality WHERE entity = ANY($1)", 1, NULL };
+PG_FUNCTION_INFO_V1(laplace_paths);
+Datum laplace_paths(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_paths", &td); set_run(fcinfo, &paths_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_attested(claims): who attested each of a set of claims, with the position given and the witness's trust. */
+static Kept attested_kept = { "laplace_attested", "SELECT a.claim, a.witness, a.position, w.trust FROM attestation a JOIN witness w ON w.id = a.witness WHERE a.claim = ANY($1)", 1, NULL };
+PG_FUNCTION_INFO_V1(laplace_attested);
+Datum laplace_attested(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attested", &td); set_run(fcinfo, &attested_kept, ts, td); PG_RETURN_NULL(); }
 
 /* ---------------------------------------------------------------- observability */
 PG_FUNCTION_INFO_V1(laplace_isa);
