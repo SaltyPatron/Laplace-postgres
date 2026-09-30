@@ -507,7 +507,7 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k, Tuplestorestate *ts, Tuple
  * them. A claim sits above its highest part, so only the tiers above the parts' are read. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 LIMIT $2", 2, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims", &td); set_run(fcinfo, &claims_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_claims_each(ids, fan): for each of a set of entities, the claims holding it: one call for a whole level of
@@ -515,13 +515,13 @@ Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_
 static Kept each_kept = { "laplace_claims_each",
     "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
     "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] LIMIT $2) c", 2, NULL };
+    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ?& $3 LIMIT $2) c", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims_each", &td); set_run(fcinfo, &each_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_containers(parts): every path that holds all of the parts, claims and observations alike, above them. */
 static Kept containers_kept = { "laplace_containers",
-    "SELECT p.entity, p.path, p.tier, s.claim IS NOT NULL FROM physicality p LEFT JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
+    "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
 PG_FUNCTION_INFO_V1(laplace_containers);
 Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td); set_run(fcinfo, &containers_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by the
@@ -631,6 +631,64 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     for (int i = 0; i < n; i++) { if (check[i] == GIN_TRUE) PG_RETURN_GIN_TERNARY_VALUE(GIN_TRUE); if (check[i] == GIN_MAYBE) r = GIN_MAYBE; }
     PG_RETURN_GIN_TERNARY_VALUE(r);
 }
+/* ---------------------------------------------------------------- GIN over the mask
+ * A row's mask (Semantics: Claims, Masks) is 256 bits: what the row is (a claim, a record, a tuple, a file), and the
+ * types it holds, by the highway's layout. Its keys are the positions of its set bits, so "claims that hold X" is
+ * the intersection of X's posting list with the claim bit's, in the one index over (path, mask). */
+#include "utils/varbit.h"
+#define LP_STRAT_HASBIT  1        /* mask ? int2 */
+#define LP_STRAT_HASALL  2        /* mask ?& int2[] */
+#define LP_STRAT_HASANY  3        /* mask ?| int2[] */
+static Datum *mask_keys(VarBit *m, int32 *n){
+    int len = VARBITLEN(m); const bits8 *b = VARBITS(m); Datum *k = palloc(sizeof(Datum) * (len ? len : 1)); int c = 0;
+    for (int i = 0; i < len; i++) if (b[i >> 3] & (0x80 >> (i & 7))) k[c++] = Int16GetDatum((int16)i);
+    *n = c; return k;
+}
+PG_FUNCTION_INFO_V1(laplace_mask_extract_value);
+Datum laplace_mask_extract_value(PG_FUNCTION_ARGS){ int32 *n = (int32 *)PG_GETARG_POINTER(1); PG_RETURN_POINTER(mask_keys(PG_GETARG_VARBIT_P(0), n)); }
+PG_FUNCTION_INFO_V1(laplace_mask_extract_query);
+Datum laplace_mask_extract_query(PG_FUNCTION_ARGS){
+    int32 *n = (int32 *)PG_GETARG_POINTER(1); StrategyNumber st = PG_GETARG_UINT16(2); int32 *mode = (int32 *)PG_GETARG_POINTER(6);
+    if (st == LP_STRAT_HASBIT) { Datum *k = palloc(sizeof(Datum)); k[0] = Int16GetDatum(PG_GETARG_INT16(0)); *n = 1; PG_RETURN_POINTER(k); }
+    ArrayType *a = PG_GETARG_ARRAYTYPE_P(0); Datum *v; bool *nulls; int c; deconstruct_array(a, INT2OID, 2, true, TYPALIGN_SHORT, &v, &nulls, &c);
+    *n = c; if (c == 0) *mode = st == LP_STRAT_HASALL ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
+    PG_RETURN_POINTER(v);
+}
+PG_FUNCTION_INFO_V1(laplace_mask_consistent);
+Datum laplace_mask_consistent(PG_FUNCTION_ARGS){
+    bool *check = (bool *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3); bool *recheck = (bool *)PG_GETARG_POINTER(5); *recheck = false;
+    if (st == LP_STRAT_HASANY) { for (int i = 0; i < n; i++) if (check[i]) PG_RETURN_BOOL(true); PG_RETURN_BOOL(false); }
+    for (int i = 0; i < n; i++) if (!check[i]) PG_RETURN_BOOL(false);
+    PG_RETURN_BOOL(true);
+}
+PG_FUNCTION_INFO_V1(laplace_mask_triconsistent);
+Datum laplace_mask_triconsistent(PG_FUNCTION_ARGS){
+    GinTernaryValue *check = (GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
+    if (st == LP_STRAT_HASANY) { GinTernaryValue r = GIN_FALSE; for (int i = 0; i < n; i++) { if (check[i] == GIN_TRUE) PG_RETURN_GIN_TERNARY_VALUE(GIN_TRUE); if (check[i] == GIN_MAYBE) r = GIN_MAYBE; } PG_RETURN_GIN_TERNARY_VALUE(r); }
+    GinTernaryValue r = GIN_TRUE; for (int i = 0; i < n; i++) { if (check[i] == GIN_FALSE) PG_RETURN_GIN_TERNARY_VALUE(GIN_FALSE); if (check[i] == GIN_MAYBE) r = GIN_MAYBE; }
+    PG_RETURN_GIN_TERNARY_VALUE(r);
+}
+static bool mask_bit(VarBit *m, int16 i){ return i >= 0 && i < VARBITLEN(m) && (VARBITS(m)[i >> 3] & (0x80 >> (i & 7))); }
+PG_FUNCTION_INFO_V1(laplace_mask_has);
+Datum laplace_mask_has(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_bit(PG_GETARG_VARBIT_P(0), PG_GETARG_INT16(1))); }
+static bool mask_has_array(VarBit *m, ArrayType *a, bool all){
+    Datum *v; bool *nulls; int c; deconstruct_array(a, INT2OID, 2, true, TYPALIGN_SHORT, &v, &nulls, &c);
+    for (int i = 0; i < c; i++) { bool has = mask_bit(m, DatumGetInt16(v[i])); if (all && !has) return false; if (!all && has) return true; }
+    return all;
+}
+PG_FUNCTION_INFO_V1(laplace_mask_has_all);
+Datum laplace_mask_has_all(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
+PG_FUNCTION_INFO_V1(laplace_mask_has_any);
+Datum laplace_mask_has_any(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
+/* The mask bit of a type, by its content: the highway's field for its list, plus its slot; -1 when it is no type. */
+PG_FUNCTION_INFO_V1(laplace_mask_bit);
+Datum laplace_mask_bit(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_INT16(-1);
+    lp_ref r = trunk_of(t, NULL, 0, NULL); PG_RETURN_INT16((int16)lp_highway_mask_bit(highway(), &r.id));
+}
+PG_FUNCTION_INFO_V1(laplace_mask_bit_of);
+Datum laplace_mask_bit_of(PG_FUNCTION_ARGS){ PG_RETURN_INT16((int16)lp_highway_mask_bit(highway(), (const lp_id *)PG_GETARG_POINTER(0))); }
+
 /* The operators themselves, for plans that do not use the index. */
 static bool path_has(Datum path, ArrayType *q, bool all){           /* the path decoded once, then binary search */
     Geo g = geo_of(path); int k; lp_id *ids = ids_of(q, &k);
