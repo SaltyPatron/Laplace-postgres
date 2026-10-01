@@ -67,6 +67,12 @@ static ArrayType *id_array(FunctionCallInfo fcinfo, const lp_id *ids, int n){
     for (int i = 0; i < n; i++) d[i] = id_datum(&ids[i]);
     return construct_array(d, n, el, 16, false, TYPALIGN_CHAR);
 }
+/* An array of IDs of a given element type: a slice of a prompt's constituents, as the argument's type. */
+static ArrayType *id_array_of(Oid el, const lp_id *ids, int n){
+    Datum *d = palloc(sizeof(Datum) * (n ? n : 1));
+    for (int i = 0; i < n; i++) d[i] = id_datum(&ids[i]);
+    return construct_array(d, n, el, 16, false, TYPALIGN_CHAR);
+}
 static lp_id *ids_of(ArrayType *a, int *n){
     Datum *d; bool *nulls; deconstruct_array(a, ARR_ELEMTYPE(a), 16, false, TYPALIGN_CHAR, &d, &nulls, n);
     lp_id *ids = palloc(sizeof(lp_id) * (*n ? *n : 1));
@@ -524,6 +530,35 @@ static Kept containers_kept = { "laplace_containers",
     "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
 PG_FUNCTION_INFO_V1(laplace_containers);
 Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td); set_run(fcinfo, &containers_kept, ts, td); PG_RETURN_NULL(); }
+/* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
+ * [i..j] of the prompt's constituents: the observations holding all of its parts (at most fan of them, claims left
+ * out), how many hold it as a run, and what follows the run in each, counted. One row per continuation (next, times);
+ * a segment held by nothing has one row with next null. Each segment is one kept statement: precedes, contains and
+ * co-occurrence from the trajectories, no softmax, no window. */
+static Kept forward_kept = { "laplace_forward",
+    "WITH c AS (SELECT p.path FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND NOT (p.mask ? 0::smallint) LIMIT $2), "
+    "f AS (SELECT laplace_follows(c.path, $1) AS nxt FROM c), "
+    "t AS (SELECT (SELECT count(*) FROM c) AS paths, (SELECT count(*) FROM f WHERE f.nxt IS NOT NULL) AS runs) "
+    "SELECT t.paths, t.runs, x.id, count(x.id) FROM t LEFT JOIN f ON true LEFT JOIN LATERAL unnest(f.nxt) x(id) ON true GROUP BY t.paths, t.runs, x.id", 2, NULL };
+PG_FUNCTION_INFO_V1(laplace_forward);
+Datum laplace_forward(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_forward", &td);
+    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0); Oid el = ARR_ELEMTYPE(arr); int n; lp_id *ids = ids_of(arr, &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_forward: SPI_connect")));
+    Kept *k = &forward_kept;
+    if (!k->plan) { Oid t[2] = { get_fn_expr_argtype(fcinfo->flinfo, 0), INT8OID }; k->plan = SPI_prepare(k->sql, 2, t);
+        if (!k->plan) ereport(ERROR, (errmsg("laplace_forward: SPI_prepare: %s", SPI_result_code_string(SPI_result)))); SPI_keepplan(k->plan); }
+    for (int i = 0; i < n; i++) for (int j = i; j < n; j++) {
+        Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, j - i + 1)), Int64GetDatum(fan) };
+        if (SPI_execute_plan(k->plan, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_forward: %s", SPI_result_code_string(SPI_result))));
+        for (uint64 r = 0; r < SPI_processed; r++) {
+            Datum v[6]; bool nl[6]; v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); nl[0] = nl[1] = false;
+            for (int c = 0; c < 4; c++) v[2 + c] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &nl[2 + c]);
+            tuplestore_putvalues(ts, td, v, nl);
+        }
+    }
+    SPI_finish(); PG_RETURN_NULL();
+}
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by the
  * next vertex of that path: what fills the gap after it. */
 static Kept fills_kept = { "laplace_fills",

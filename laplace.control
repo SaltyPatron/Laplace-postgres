@@ -1,5 +1,5 @@
 comment = 'Laplace: 4D expansion of PostgreSQL and PostGIS'
-default_version = '1.3'
+default_version = '1.4'
 module_pathname = '$libdir/laplace'
 requires = 'postgis'
 relocatable = true
