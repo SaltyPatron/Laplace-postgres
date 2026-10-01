@@ -510,28 +510,32 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k, Tuplestorestate *ts, Tuple
     SPI_finish();
 }
 /* laplace_claims(parts, fan): the claims holding every one of the parts, with the consensus on each: at most fan of
- * them. A claim sits above its highest part, so only the tiers above the parts' are read. */
+ * them. A claim sits one tier above its highest part (two when a repeated block lifts it), so those two tiers alone
+ * are read: the partition pruned, not every tier above. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
+    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims", &td); set_run(fcinfo, &claims_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_claims_each(ids, fan): for each of a set of entities, the claims holding it: one call for a whole level of
- * a walk. i is the entity's place in the set. */
+ * a walk. i is the entity's place in the set. The entity is a rare key (an observation, a claim), so the path alone
+ * is the index condition and the bits are a check on the rows found: the kind bit's posting list is every claim. */
 static Kept each_kept = { "laplace_claims_each",
     "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
     "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ?& $3 LIMIT $2) c", 3, NULL };
+    "WHERE p.tier BETWEEN e.tier + 1 AND e.tier + 2 AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) LIMIT $2) c", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims_each", &td); set_run(fcinfo, &each_kept, ts, td); PG_RETURN_NULL(); }
-/* laplace_containers(parts): every path that holds all of the parts, claims and observations alike, above them. */
+/* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
+ * direct constituents, so what holds the parts sits one tier above the highest of them (two when a repeated block
+ * lifts it): those two tiers alone are read. */
 static Kept containers_kept = { "laplace_containers",
     "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
+    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
 /* With no bits asked for, the mask takes no part: "any of no bits" would send the index over every row. */
 static Kept containers_any_kept = { "laplace_containers",
     "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
+    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_containers);
 Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td);
     ArrayType *bits = PG_GETARG_ARRAYTYPE_P(1); set_run(fcinfo, ArrayGetNItems(ARR_NDIM(bits), ARR_DIMS(bits)) ? &containers_kept : &containers_any_kept, ts, td); PG_RETURN_NULL(); }
@@ -541,7 +545,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = 
  * a segment held by nothing has one row with next null. Each segment is one kept statement: precedes, contains and
  * co-occurrence from the trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "WITH c AS (SELECT p.path FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND NOT (p.mask ? 0::smallint) LIMIT $2), "
+    "WITH m AS (SELECT max(e.tier) AS t FROM entity e WHERE e.id = ANY($1)), c AS (SELECT p.path FROM physicality p, m WHERE p.tier BETWEEN m.t + 1 AND m.t + 2 AND p.path @> $1 AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2), "
     "f AS (SELECT laplace_follows(c.path, $1) AS nxt FROM c), "
     "t AS (SELECT (SELECT count(*) FROM c) AS paths, (SELECT count(*) FROM f WHERE f.nxt IS NOT NULL) AS runs) "
     "SELECT t.paths, t.runs, x.id, count(x.id) FROM t LEFT JOIN f ON true LEFT JOIN LATERAL unnest(f.nxt) x(id) ON true GROUP BY t.paths, t.runs, x.id", 2, NULL };
@@ -553,7 +557,15 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
     Kept *k = &forward_kept;
     if (!k->plan) { Oid t[2] = { get_fn_expr_argtype(fcinfo->flinfo, 0), INT8OID }; k->plan = SPI_prepare(k->sql, 2, t);
         if (!k->plan) ereport(ERROR, (errmsg("laplace_forward: SPI_prepare: %s", SPI_result_code_string(SPI_result)))); SPI_keepplan(k->plan); }
-    for (int i = 0; i < n; i++) for (int j = i; j < n; j++) {
+    /* which constituents are compositions (words and above): a segment of atoms alone (a space, a letter) is a hub and
+     * says nothing of the prompt, and a single constituent is the constituents' own step, not a segment */
+    uint8 *comp = palloc0((size_t)n);
+    { static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i FROM unnest($1) WITH ORDINALITY u(id, i) JOIN entity e ON e.id = u.id WHERE e.tier > 0", 1, NULL };
+      if (!tiers_kept.plan) { Oid t[1] = { get_fn_expr_argtype(fcinfo->flinfo, 0) }; tiers_kept.plan = SPI_prepare(tiers_kept.sql, 1, t); if (!tiers_kept.plan) ereport(ERROR, (errmsg("laplace_forward: SPI_prepare tiers"))); SPI_keepplan(tiers_kept.plan); }
+      Datum a0[1] = { PointerGetDatum(arr) }; if (SPI_execute_plan(tiers_kept.plan, a0, NULL, true, 0) == SPI_OK_SELECT)
+          for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int64 i = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)); if (!nl && i >= 1 && i <= n) comp[i - 1] = 1; } }
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
+        int words = 0; for (int k = i; k <= j; k++) words += comp[k]; if (!words) continue;
         Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, j - i + 1)), Int64GetDatum(fan) };
         if (SPI_execute_plan(k->plan, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_forward: %s", SPI_result_code_string(SPI_result))));
         for (uint64 r = 0; r < SPI_processed; r++) {
