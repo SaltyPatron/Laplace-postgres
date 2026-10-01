@@ -571,7 +571,12 @@ static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicalit
 PG_FUNCTION_INFO_V1(laplace_paths);
 Datum laplace_paths(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_paths", &td); set_run(fcinfo, &paths_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_attested(claims): who attested each of a set of claims, with the position given and the witness's trust. */
-static Kept attested_kept = { "laplace_attested", "SELECT a.claim, a.witness, a.position, w.trust FROM attestation a JOIN witness w ON w.id = a.witness WHERE a.claim = ANY($1)", 1, NULL };
+/* A claim witnessed on its own is a ledger row; one witnessed within a record is a member of the record's path, and the
+ * record is the ledger row: both are found, the record's rows through the path index. */
+static Kept attested_kept = { "laplace_attested",
+    "SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) JOIN attestation a ON a.claim = u.id JOIN witness w ON w.id = a.witness "
+    "UNION ALL SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) JOIN entity e ON e.id = u.id "
+    "JOIN physicality p ON p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ? 1::smallint JOIN attestation a ON a.claim = p.entity JOIN witness w ON w.id = a.witness", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_attested);
 Datum laplace_attested(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attested", &td); set_run(fcinfo, &attested_kept, ts, td); PG_RETURN_NULL(); }
 
