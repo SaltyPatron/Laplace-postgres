@@ -475,9 +475,9 @@ Datum laplace_text(PG_FUNCTION_ARGS){
 }
 
 /* ---------------------------------------------------------------- the web: what tugs back when a strand is pulled
- * A claim is content like any other, hashed over its parts; its tier is one above its highest part. So the claims that
- * hold an entity are the paths above the entity's tier that contain it (the tiers at and below are pruned) that the
- * consensus knows. Each statement is planned once per backend and the plan kept; every call is one executor run over
+ * A claim is content like any other, hashed over its parts. A tier is a floor: what holds an entity sits above it, at
+ * whatever tier its own recipe composed it, so the claims that hold an entity are found by the ID they hold, among the
+ * paths above the entity's tier (only the tiers at and below are pruned), that the consensus knows. Each statement is planned once per backend and the plan kept; every call is one executor run over
  * a set, returned through a tuplestore. */
 #include "funcapi.h"
 typedef struct { const char *name; const char *sql; int nargs; SPIPlanPtr plan; } Kept;
@@ -510,11 +510,10 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k, Tuplestorestate *ts, Tuple
     SPI_finish();
 }
 /* laplace_claims(parts, fan): the claims holding every one of the parts, with the consensus on each: at most fan of
- * them. A claim sits one tier above its highest part (two when a repeated block lifts it), so those two tiers alone
- * are read: the partition pruned, not every tier above. */
+ * them. A claim sits above its highest part, at no fixed distance: every tier above is read, by the IDs held. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims", &td); set_run(fcinfo, &claims_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_claims_each(ids, fan): for each of a set of entities, the claims holding it: one call for a whole level of
@@ -523,19 +522,19 @@ Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_
 static Kept each_kept = { "laplace_claims_each",
     "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
     "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier BETWEEN e.tier + 1 AND e.tier + 2 AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) LIMIT $2) c", 3, NULL };
+    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) LIMIT $2) c", 3, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims_each", &td); set_run(fcinfo, &each_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
- * direct constituents, so what holds the parts sits one tier above the highest of them (two when a repeated block
- * lifts it): those two tiers alone are read. */
+ * direct constituents, so what holds the parts sits above the highest of them, at no fixed distance: every tier above
+ * is read, by the IDs held. */
 static Kept containers_kept = { "laplace_containers",
     "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
 /* With no bits asked for, the mask takes no part: "any of no bits" would send the index over every row. */
 static Kept containers_any_kept = { "laplace_containers",
     "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier BETWEEN (SELECT max(e.tier) + 1 FROM entity e WHERE e.id = ANY($1)) AND (SELECT max(e.tier) + 2 FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_containers);
 Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td);
     ArrayType *bits = PG_GETARG_ARRAYTYPE_P(1); set_run(fcinfo, ArrayGetNItems(ARR_NDIM(bits), ARR_DIMS(bits)) ? &containers_kept : &containers_any_kept, ts, td); PG_RETURN_NULL(); }
@@ -545,7 +544,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = 
  * a segment held by nothing has one row with next null. Each segment is one kept statement: precedes, contains and
  * co-occurrence from the trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "WITH m AS (SELECT max(e.tier) AS t FROM entity e WHERE e.id = ANY($1)), c AS (SELECT p.path FROM physicality p, m WHERE p.tier BETWEEN m.t + 1 AND m.t + 2 AND p.path @> $1 AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2), "
+    "WITH m AS (SELECT max(e.tier) AS t FROM entity e WHERE e.id = ANY($1)), c AS (SELECT p.path FROM physicality p, m WHERE p.tier > m.t AND p.path @> $1 AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2), "
     "f AS (SELECT laplace_follows(c.path, $1) AS nxt FROM c), "
     "t AS (SELECT (SELECT count(*) FROM c) AS paths, (SELECT count(*) FROM f WHERE f.nxt IS NOT NULL) AS runs) "
     "SELECT t.paths, t.runs, x.id, count(x.id) FROM t LEFT JOIN f ON true LEFT JOIN LATERAL unnest(f.nxt) x(id) ON true GROUP BY t.paths, t.runs, x.id", 2, NULL };
@@ -589,11 +588,14 @@ PG_FUNCTION_INFO_V1(laplace_paths);
 Datum laplace_paths(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_paths", &td); set_run(fcinfo, &paths_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_attested(claims): who attested each of a set of claims, with the position given and the witness's trust. */
 /* A claim witnessed on its own is a ledger row; one witnessed within a record is a member of the record's path, and the
- * record is the ledger row: both are found, the record's rows through the path index. */
+ * record is the ledger row: both are found, the record's rows through the path index. The records that hold a claim
+ * are found by the ID they hold; that they are records is checked on the few rows found, never searched for by itself
+ * (every record carries that bit). */
 static Kept attested_kept = { "laplace_attested",
     "SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) JOIN attestation a ON a.claim = u.id JOIN witness w ON w.id = a.witness "
-    "UNION ALL SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) JOIN entity e ON e.id = u.id "
-    "JOIN physicality p ON p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ? 1::smallint JOIN attestation a ON a.claim = p.entity JOIN witness w ON w.id = a.witness", 1, NULL };
+    "UNION ALL SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) "
+    "CROSS JOIN LATERAL (SELECT p.entity FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = u.id) AND p.path @> ARRAY[u.id] AND laplace_mask_has(p.mask, 1::smallint)) k "
+    "JOIN attestation a ON a.claim = k.entity JOIN witness w ON w.id = a.witness", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_attested);
 Datum laplace_attested(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attested", &td); set_run(fcinfo, &attested_kept, ts, td); PG_RETURN_NULL(); }
 
