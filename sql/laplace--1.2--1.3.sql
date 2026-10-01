@@ -34,6 +34,16 @@ CREATE FUNCTION laplace_mask_bit(blake3) RETURNS smallint AS 'MODULE_PATHNAME', 
 -- by tier, and the tiers measured largest again 16 ways by the first hex digit of the ID (an ID is a hash, so the
 -- parts fill evenly and a lookup by ID prunes to one). Hilbert values are unsigned 64-bit stored with the top bit
 -- flipped, so bigint order is Hilbert order.
+-- Tables that stood before the extension owned them (a database an earlier engine deployed) become its own first:
+-- CREATE TABLE IF NOT EXISTS then passes them over, and what follows adds to them.
+DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')
+             AND (c.relname IN ('entity', 'physicality', 'witness', 'attestation', 'consensus') OR c.relname ~ '^(entity|physicality)_t')
+             AND NOT EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+                             WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND e.extname = 'laplace')
+  LOOP EXECUTE format('ALTER EXTENSION laplace ADD TABLE %I', r.relname); END LOOP;
+END $$;
 CREATE TABLE IF NOT EXISTS entity (
   id       blake3   NOT NULL,
   tier     smallint NOT NULL,
