@@ -528,8 +528,13 @@ Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts =
 static Kept containers_kept = { "laplace_containers",
     "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
     "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
+/* With no bits asked for, the mask takes no part: "any of no bits" would send the index over every row. */
+static Kept containers_any_kept = { "laplace_containers",
+    "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
 PG_FUNCTION_INFO_V1(laplace_containers);
-Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td); set_run(fcinfo, &containers_kept, ts, td); PG_RETURN_NULL(); }
+Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_containers", &td);
+    ArrayType *bits = PG_GETARG_ARRAYTYPE_P(1); set_run(fcinfo, ArrayGetNItems(ARR_NDIM(bits), ARR_DIMS(bits)) ? &containers_kept : &containers_any_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (at most fan of them, claims left
  * out), how many hold it as a run, and what follows the run in each, counted. One row per continuation (next, times);
