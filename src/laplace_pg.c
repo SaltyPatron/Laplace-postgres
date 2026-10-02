@@ -541,13 +541,14 @@ Datum laplace_containers(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (at most fan of them, claims left
  * out), how many hold it as a run, and what follows the run in each, counted. One row per continuation (next, times);
- * a segment held by nothing has one row with next null. Each segment is one kept statement: precedes, contains and
- * co-occurrence from the trajectories, no softmax, no window. */
+ * a segment held by nothing, or held where nothing follows the run, has a row with next null. SQL only fetches the
+ * paths that hold a segment, through the container index (Architecture: SQL fetches and writes records); the runs are
+ * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
+ * trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "WITH m AS (SELECT max(e.tier) AS t FROM entity e WHERE e.id = ANY($1)), c AS (SELECT p.path FROM physicality p, m WHERE p.tier > m.t AND p.path @> $1 AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2), "
-    "f AS (SELECT laplace_follows(c.path, $1) AS nxt FROM c), "
-    "t AS (SELECT (SELECT count(*) FROM c) AS paths, (SELECT count(*) FROM f WHERE f.nxt IS NOT NULL) AS runs) "
-    "SELECT t.paths, t.runs, x.id, count(x.id) FROM t LEFT JOIN f ON true LEFT JOIN LATERAL unnest(f.nxt) x(id) ON true GROUP BY t.paths, t.runs, x.id", 2, NULL };
+    "SELECT p.path FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 "
+    "AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2", 2, NULL };
+typedef struct { lp_id id; int64 times; } Followed;
 PG_FUNCTION_INFO_V1(laplace_forward);
 Datum laplace_forward(PG_FUNCTION_ARGS){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_forward", &td);
@@ -563,16 +564,39 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
       if (!tiers_kept.plan) { Oid t[1] = { get_fn_expr_argtype(fcinfo->flinfo, 0) }; tiers_kept.plan = SPI_prepare(tiers_kept.sql, 1, t); if (!tiers_kept.plan) ereport(ERROR, (errmsg("laplace_forward: SPI_prepare tiers"))); SPI_keepplan(tiers_kept.plan); }
       Datum a0[1] = { PointerGetDatum(arr) }; if (SPI_execute_plan(tiers_kept.plan, a0, NULL, true, 0) == SPI_OK_SELECT)
           for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int64 i = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)); if (!nl && i >= 1 && i <= n) comp[i - 1] = 1; } }
+    /* what a segment's paths are read into is given back after the segment: a prompt has a segment for every pair of its constituents */
+    MemoryContext seg = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward segment", ALLOCSET_DEFAULT_SIZES);
     for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
         int words = 0; for (int k = i; k <= j; k++) words += comp[k]; if (!words) continue;
-        Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, j - i + 1)), Int64GetDatum(fan) };
+        MemoryContext old = MemoryContextSwitchTo(seg); int np = j - i + 1;
+        Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan) };
         if (SPI_execute_plan(k->plan, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_forward: %s", SPI_result_code_string(SPI_result))));
-        for (uint64 r = 0; r < SPI_processed; r++) {
-            Datum v[6]; bool nl[6]; v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); nl[0] = nl[1] = false;
-            for (int c = 0; c < 4; c++) v[2 + c] = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, c + 1, &nl[2 + c]);
-            tuplestore_putvalues(ts, td, v, nl);
+        SPITupleTable *tt = SPI_tuptable; uint64 paths = SPI_processed; int64 runs = 0; bool unfollowed = paths == 0;
+        /* what follows the run in each path, counted by ID: open addressing over the distinct continuations */
+        size_t nf = 0, cf = 64, cs = 256; Followed *fl = palloc(sizeof(Followed) * cf); uint32 *slot = palloc0(sizeof(uint32) * cs);
+        for (uint64 r = 0; r < paths; r++) {
+            bool isnull; Datum d = SPI_getbinval(tt->vals[r], tt->tupdesc, 1, &isnull); if (isnull) { unfollowed = true; continue; }
+            Geo g = geo_of(d); size_t len; uint8 *e = as_ewkb(&g, &len);
+            size_t cap = (size_t)g.n * 4 + 16; lp_id *out = palloc(sizeof(lp_id) * cap);
+            size_t found = lp_follows(e, len, ids + i, (size_t)np, out, cap);
+            if (!found) { unfollowed = true; continue; }                     /* it holds the parts, and not as a run that anything follows */
+            runs++; if (found > cap) found = cap;
+            for (size_t x = 0; x < found; x++) {
+                if ((nf + 1) * 2 > cs) { cs *= 2; slot = palloc0(sizeof(uint32) * cs);
+                    for (size_t y = 0; y < nf; y++) { uint64 h; memcpy(&h, fl[y].id.b, 8); size_t s = h & (cs - 1); while (slot[s]) s = (s + 1) & (cs - 1); slot[s] = (uint32)y + 1; } }
+                uint64 h; memcpy(&h, out[x].b, 8); size_t s = h & (cs - 1);
+                while (slot[s] && memcmp(&fl[slot[s] - 1].id, &out[x], 16)) s = (s + 1) & (cs - 1);
+                if (!slot[s]) { if (nf == cf) { cf *= 2; fl = repalloc(fl, sizeof(Followed) * cf); } fl[nf].id = out[x]; fl[nf].times = 0; slot[s] = (uint32)++nf; }
+                fl[slot[s] - 1].times++;
+            }
         }
+        Datum v[6]; bool nl[6] = { false, false, false, false, false, false };
+        v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum((int64)paths); v[3] = Int64GetDatum(runs);
+        for (size_t x = 0; x < nf; x++) { v[4] = id_datum(&fl[x].id); v[5] = Int64GetDatum(fl[x].times); tuplestore_putvalues(ts, td, v, nl); }
+        if (unfollowed) { v[4] = (Datum)0; nl[4] = true; v[5] = Int64GetDatum(0); tuplestore_putvalues(ts, td, v, nl); }
+        SPI_freetuptable(tt); MemoryContextSwitchTo(old); MemoryContextReset(seg);
     }
+    MemoryContextDelete(seg);
     SPI_finish(); PG_RETURN_NULL();
 }
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by the
