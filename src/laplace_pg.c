@@ -510,45 +510,72 @@ SET_FN(laplace_attested, attested_kept)
  * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
  * trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "SELECT p.path FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 "
+    "SELECT p.path, p.tier FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 "
     "AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2", 2, NULL };
-static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i FROM unnest($1) WITH ORDINALITY u(id, i) JOIN entity e ON e.id = u.id WHERE e.tier > 0", 1, NULL };
+static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i, e.tier FROM unnest($1) WITH ORDINALITY u(id, i) JOIN entity e ON e.id = u.id", 1, NULL };
+/* A segment's observations: each path as it lies, and its tier. */
+typedef struct { Datum path; int16 tier; } Held;
+typedef lp_vec(Held) Helds;
 PG_FUNCTION_INFO_V1(laplace_forward);
 Datum laplace_forward(PG_FUNCTION_ARGS){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_forward", &td);
     ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0); Oid el = ARR_ELEMTYPE(arr), at = get_fn_expr_argtype(fcinfo->flinfo, 0), types[2] = { at, INT8OID };
     int n; lp_id *ids = ids_of(arr, &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_forward: SPI_connect")));
-    /* which constituents are compositions (words and above): a segment of atoms alone (a space, a letter) is a hub and
-     * says nothing of the prompt, and a single constituent is the constituents' own step, not a segment */
-    uint8 *comp = palloc0((size_t)n);
+    /* each constituent's highest recorded tier (-1: not recorded): which are compositions (words and above), and the
+     * floor a segment's holders sit above. A segment of atoms alone (a space, a letter) is a hub and says nothing of the
+     * prompt, and a single constituent is the constituents' own step, not a segment */
+    int16 *tier = palloc(sizeof(int16) * (size_t)n); for (int i = 0; i < n; i++) tier[i] = -1;
     { Datum a0[1] = { PointerGetDatum(arr) }; kept_run(&tiers_kept, &at, a0);
-      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int64 i = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)); if (!nl && i >= 1 && i <= n) comp[i - 1] = 1; } }
-    /* what follows the run in each path, counted by ID; what a segment's paths are read into is given back after it */
+      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int64 i = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)); int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
+          if (i >= 1 && i <= n && t > tier[i - 1]) tier[i - 1] = t; } }
+    /* What holds [i..j] holds [i..j-1]: while the shorter segment's holders were all of them (fewer than the fan), the
+     * longer one's are those of them that hold its new part too and sit above its highest tier, found here, not asked
+     * for again. A segment whose shorter one reached the fan is asked of the index. */
     lp_idmap *followed = lp_idmap_sized(sizeof(int64)); lp_vec(lp_id) out = { 0 };
-    MemoryContext seg = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward segment", ALLOCSET_DEFAULT_SIZES);
-    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) {
-        int words = 0; for (int k = i; k <= j; k++) words += comp[k]; if (!words) continue;
-        MemoryContext old = MemoryContextSwitchTo(seg); int np = j - i + 1;
-        Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan) };
-        kept_run(&forward_kept, types, a);
-        SPITupleTable *tt = SPI_tuptable; uint64 paths = SPI_processed; int64 runs = 0; bool unfollowed = paths == 0;
-        lp_idmap_clear(followed);
-        for (uint64 r = 0; r < paths; r++) {
-            bool isnull; Datum d = SPI_getbinval(tt->vals[r], tt->tupdesc, 1, &isnull); if (isnull) { unfollowed = true; continue; }
-            Geo g = geo_of(d); size_t cap = g.p.n * 4 + 16; lp_vec_reserve(&out, cap);
-            size_t found = lp_path_follows(g.p, ids + i, (size_t)np, out.v, cap);
-            if (!found) { unfollowed = true; continue; }                     /* it holds the parts, and not as a run that anything follows */
-            runs++; if (found > cap) found = cap;
-            for (size_t x = 0; x < found; x++) (*(int64 *)lp_idmap_get(followed, &out.v[x], NULL))++;
+    /* the paths a segment starting at i was answered with live until the next i: what is derived from them points at them */
+    MemoryContext rowctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward rows", ALLOCSET_DEFAULT_SIZES),
+                  keepctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward held", ALLOCSET_DEFAULT_SIZES);
+    Helds held[2] = { { 0 }, { 0 } };
+    for (int i = 0; i < n; i++) {
+        MemoryContextReset(keepctx);
+        int cur = 0, have = 0, floor = tier[i], words = tier[i] > 0;                   /* have: held[cur] is every holder of [i..j-1] */
+        for (int j = i + 1; j < n; j++) {
+            words += tier[j] > 0; if (tier[j] > floor) floor = tier[j];
+            int next = cur ^ 1, np = j - i + 1; held[next].n = 0;
+            if (!words) { have = 0; continue; }
+            if (!have) {
+                MemoryContext old = MemoryContextSwitchTo(rowctx);
+                Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan) };
+                kept_run(&forward_kept, types, a);
+                MemoryContextSwitchTo(keepctx);
+                for (uint64 r = 0; r < SPI_processed; r++) { bool nl; Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl);     /* path is NOT NULL */
+                    int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
+                    lp_push(&held[next], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t }); }
+                SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
+                have = held[next].n < (size_t)fan;                                     /* fewer than the fan: every holder there is */
+            } else
+                for (size_t r = 0; r < held[cur].n; r++) { const Held *h = &held[cur].v[r]; Geo g = geo_of(h->path);
+                    if (h->tier > floor && lp_path_holds(g.p, &ids[j], 1, true)) lp_push(&held[next], *h); }
+            /* what follows the run in each path, counted by ID */
+            uint64 paths = held[next].n; int64 runs = 0; bool unfollowed = paths == 0;
+            lp_idmap_clear(followed);
+            for (size_t r = 0; r < held[next].n; r++) {
+                Geo g = geo_of(held[next].v[r].path); size_t cap = g.p.n * 4 + 16; lp_vec_reserve(&out, cap);
+                size_t found = lp_path_follows(g.p, ids + i, (size_t)np, out.v, cap);
+                if (!found) { unfollowed = true; continue; }                     /* it holds the parts, and not as a run that anything follows */
+                runs++; if (found > cap) found = cap;
+                for (size_t x = 0; x < found; x++) (*(int64 *)lp_idmap_get(followed, &out.v[x], NULL))++;
+            }
+            Datum v[6]; bool nl[6] = { false, false, false, false, false, false };
+            v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum((int64)paths); v[3] = Int64GetDatum(runs);
+            for (size_t x = 0; x < lp_idmap_count(followed); x++) { v[4] = id_datum(lp_idmap_key(followed, x)); v[5] = Int64GetDatum(*(int64 *)lp_idmap_at(followed, x)); set_put(fcinfo, ts, td, v, nl); }
+            if (unfollowed) { v[4] = (Datum)0; nl[4] = true; v[5] = Int64GetDatum(0); set_put(fcinfo, ts, td, v, nl); }
+            cur = next;
         }
-        Datum v[6]; bool nl[6] = { false, false, false, false, false, false };
-        v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum((int64)paths); v[3] = Int64GetDatum(runs);
-        for (size_t x = 0; x < lp_idmap_count(followed); x++) { v[4] = id_datum(lp_idmap_key(followed, x)); v[5] = Int64GetDatum(*(int64 *)lp_idmap_at(followed, x)); tuplestore_putvalues(ts, td, v, nl); }
-        if (unfollowed) { v[4] = (Datum)0; nl[4] = true; v[5] = Int64GetDatum(0); tuplestore_putvalues(ts, td, v, nl); }
-        SPI_freetuptable(tt); MemoryContextSwitchTo(old); MemoryContextReset(seg);
     }
-    MemoryContextDelete(seg); lp_idmap_free(followed); lp_vec_free(&out);
+    MemoryContextDelete(rowctx); MemoryContextDelete(keepctx);
+    lp_idmap_free(followed); lp_vec_free(&out); lp_vec_free(&held[0]); lp_vec_free(&held[1]);
     SPI_finish(); PG_RETURN_NULL();
 }
 
