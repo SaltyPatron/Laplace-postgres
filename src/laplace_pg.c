@@ -160,6 +160,23 @@ Datum laplace_vertex_ids(PG_FUNCTION_ARGS){
     PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, ids, m));
 }
 
+/* laplace_middle_any(path, ids): whether a path holds any of the IDs between its first part and its last, the place a
+ * claim's predicate takes, runs counted as the parts they repeat. The claim reads take out the strands a firmware
+ * refuses with it, before their fan: a restriction is applied before the sort (Sequence 15.5). */
+PG_FUNCTION_INFO_V1(laplace_middle_any);
+Datum laplace_middle_any(PG_FUNCTION_ARGS){
+    Geo g = geo_of(PG_GETARG_DATUM(0)); int nr; lp_id *refuse = ids_of(PG_GETARG_ARRAYTYPE_P(1), &nr);
+    uint64 np = 0, at = 0; for (uint32 i = 0; i < g.n; i++) np += lp_m_run(g.xyzm[4 * i + 3]);
+    if (!nr || np < 3) PG_RETURN_BOOL(false);
+    for (uint32 i = 0; i < g.n; i++) {
+        uint64 first = at; at += lp_m_run(g.xyzm[4 * i + 3]);
+        if (at - 1 < 1 || first > np - 2) continue;                       /* this vertex is only the first part, or only the last */
+        lp_id id; lp_xyz_to_id(g.xyzm + 4 * i, &id);
+        for (int z = 0; z < nr; z++) if (!memcmp(&id, &refuse[z], 16)) PG_RETURN_BOOL(true);
+    }
+    PG_RETURN_BOOL(false);
+}
+
 PG_FUNCTION_INFO_V1(laplace_follows);
 Datum laplace_follows(PG_FUNCTION_ARGS){
     Geo g = geo_of(PG_GETARG_DATUM(0)); int np; lp_id *phrase = ids_of(PG_GETARG_ARRAYTYPE_P(1), &np);
@@ -509,20 +526,20 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k, Tuplestorestate *ts, Tuple
     }
     SPI_finish();
 }
-/* laplace_claims(parts, fan): the claims holding every one of the parts, with the consensus on each: at most fan of
+/* laplace_claims(parts, fan, bits, refuse): the claims holding every one of the parts, none refused, with the consensus on each: at most fan of
  * them. A claim sits above its highest part, at no fixed distance: every tier above is read, by the IDs held. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 LIMIT $2", 3, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) LIMIT $2", 4, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims", &td); set_run(fcinfo, &claims_kept, ts, td); PG_RETURN_NULL(); }
-/* laplace_claims_each(ids, fan): for each of a set of entities, the claims holding it: one call for a whole level of
+/* laplace_claims_each(ids, fan, bits, refuse): for each of a set of entities, the claims holding it, none refused: one call for a whole level of
  * a walk. i is the entity's place in the set. The entity is a rare key (an observation, a claim), so the path alone
  * is the index condition and the bits are a check on the rows found: the kind bit's posting list is every claim. */
 static Kept each_kept = { "laplace_claims_each",
     "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
     "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) LIMIT $2) c", 3, NULL };
+    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) AND NOT laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL };
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_claims_each", &td); set_run(fcinfo, &each_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
