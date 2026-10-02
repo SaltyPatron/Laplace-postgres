@@ -840,3 +840,107 @@ Datum laplace_path_times(PG_FUNCTION_ARGS){
     Datum v[2]; bool nl[2] = { false, false }; v[0] = id_datum(&s->id[s->i]); v[1] = Int64GetDatum(s->times[s->i]); s->i++;
     SRF_RETURN_NEXT(fx, HeapTupleGetDatum(heap_form_tuple(fx->tuple_desc, v, nl)));
 }
+
+/* ---------------------------------------------------------------- COUPLE, one coarse native operator
+ * laplace_couple(occ, fan, refuse, shape, shape_n, keep): the coupling field of an admitted observation
+ * (Sequence 20.2), in one call: bounded indexed set access through SPI, everything else native.
+ *   strand       every claim holding an occurrence, refusals out before the fan (15.5): the claim's other end
+ *   containment  every observation holding an occurrence (19.3), at most the fan an occurrence
+ *   shape        the observed curves nearest the observation's own (19.6, 19.7): nominated by the GIN (what holds the
+ *                occurrences) and the GiST (what lies nearest its centroid), each realized from its children's real
+ *                coordinates and measured natively under the firmware's shape; the keep nearest, with their vertices
+ * One row a response, its route kept apart (the field is typed state, not one scalar): route 0 strand, 1 containment,
+ * 2 shape. occ: the occurrence it answers (1-based), 0 for shape. */
+typedef struct { lp_id id; double xyzm[4]; bool has; } CCoord;
+static int ccoord_cmp(const void *a, const void *b){ return memcmp(a, b, 16); }
+static void coords_spi(Oid idarr, CCoord *c, int n){                     /* every ID's real coordinate: one read */
+    if (!n) return; qsort(c, (size_t)n, sizeof(CCoord), ccoord_cmp);
+    lp_id *ids = palloc(sizeof(lp_id) * (size_t)n); for (int i = 0; i < n; i++) ids[i] = c[i].id;
+    Datum a[1] = { PointerGetDatum(id_array_of(get_element_type(idarr), ids, n)) }; Oid t[1] = { idarr };
+    if (SPI_execute_with_args("SELECT e.id, e.coord FROM entity e WHERE e.id = ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: coordinates")));
+    for (uint64 r = 0; r < SPI_processed; r++) { bool nl; CCoord key; memcpy(key.id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
+        Datum g = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl); if (nl) continue;
+        CCoord *x = bsearch(&key, c, (size_t)n, sizeof(CCoord), ccoord_cmp); if (!x) continue; Geo gg = geo_of(g); if (gg.n < 1) continue;
+        memcpy(x->xyzm, gg.xyzm, 32); x->has = true; }
+}
+typedef struct { lp_id id; lp_id *v; int nv; double d; } CCurve;
+static int ccurve_cmp(const void *a, const void *b){ double x = ((const CCurve *)a)->d, y = ((const CCurve *)b)->d; return x < y ? -1 : x > y; }
+PG_FUNCTION_INFO_V1(laplace_couple);
+Datum laplace_couple(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_couple", &td);
+    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
+    ArrayType *occa = PG_GETARG_ARRAYTYPE_P(0); int nocc; lp_id *occ = ids_of(occa, &nocc);
+    int64 fan = PG_GETARG_INT64(1); int16 shape = PG_GETARG_INT16(3); double shape_n = PG_GETARG_FLOAT8(4); int32 keep = PG_GETARG_INT32(5);
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_couple: SPI_connect")));
+    #define EMIT(ID, OCC, ROUTE, R, D, V, VIA, REL, TIER, DIST, VERT, NVERT) do { Datum o_[11]; bool n_[11] = { 0 }; \
+        o_[0] = id_datum(ID); o_[1] = Int32GetDatum(OCC); o_[2] = Int16GetDatum(ROUTE); \
+        if ((ROUTE) == 0) { o_[3] = Float8GetDatum(R); o_[4] = Float8GetDatum(D); o_[5] = Float8GetDatum(V); o_[6] = id_datum(VIA); o_[7] = id_datum(REL); } else { n_[3] = n_[4] = n_[5] = n_[6] = n_[7] = true; o_[3] = o_[4] = o_[5] = o_[6] = o_[7] = 0; } \
+        o_[8] = Int16GetDatum(TIER); if ((ROUTE) == 2) o_[9] = Float8GetDatum(DIST); else { n_[9] = true; o_[9] = 0; } \
+        if (VERT) o_[10] = PointerGetDatum(id_array_of(get_element_type(idarr), VERT, NVERT)); else { n_[10] = true; o_[10] = 0; } \
+        MemoryContext m_ = MemoryContextSwitchTo(((ReturnSetInfo *)fcinfo->resultinfo)->econtext->ecxt_per_query_memory); tuplestore_putvalues(ts, td, o_, n_); MemoryContextSwitchTo(m_); } while (0)
+    Datum fanp1 = Int64GetDatum(fan + 1), fand = Int64GetDatum(fan);
+    /* strands: every claim holding an occurrence, refusals out before the fan */
+    { Datum a[3] = { PointerGetDatum(occa), fanp1, PG_GETARG_DATUM(2) }; Oid t[3] = { idarr, INT8OID, idarr };
+      if (SPI_execute_with_args("SELECT u.i, c.path, s.rating, s.deviation, s.volatility FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
+            "CROSS JOIN LATERAL (SELECT p.entity, p.path FROM physicality p WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ? 0::smallint "
+            "AND NOT laplace_middle_any(p.path, $3) LIMIT $2) c JOIN consensus s ON s.claim = c.entity", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
+      for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
+          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc) continue;
+          Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); size_t len; uint8 *e = as_ewkb(&g, &len); lp_id part[64]; size_t np = lp_path_ids(e, len, part, 64); if (np < 2 || np > 64) continue;
+          int at = -1; for (size_t k = 0; k < np && at < 0; k++) if (!memcmp(&part[k], &occ[i], 16)) at = (int)k;
+          int other = np == 2 ? 1 - at : at == 0 ? (int)np - 1 : at == (int)np - 1 ? 0 : -1; if (at < 0 || other < 0 || !memcmp(&part[other], &occ[i], 16)) continue;
+          lp_id rel = np >= 3 ? part[1] : occ[i];
+          EMIT(&part[other], i + 1, 0, DatumGetFloat8(SPI_getbinval(tup, d, 3, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 4, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 5, &nl)), &occ[i], &rel, 0, 0.0, (lp_id *)NULL, 0); } }
+    /* containment: what holds each occurrence, the paths kept as the shape's GIN nominations */
+    lp_idmap *nom = lp_idmap_new(); CCurve *cv = NULL; int ncv = 0, ccv = 0;
+    { Datum a[2] = { PointerGetDatum(occa), fanp1 }; Oid t[2] = { idarr, INT8OID };
+      if (SPI_execute_with_args("SELECT u.i, c.entity, c.tier, c.path FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
+            "CROSS JOIN LATERAL (SELECT p.entity, p.tier, p.path FROM physicality p WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND NOT (p.mask ? 0::smallint) LIMIT $2) c", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: containment")));
+      int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: reached, never crossed */
+      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
+      for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
+          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc || held[i] > fan) continue;
+          lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(tup, d, 2, &nl)), 16); int16 tier = DatumGetInt16(SPI_getbinval(tup, d, 3, &nl));
+          EMIT(&id, i + 1, 1, 0.0, 0.0, 0.0, (lp_id *)NULL, (lp_id *)NULL, tier, 0.0, (lp_id *)NULL, 0);
+          bool fresh; lp_idmap_put(nom, &id, &fresh); if (!fresh || shape < 0) continue;
+          Geo g = geo_of(SPI_getbinval(tup, d, 4, &nl)); size_t len; uint8 *e = as_ewkb(&g, &len); size_t n = lp_path_ids(e, len, NULL, 0); if (n < 2 || n > 1024) continue;
+          if (ncv == ccv) { ccv = ccv ? ccv * 2 : 1024; cv = ccv == 1024 ? palloc(sizeof(CCurve) * (size_t)ccv) : repalloc(cv, sizeof(CCurve) * (size_t)ccv); }
+          cv[ncv].id = id; cv[ncv].v = palloc(sizeof(lp_id) * n); cv[ncv].nv = (int)lp_path_ids(e, len, cv[ncv].v, n); ncv++; } }
+    if (shape >= 0 && keep > 0) {
+        /* the observation's own curve, and its centroid for the GiST */
+        CCoord *pc = palloc(sizeof(CCoord) * (size_t)nocc); for (int i = 0; i < nocc; i++) { memset(&pc[i], 0, sizeof pc[i]); pc[i].id = occ[i]; } coords_spi(idarr, pc, nocc);
+        double *pa = palloc(sizeof(double) * 4 * (size_t)nocc), cen[4] = { 0 }; int npa = 0;
+        for (int i = 0; i < nocc; i++) { CCoord key; key.id = occ[i]; CCoord *x = bsearch(&key, pc, (size_t)nocc, sizeof(CCoord), ccoord_cmp); if (x && x->has) memcpy(pa + 4 * npa++, x->xyzm, 32); }
+        for (int i = 0; i < npa; i++) for (int k = 0; k < 4; k++) cen[k] += pa[4 * i + k] / npa;
+        if (npa >= 2) {
+            /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
+            uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt); bytea *pb = palloc(VARHDRSZ + pl); SET_VARSIZE(pb, VARHDRSZ + pl); memcpy(VARDATA(pb), pt, pl);
+            Datum a[2] = { PointerGetDatum(pb), fand }; Oid t[2] = { BYTEAOID, INT8OID };
+            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <<->> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
+            for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(tup, d, 1, &nl)), 16);
+                bool fresh; lp_idmap_put(nom, &id, &fresh); if (!fresh) continue;
+                Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); size_t len; uint8 *e = as_ewkb(&g, &len); size_t n = lp_path_ids(e, len, NULL, 0); if (n < 2 || n > 1024) continue;
+                if (ncv == ccv) { ccv = ccv ? ccv * 2 : 1024; cv = ccv == 1024 ? palloc(sizeof(CCurve) * (size_t)ccv) : repalloc(cv, sizeof(CCurve) * (size_t)ccv); }
+                cv[ncv].id = id; cv[ncv].v = palloc(sizeof(lp_id) * n); cv[ncv].nv = (int)lp_path_ids(e, len, cv[ncv].v, n); ncv++; }
+            /* every child's real coordinate, once; each curve realized and measured */
+            lp_idmap *kid = lp_idmap_new(); for (int i = 0; i < ncv; i++) for (int k = 0; k < cv[i].nv; k++) lp_idmap_put(kid, &cv[i].v[k], NULL);
+            int nk = (int)lp_idmap_count(kid); CCoord *kc = palloc(sizeof(CCoord) * (size_t)(nk ? nk : 1));
+            for (int i = 0; i < nk; i++) { memset(&kc[i], 0, sizeof kc[i]); kc[i].id = *lp_idmap_key(kid, (size_t)i); }
+            lp_idmap_free(kid); coords_spi(idarr, kc, nk);
+            double *b = palloc(sizeof(double) * 4 * 1024);
+            for (int i = 0; i < ncv; i++) { int nb = 0;
+                for (int k = 0; k < cv[i].nv; k++) { CCoord key; key.id = cv[i].v[k]; CCoord *x = bsearch(&key, kc, (size_t)nk, sizeof(CCoord), ccoord_cmp); if (x && x->has) memcpy(b + 4 * nb++, x->xyzm, 32); }
+                if (nb < 2) { cv[i].d = INFINITY; continue; }
+                switch (shape) { case 1: cv[i].d = lp_frechet4_outliers(pa, (size_t)npa, b, (size_t)nb, (unsigned)shape_n); break;
+                    case 2: { size_t s; double dd = lp_dtw4(pa, (size_t)npa, b, (size_t)nb, &s); cv[i].d = s ? dd / (double)s : dd; } break;
+                    case 3: cv[i].d = (double)lp_edr4(pa, (size_t)npa, b, (size_t)nb, shape_n); break;
+                    default: cv[i].d = lp_frechet4(pa, (size_t)npa, b, (size_t)nb); } }
+            if (ncv) qsort(cv, (size_t)ncv, sizeof(CCurve), ccurve_cmp);
+            for (int i = 0; i < ncv && i < keep; i++) if (isfinite(cv[i].d)) EMIT(&cv[i].id, 0, 2, 0.0, 0.0, 0.0, (lp_id *)NULL, (lp_id *)NULL, 0, cv[i].d, cv[i].v, cv[i].nv);
+        }
+    }
+    lp_idmap_free(nom);
+    #undef EMIT
+    SPI_finish();
+    PG_RETURN_NULL();
+}
