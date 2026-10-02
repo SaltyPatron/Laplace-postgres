@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(LaplacePostgres VERSION 0.6.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.7.0 LANGUAGES C CXX ASM)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
 if(DEFINED ENV{LAPLACE_NATIVE} AND NOT "$ENV{LAPLACE_NATIVE}" STREQUAL "")
