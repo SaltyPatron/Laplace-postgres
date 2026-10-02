@@ -916,7 +916,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
             uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt); bytea *pb = palloc(VARHDRSZ + pl); SET_VARSIZE(pb, VARHDRSZ + pl); memcpy(VARDATA(pb), pt, pl);
             Datum a[2] = { PointerGetDatum(pb), fand }; Oid t[2] = { BYTEAOID, INT8OID };
-            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <<->> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
+            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id, e.tier FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <<->> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id AND p.tier = e.tier", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
             for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(tup, d, 1, &nl)), 16);
                 bool fresh; lp_idmap_put(nom, &id, &fresh); if (!fresh) continue;
                 Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); size_t len; uint8 *e = as_ewkb(&g, &len); size_t n = lp_path_ids(e, len, NULL, 0); if (n < 2 || n > 1024) continue;
