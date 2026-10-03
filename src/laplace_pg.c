@@ -628,8 +628,8 @@ static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicalit
 PG_FUNCTION_INFO_V1(laplace_paths);
 Datum laplace_paths(PG_FUNCTION_ARGS){ TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_paths", &td); set_run(fcinfo, &paths_kept, ts, td); PG_RETURN_NULL(); }
 /* laplace_attested(claims): who attested each of a set of claims, with the position given and the witness's trust. */
-/* A claim witnessed on its own is a ledger row; one witnessed within a record is a member of the record's path, and the
- * record is the ledger row: both are found, the record's rows through the path index. The records that hold a claim
+/* A claim witnessed on its own is an attestation; one witnessed within a record is a member of the record's path, and the
+ * record is the attestation: both are found, the record's rows through the path index. The records that hold a claim
  * are found by the ID they hold; that they are records is checked on the few rows found, never searched for by itself
  * (every record carries that bit). */
 static Kept attested_kept = { "laplace_attested",
