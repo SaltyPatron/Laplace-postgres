@@ -348,7 +348,9 @@ BEGIN
   CREATE INDEX IF NOT EXISTS attestation_claim ON attestation (claim);
   CREATE INDEX IF NOT EXISTS entity_hilbert ON entity (hilbert);
   CREATE INDEX IF NOT EXISTS entity_coord ON entity USING gist (coord gist_geometry_ops_nd);
-  CREATE INDEX IF NOT EXISTS physicality_paths ON physicality USING gin (path laplace_path_ops, mask laplace_mask_ops) WITH (gin_pending_list_limit = 262144);
+  -- 32 MB a partition: a search scans the pending list, so it spills around a batch instead of holding a source.
+  -- 4 MB spilled every few thousand paths (full-page images). 256 MB held the list until the source ended.
+  CREATE INDEX IF NOT EXISTS physicality_paths ON physicality USING gin (path laplace_path_ops, mask laplace_mask_ops) WITH (gin_pending_list_limit = 32768);
   CREATE INDEX IF NOT EXISTS attestation_witness ON attestation (witness);
 END $$;
 DROP INDEX IF EXISTS physicality_paths;       -- the container index without the mask, where a database had it

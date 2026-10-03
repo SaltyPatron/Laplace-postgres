@@ -1,14 +1,13 @@
--- The container index takes a load's entries into its pending list and merges them once, when the load is done
--- (laplace ingest merges every GIN at the end of a source). At the default 4 MB the list filled every few thousand
--- paths and merged into the index's pages at random: each merge after a checkpoint wrote every page it touched into
--- the log whole, and the container index was 45% of a load's full-page images. 256 MB a partition: entries append in
--- order, and the index's own pages are written once a load.
+-- The container index appends a load's entries to a pending list. A search scans that list, so the list spills
+-- around a batch (32 MB a partition) and the batch drains it. At the default 4 MB the list filled every few thousand
+-- paths and merged into random pages: each merge after a checkpoint wrote every page it touched into the log whole,
+-- and the container index was 45% of a load's full-page images.
 DO $$
 DECLARE r record;
 BEGIN
   FOR r IN SELECT c.oid::regclass AS i FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE a.amname = 'gin' AND c.relkind = 'i'
            AND c.relname LIKE 'physicality%' LOOP
-    EXECUTE format('ALTER INDEX %s SET (gin_pending_list_limit = 262144)', r.i);
+    EXECUTE format('ALTER INDEX %s SET (gin_pending_list_limit = 32768)', r.i);
   END LOOP;
 END $$;
 -- The packed mask's bit functions give way to the banks'.
