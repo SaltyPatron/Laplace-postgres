@@ -786,14 +786,27 @@ PG_FUNCTION_INFO_V1(laplace_mask_has_all);
 Datum laplace_mask_has_all(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
 PG_FUNCTION_INFO_V1(laplace_mask_has_any);
 Datum laplace_mask_has_any(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
-/* The mask bit of a type, by its content: the highway's field for its list, plus its slot; -1 when it is no type. */
-PG_FUNCTION_INFO_V1(laplace_mask_bit);
-Datum laplace_mask_bit(PG_FUNCTION_ARGS){
-    text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_INT16(-1);
-    lp_ref r = trunk_of(t, NULL, 0, NULL); PG_RETURN_INT16((int16)lp_highway_mask_bit(highway(), &r.id));
+/* A value's bit in a bank (manifest/banks.tsv): its frozen slot in the bank's list, by its content as text; for the
+ * row's own bank, kind, the kinds by name. -1 when the bank does not hold it. */
+PG_FUNCTION_INFO_V1(laplace_bank_bit);
+Datum laplace_bank_bit(PG_FUNCTION_ARGS){
+    char *bank = text_to_cstring(PG_GETARG_TEXT_PP(0)); text *t = PG_GETARG_TEXT_PP(1);
+    const lp_bank *b = lp_highway_bank(highway(), bank); if (!b) ereport(ERROR, (errmsg("laplace: no bank \"%s\" (manifest/banks.tsv)", bank)));
+    if (!b->list) { char *v = text_to_cstring(t); static const char *kinds[] = { "claim", "record", "tuple", "file" };
+        for (int k = 0; k < 4; k++) if (!strcmp(v, kinds[k])) PG_RETURN_INT16(k); PG_RETURN_INT16(-1); }
+    if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_INT16(-1);
+    lp_ref r = trunk_of(t, NULL, 0, NULL); int64 slot = lp_highway_slot(highway(), b->list, &r.id);
+    PG_RETURN_INT16(slot >= 0 && slot < b->width ? (int16)slot : -1);
 }
-PG_FUNCTION_INFO_V1(laplace_mask_bit_of);
-Datum laplace_mask_bit_of(PG_FUNCTION_ARGS){ PG_RETURN_INT16((int16)lp_highway_mask_bit(highway(), (const lp_id *)PG_GETARG_POINTER(0))); }
+/* The bank a type is a value of, and its bit there, by the type's ID; no row when it is a value of no bank. */
+PG_FUNCTION_INFO_V1(laplace_bank_of);
+Datum laplace_bank_of(PG_FUNCTION_ARGS){
+    int32_t bit; const lp_bank *b = lp_highway_bank_of(highway(), (const lp_id *)PG_GETARG_POINTER(0), &bit);
+    TupleDesc td; if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("laplace_bank_of: a record is returned")));
+    if (!b) PG_RETURN_NULL();
+    Datum v[4] = { CStringGetTextDatum(b->name), CStringGetTextDatum(b->group), CStringGetTextDatum(b->carrier), Int16GetDatum((int16)bit) }; bool nl[4] = { 0 };
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), v, nl)));
+}
 
 /* The operators themselves, for plans that do not use the index. */
 static bool path_has(Datum path, ArrayType *q, bool all){           /* the path decoded once, then binary search */
