@@ -1,7 +1,11 @@
 # Laplace-postgres on its runner: the extension built with icx against the machine's PostgreSQL, installed into its
 # extension directories by rename (the group's right; no root; a backend holding the old library keeps its inode), and
-# the extension updated in the database. Laplace-Native is checked out beside it (private: the secret LAPLACE_CHECKOUT).
+# the extension updated in the database. Laplace-Native is checked out beside it (private: the secret LAPLACE_CHECKOUT),
+# and Laplace-Operations for laplace.env, the one definition of the database. Before the database is updated, the
+# extension is installed fresh into a scratch database at its newest version, so a script that cannot install fails here.
 name: Laplace-postgres
+env:
+  LAPLACE_CONNINFO: ""   # laplace.env's
 on:
   workflow_dispatch:
   push:
@@ -15,6 +19,8 @@ jobs:
         with: { path: Laplace-postgres }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", path: Laplace-Native, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
@@ -25,9 +31,20 @@ jobs:
         run: |
           stage=$(mktemp -d); DESTDIR=$stage cmake --install "$LAPLACE_BUILD/Laplace-postgres/icx-release" >/dev/null
           (cd "$stage" && find . -type f) | while read -r f; do mv -f "$stage/$f" "/${f#./}"; echo "/${f#./}"; done; rm -rf "$stage"
+      - name: the extension installed fresh, at its newest version
+        run: |
+          . Laplace-Operations/laplace.env
+          scratch=laplace_ci_$GITHUB_RUN_ID; admin=$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=postgres/")
+          "$LAPLACE_PG_DIR/bin/psql" "$admin" -X -v ON_ERROR_STOP=1 -qc "CREATE DATABASE $scratch"
+          trap '"$LAPLACE_PG_DIR/bin/psql" "$admin" -X -qc "DROP DATABASE IF EXISTS $scratch WITH (FORCE)"' EXIT
+          "$LAPLACE_PG_DIR/bin/psql" "$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$scratch/")" -X -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION postgis" -c "CREATE EXTENSION laplace" \
+            -c "SELECT extversion FROM pg_extension WHERE extname = 'laplace'"
       - name: the extension in the database
         run: |
-          db=$(echo "$LAPLACE_CONNINFO" | sed -n 's/.*dbname=\([^ ]*\).*/\1/p')
-          if "$LAPLACE_PG_DIR/bin/psql" "${LAPLACE_CONNINFO/dbname=$db/dbname=postgres}" -XAtc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1; then
+          . Laplace-Operations/laplace.env
+          db=$(echo "$LAPLACE_CONNINFO" | sed -n 's/.*dbname=\([^ ]*\).*/\1/p'); admin=$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=postgres/")
+          [ -n "$db" ] || { echo "laplace.env names no database"; exit 1; }
+          if "$LAPLACE_PG_DIR/bin/psql" "$admin" -XAtc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1; then
             "$LAPLACE_PG_DIR/bin/psql" "$LAPLACE_CONNINFO" -X -v ON_ERROR_STOP=1 -c "ALTER EXTENSION laplace UPDATE" -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'laplace'"
           else echo "no database $db yet: the Engine's deploy makes it"; fi

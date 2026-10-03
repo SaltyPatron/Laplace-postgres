@@ -248,7 +248,7 @@ CREATE OPERATOR CLASS laplace_mask_ops FOR TYPE bit USING gin AS
 -- The banks (manifest/banks.tsv): one mask per semantic group, on the row its group describes. A value's bit in its bank
 -- is its frozen slot; laplace_bank_bit('kind', 'claim') is a row's kind, laplace_bank_bit('upos', 'NOUN') a part of speech.
 CREATE FUNCTION laplace_bank_bit(bank text, value text) RETURNS smallint AS 'MODULE_PATHNAME', 'laplace_bank_bit' LANGUAGE C STABLE STRICT PARALLEL SAFE;
-CREATE FUNCTION laplace_bank_of(blake3, OUT bank text, OUT grp text, OUT carrier text, OUT bit smallint) RETURNS record AS 'MODULE_PATHNAME', 'laplace_bank_of' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_bank_of(blake3, OUT bank text, OUT grp text, OUT carrier text, OUT "bit" smallint) RETURNS record AS 'MODULE_PATHNAME', 'laplace_bank_of' LANGUAGE C STABLE STRICT PARALLEL SAFE;
 
 -- ------------------------------------------------------------------------------------------------ the tables
 -- The five tables, the extension's own (Storage: Physicality; Semantics), so a database is a Laplace database by
