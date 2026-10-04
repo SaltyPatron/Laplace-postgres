@@ -141,13 +141,22 @@ Datum laplace_point4d_gist_consistent(PG_FUNCTION_ARGS){
     PG_RETURN_BOOL(true);
 }
 
+/* An inner key: the box, and for a path key (below) its ends marked absent. Every key starts with its Box4, so the
+ * box functions serve both key sizes. */
+static void *inner_key(const Box4 *b, size_t size){
+    double *k = palloc(size); memcpy(k, b, sizeof *b);
+    for (size_t i = sizeof *b / sizeof(double); i < size / sizeof(double); i++) k[i] = NAN;
+    return k;
+}
+static Datum keys_union(GistEntryVector *v, int *size, size_t keysize){
+    Box4 u = *(const Box4 *)DatumGetPointer(v->vector[0].key);
+    for (int i = 1; i < v->n; i++) box_join(&u, (const Box4 *)DatumGetPointer(v->vector[i].key));
+    *size = (int)keysize;
+    return PointerGetDatum(inner_key(&u, keysize));
+}
 PG_FUNCTION_INFO_V1(laplace_point4d_gist_union);
 Datum laplace_point4d_gist_union(PG_FUNCTION_ARGS){
-    GistEntryVector *v = (GistEntryVector *)PG_GETARG_POINTER(0); int *size = (int *)PG_GETARG_POINTER(1);
-    Box4 *u = palloc(sizeof *u); *u = *(const Box4 *)DatumGetPointer(v->vector[0].key);
-    for (int i = 1; i < v->n; i++) box_join(u, (const Box4 *)DatumGetPointer(v->vector[i].key));
-    *size = sizeof *u;
-    PG_RETURN_POINTER(u);
+    return keys_union((GistEntryVector *)PG_GETARG_POINTER(0), (int *)PG_GETARG_POINTER(1), sizeof(Box4));
 }
 
 /* Growth of the edge sum, so a point (all edges 0) still costs what it stretches. */
@@ -168,9 +177,7 @@ static int centre_cmp(const void *a, const void *b){
     const Centre *x = a, *y = b;
     return x->c < y->c ? -1 : x->c > y->c ? 1 : (int)x->i - (int)y->i;
 }
-PG_FUNCTION_INFO_V1(laplace_point4d_gist_picksplit);
-Datum laplace_point4d_gist_picksplit(PG_FUNCTION_ARGS){
-    GistEntryVector *v = (GistEntryVector *)PG_GETARG_POINTER(0); GIST_SPLITVEC *s = (GIST_SPLITVEC *)PG_GETARG_POINTER(1);
+static Datum keys_split(GistEntryVector *v, GIST_SPLITVEC *s, size_t keysize){
     OffsetNumber last = (OffsetNumber)(v->n - 1);
     int n = last - FirstOffsetNumber + 1, axis = 0; double best = -1;
     for (int d = 0; d < 4; d++) {
@@ -189,15 +196,20 @@ Datum laplace_point4d_gist_picksplit(PG_FUNCTION_ARGS){
     qsort(c, (size_t)n, sizeof *c, centre_cmp);
     s->spl_left = palloc(sizeof(OffsetNumber) * (size_t)n); s->spl_right = palloc(sizeof(OffsetNumber) * (size_t)n);
     s->spl_nleft = s->spl_nright = 0;
-    Box4 *l = palloc(sizeof *l), *r = palloc(sizeof *r);
+    Box4 lb, rb, *l = &lb, *r = &rb;
     for (int k = 0; k < n; k++) {
         const Box4 *b = (const Box4 *)DatumGetPointer(v->vector[c[k].i].key);
         if (k < n / 2) { if (s->spl_nleft++ == 0) *l = *b; else box_join(l, b); s->spl_left[s->spl_nleft - 1] = c[k].i; }
         else { if (s->spl_nright++ == 0) *r = *b; else box_join(r, b); s->spl_right[s->spl_nright - 1] = c[k].i; }
     }
-    s->spl_ldatum = PointerGetDatum(l); s->spl_rdatum = PointerGetDatum(r);
-    PG_RETURN_POINTER(s);
+    s->spl_ldatum = PointerGetDatum(inner_key(l, keysize)); s->spl_rdatum = PointerGetDatum(inner_key(r, keysize));
+    return PointerGetDatum(s);
 }
+PG_FUNCTION_INFO_V1(laplace_point4d_gist_picksplit);
+Datum laplace_point4d_gist_picksplit(PG_FUNCTION_ARGS){
+    return keys_split((GistEntryVector *)PG_GETARG_POINTER(0), (GIST_SPLITVEC *)PG_GETARG_POINTER(1), sizeof(Box4));
+}
+
 
 PG_FUNCTION_INFO_V1(laplace_point4d_gist_same);
 Datum laplace_point4d_gist_same(PG_FUNCTION_ARGS){
@@ -214,6 +226,86 @@ Datum laplace_point4d_gist_distance(PG_FUNCTION_ARGS){
     if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_point4d_ops: unknown strategy %u", strategy)));
     *recheck = false;   /* a leaf's distance is lp_distance4's, bit for bit (header) */
     PG_RETURN_FLOAT8(box_distance((const Box4 *)DatumGetPointer(e->key), point_of(PG_GETARG_DATUM(1))));
+}
+
+/* ---------------------------------------------------------------- laplace_path4d_ops: Fréchet KNN
+ * Keys over LINESTRING ZM (a POINT ZM is a path of one vertex): the vertices' box, and at a leaf the first and last
+ * vertex (inner keys mark them absent), 128 bytes. Ordered by <%>, laplace_frechet4d, the discrete Fréchet distance
+ * (lp_frechet4). Every coupling pairs the first vertices, pairs the last ones, and pairs each query vertex with some
+ * vertex of the path, which lies in the box. So the Fréchet distance is at least the largest of: the query vertices'
+ * distances to the box, and at a leaf the first-to-first and last-to-last distances. Each is summed in lp_frechet4's
+ * order, and the gap to a box is no larger than the difference to any point in it, so the bound never exceeds the
+ * exact distance; the leaf is rechecked, which puts the rows in exact Fréchet order. */
+typedef struct { Box4 box; double first[4], last[4]; } PathKey;
+
+static inline double d2_of(const double *a, const double *b){
+    double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2], dm = a[3] - b[3];
+    return ((dx * dx + dy * dy) + dz * dz) + dm * dm;
+}
+static inline double box_gap2(const Box4 *b, const double q[4]){
+    double g[4];
+    for (int d = 0; d < 4; d++) g[d] = q[d] < b->lo[d] ? b->lo[d] - q[d] : q[d] > b->hi[d] ? q[d] - b->hi[d] : 0.0;
+    return ((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3];
+}
+static Geo path_of(Datum d){
+    Geo g = geo_of(d);
+    if (g.n == 0) ereport(ERROR, (errmsg("laplace_path4d_ops: expected a LINESTRING ZM or POINT ZM with a vertex")));
+    return g;
+}
+
+/* The key type exists for the index's storage only: shown as its box, never typed in. */
+PG_FUNCTION_INFO_V1(laplace_path4d_key_in);
+Datum laplace_path4d_key_in(PG_FUNCTION_ARGS){
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("laplace_path4d_key is an index key, not an input type")));
+    PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_path4d_key_out);
+Datum laplace_path4d_key_out(PG_FUNCTION_ARGS){ return DirectFunctionCall1(laplace_box4d_out, PG_GETARG_DATUM(0)); }
+
+PG_FUNCTION_INFO_V1(laplace_path4d_gist_compress);
+Datum laplace_path4d_gist_compress(PG_FUNCTION_ARGS){
+    GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
+    if (!e->leafkey) PG_RETURN_POINTER(e);
+    Geo g = path_of(e->key);
+    GISTENTRY *r = palloc(sizeof *r); PathKey *k = palloc(sizeof *k);
+    box_of_point(&k->box, g.xyzm);
+    for (uint32 i = 1; i < g.n; i++) { Box4 v; box_of_point(&v, g.xyzm + 4 * i); box_join(&k->box, &v); }
+    memcpy(k->first, g.xyzm, sizeof k->first); memcpy(k->last, g.xyzm + 4 * (g.n - 1), sizeof k->last);
+    gistentryinit(*r, PointerGetDatum(k), e->rel, e->page, e->offset, false);
+    PG_RETURN_POINTER(r);
+}
+
+PG_FUNCTION_INFO_V1(laplace_path4d_gist_union);
+Datum laplace_path4d_gist_union(PG_FUNCTION_ARGS){
+    return keys_union((GistEntryVector *)PG_GETARG_POINTER(0), (int *)PG_GETARG_POINTER(1), sizeof(PathKey));
+}
+PG_FUNCTION_INFO_V1(laplace_path4d_gist_picksplit);
+Datum laplace_path4d_gist_picksplit(PG_FUNCTION_ARGS){
+    return keys_split((GistEntryVector *)PG_GETARG_POINTER(0), (GIST_SPLITVEC *)PG_GETARG_POINTER(1), sizeof(PathKey));
+}
+PG_FUNCTION_INFO_V1(laplace_path4d_gist_same);
+Datum laplace_path4d_gist_same(PG_FUNCTION_ARGS){
+    bool *r = (bool *)PG_GETARG_POINTER(2);
+    *r = memcmp(PG_GETARG_POINTER(0), PG_GETARG_POINTER(1), sizeof(PathKey)) == 0;
+    PG_RETURN_POINTER(r);
+}
+
+PG_FUNCTION_INFO_V1(laplace_path4d_gist_distance);
+Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
+    GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
+    StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
+    if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_path4d_ops: unknown strategy %u", strategy)));
+    const PathKey *k = (const PathKey *)DatumGetPointer(e->key);
+    Geo q = path_of(PG_GETARG_DATUM(1));
+    double b2 = 0;
+    for (uint32 i = 0; i < q.n; i++) { double g = box_gap2(&k->box, q.xyzm + 4 * i); if (g > b2) b2 = g; }
+    if (GIST_LEAF(e)) {
+        double f = d2_of(q.xyzm, k->first), l = d2_of(q.xyzm + 4 * (q.n - 1), k->last);
+        if (f > b2) b2 = f;
+        if (l > b2) b2 = l;
+    }
+    *recheck = true;   /* a lower bound: the executor computes <%> on the row and reorders */
+    PG_RETURN_FLOAT8(sqrt(b2));
 }
 
 /* ---------------------------------------------------------------- sorted build */

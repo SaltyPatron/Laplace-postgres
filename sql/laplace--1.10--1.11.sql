@@ -68,6 +68,37 @@ CREATE OPERATOR CLASS laplace_angular4d_ops FOR TYPE geometry USING gist AS
   FUNCTION 8 laplace_angular4d_gist_distance(internal, geometry, smallint, oid, internal),
   FUNCTION 11 laplace_point4d_gist_sortsupport(internal),
   STORAGE laplace_box4d;
+-- Paths by shape (laplace_path4d_ops): GiST over LINESTRING ZM ordered by <%>, the discrete Fréchet distance
+-- (laplace_frechet4d). Its keys hold each path's box and its first and last vertex; the index gives a lower bound
+-- (the query's vertices to the box, first to first, last to last) and the rows are rechecked, so ORDER BY path <%> q
+-- LIMIT k comes out in exact Fréchet order.
+CREATE OPERATOR <%> (LEFTARG = geometry, RIGHTARG = geometry, FUNCTION = laplace_frechet4d, COMMUTATOR = <%>);
+CREATE TYPE laplace_path4d_key;
+CREATE FUNCTION laplace_path4d_key_in(cstring) RETURNS laplace_path4d_key AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path4d_key_out(laplace_path4d_key) RETURNS cstring AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE TYPE laplace_path4d_key (INPUT = laplace_path4d_key_in, OUTPUT = laplace_path4d_key_out,
+                                INTERNALLENGTH = 128, ALIGNMENT = double, STORAGE = plain);
+CREATE FUNCTION laplace_path4d_gist_compress(internal) RETURNS internal
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path4d_gist_union(internal, internal) RETURNS laplace_path4d_key
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path4d_gist_picksplit(internal, internal) RETURNS internal
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path4d_gist_same(laplace_path4d_key, laplace_path4d_key, internal) RETURNS internal
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_path4d_gist_distance(internal, geometry, smallint, oid, internal) RETURNS double precision
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE OPERATOR CLASS laplace_path4d_ops FOR TYPE geometry USING gist AS
+  OPERATOR 15 <%> (geometry, geometry) FOR ORDER BY float_ops,
+  FUNCTION 1 laplace_point4d_gist_consistent(internal, geometry, smallint, oid, internal),
+  FUNCTION 2 laplace_path4d_gist_union(internal, internal),
+  FUNCTION 3 laplace_path4d_gist_compress(internal),
+  FUNCTION 5 laplace_point4d_gist_penalty(internal, internal, internal),
+  FUNCTION 6 laplace_path4d_gist_picksplit(internal, internal),
+  FUNCTION 7 laplace_path4d_gist_same(laplace_path4d_key, laplace_path4d_key, internal),
+  FUNCTION 8 laplace_path4d_gist_distance(internal, geometry, smallint, oid, internal),
+  FUNCTION 11 laplace_point4d_gist_sortsupport(internal),
+  STORAGE laplace_path4d_key;
 
 CREATE OR REPLACE FUNCTION laplace_schema_indexes() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
