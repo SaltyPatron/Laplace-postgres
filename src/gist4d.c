@@ -16,6 +16,8 @@
 #include "access/gist.h"
 #include "access/stratnum.h"
 #include "utils/sortsupport.h"
+#include "utils/array.h"
+#include "catalog/pg_type.h"
 #include "geo.h"
 #include "laplace/laplace.h"
 #include <math.h>
@@ -306,6 +308,35 @@ Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
     }
     *recheck = true;   /* a lower bound: the executor computes <%> on the row and reorders */
     PG_RETURN_FLOAT8(sqrt(b2));
+}
+
+/* ---------------------------------------------------------------- 4D boxes as Hilbert ranges
+ * The cells of the box between two corners, as ranges of the stored Hilbert values: a table's hilbert column holds
+ * lp_hilbert4 XOR 2^63 (bigint order = Hilbert order), so each range maps to one btree range. The cells come from
+ * the corners as lp_hilbert4 makes them (lp_hilbert4_axis), so the ranges cover every point in the box; a cell on the
+ * box's faces also holds points outside it, which laplace_within4d filters. Flat: lo, hi, lo, hi, ... */
+PG_FUNCTION_INFO_V1(laplace_hilbert_ranges_flat);
+Datum laplace_hilbert_ranges_flat(PG_FUNCTION_ARGS){
+    const double *a = point_of(PG_GETARG_DATUM(0)), *b = point_of(PG_GETARG_DATUM(1)); int32 cap = PG_GETARG_INT32(2);
+    if (cap < 1 || cap > 65536) ereport(ERROR, (errmsg("laplace_hilbert_ranges: the budget is 1 to 65536 ranges, not %d", cap)));
+    uint32_t lo[4], hi[4];
+    for (int d = 0; d < 4; d++) { lo[d] = lp_hilbert4_axis(a[d]); hi[d] = lp_hilbert4_axis(b[d]); }
+    lp_hrange *r = palloc(sizeof *r * (size_t)cap);
+    size_t n = lp_hilbert4_ranges(lo, hi, r, (size_t)cap);
+    Datum *v = palloc(sizeof *v * (2 * n + 1));
+    for (size_t i = 0; i < n; i++) {
+        v[2 * i] = Int64GetDatum((int64)(r[i].lo ^ 0x8000000000000000ull));
+        v[2 * i + 1] = Int64GetDatum((int64)(r[i].hi ^ 0x8000000000000000ull));
+    }
+    PG_RETURN_ARRAYTYPE_P(construct_array_builtin(v, (int)(2 * n), INT8OID));
+}
+
+/* A point inside the box between two corners, faces included. */
+PG_FUNCTION_INFO_V1(laplace_within4d);
+Datum laplace_within4d(PG_FUNCTION_ARGS){
+    const double *p = point_of(PG_GETARG_DATUM(0)), *a = point_of(PG_GETARG_DATUM(1)), *b = point_of(PG_GETARG_DATUM(2));
+    for (int d = 0; d < 4; d++) if (!(p[d] >= a[d] && p[d] <= b[d])) PG_RETURN_BOOL(false);
+    PG_RETURN_BOOL(true);
 }
 
 /* ---------------------------------------------------------------- sorted build */

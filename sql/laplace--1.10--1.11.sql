@@ -99,6 +99,20 @@ CREATE OPERATOR CLASS laplace_path4d_ops FOR TYPE geometry USING gist AS
   FUNCTION 8 laplace_path4d_gist_distance(internal, geometry, smallint, oid, internal),
   FUNCTION 11 laplace_point4d_gist_sortsupport(internal),
   STORAGE laplace_path4d_key;
+-- 4D boxes through the Hilbert order: laplace_hilbert_ranges(lo, hi, budget) covers the box between two corners with
+-- at most budget ranges of the stored hilbert values (lp_hilbert4 XOR 2^63, bigint order), exact where the budget
+-- allows; laplace_within4d is the exact test on the coordinates. A box query on entity:
+--   SELECT e.id FROM laplace_hilbert_ranges(lo, hi) r JOIN entity e ON e.hilbert BETWEEN r.lo AND r.hi
+--   WHERE laplace_within4d(e.coord, lo, hi)
+CREATE FUNCTION laplace_hilbert_ranges_flat(geometry, geometry, integer) RETURNS bigint[]
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_hilbert_ranges(lo geometry, hi geometry, budget integer DEFAULT 64)
+  RETURNS TABLE (lo bigint, hi bigint)
+  AS $$ SELECT f[2 * i - 1], f[2 * i] FROM (SELECT laplace_hilbert_ranges_flat($1, $2, $3) AS f) s,
+              generate_series(1, coalesce(array_length(f, 1), 0) / 2) i $$
+  LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE ROWS 64;
+CREATE FUNCTION laplace_within4d(geometry, geometry, geometry) RETURNS boolean
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE OR REPLACE FUNCTION laplace_schema_indexes() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
