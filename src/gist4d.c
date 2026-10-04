@@ -64,7 +64,7 @@ static inline void direction_of(const double p[4], double u[4]){
 }
 /* The angle from a chord between unit vectors: 2 asin(c/2), with c/2 held to 1 (unit vectors are unit within
  * rounding, so a chord between opposite ones can exceed 2 by an ulp). Monotone in c. */
-static inline double angle_of_chord(double c){ double h = c / 2.0; return 2.0 * asin(h < 1.0 ? h : 1.0); }
+static inline double angle_of_chord(double c){ double h = c / 2.0; return 2.0 * asin(h > 1.0 ? 1.0 : h); }   /* NaN (the origin) passes through */
 
 /* <=>: the angle between two points' directions, in radians. */
 PG_FUNCTION_INFO_V1(laplace_angular4d);
