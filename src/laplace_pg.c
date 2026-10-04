@@ -25,29 +25,7 @@
 PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.0");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
-#define G2_Z 0x01
-#define G2_M 0x02
-#define G2_BBOX 0x04
-#define G2_GEODETIC 0x08
-#define G2_EXTENDED 0x10
-#define G2_VERSION 0x40
-
-typedef struct { uint32 type; uint32 n; const double *xyzm; } Geo;   /* POINT or LINESTRING with Z and M */
-
-static Geo geo_of(Datum d){
-    bytea *g = (bytea *)PG_DETOAST_DATUM(d); const uint8 *p = (const uint8 *)g; Geo r;
-    uint8 flags = p[7];
-    if (!(flags & G2_VERSION)) ereport(ERROR, (errmsg("laplace: expected a PostGIS geometry in serialization version 2")));
-    if (!(flags & G2_Z) || !(flags & G2_M)) ereport(ERROR, (errmsg("laplace: expected a geometry with Z and M")));
-    size_t off = 8;
-    if (flags & G2_EXTENDED) off += 8;
-    if (flags & G2_BBOX) off += (flags & G2_GEODETIC) ? 6 * sizeof(float) : 2 * 4 * sizeof(float);
-    memcpy(&r.type, p + off, 4); memcpy(&r.n, p + off + 4, 4);
-    if (r.type != 1 && r.type != 2) ereport(ERROR, (errmsg("laplace: expected a POINT or LINESTRING, got type %u", r.type)));
-    r.xyzm = (const double *)(p + off + 8);
-    if (off + 8 + (size_t)r.n * 32 > VARSIZE(g)) ereport(ERROR, (errmsg("laplace: truncated geometry")));
-    return r;
-}
+#include "geo.h"
 
 /* A PostGIS LINESTRING/POINT body is laid out like an EWKB vertex block, so Native's kernels take it after a small
  * EWKB-style header built on the stack. */
@@ -929,7 +907,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
             uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt); bytea *pb = palloc(VARHDRSZ + pl); SET_VARSIZE(pb, VARHDRSZ + pl); memcpy(VARDATA(pb), pt, pl);
             Datum a[2] = { PointerGetDatum(pb), fand }; Oid t[2] = { BYTEAOID, INT8OID };
-            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id, e.tier FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <<->> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id AND p.tier = e.tier", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
+            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id, e.tier FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <~> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id AND p.tier = e.tier", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
             for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(tup, d, 1, &nl)), 16);
                 bool fresh; lp_idmap_put(nom, &id, &fresh); if (!fresh) continue;
                 Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); size_t len; uint8 *e = as_ewkb(&g, &len); size_t n = lp_path_ids(e, len, NULL, 0); if (n < 2 || n > 1024) continue;

@@ -37,8 +37,8 @@ Q = [
      "SELECT f, count(*) FROM physicality p, unnest(laplace_follows(p.path, laplace_parts('Captain '))) f "
      f"WHERE p.path @> {ids('Captain')} GROUP BY f ORDER BY 2 DESC LIMIT 12"),
     ("the 16 word segments nearest 'king' in 4D (GiST)",
-     "SELECT id, coord <<->> laplace_coord('king') AS d FROM entity WHERE tier = 2 "
-     "ORDER BY coord <<->> laplace_coord('king') LIMIT 16"),
+     "SELECT id, coord <~> laplace_coord('king') AS d FROM entity WHERE tier = 2 "
+     "ORDER BY coord <~> laplace_coord('king') LIMIT 16"),
     ("everything attested about 'dog', with how hard each strand tugs back",
      "SELECT p.entity, laplace_confidence(s.rating, s.deviation) FROM physicality p JOIN consensus s ON s.claim = p.entity "
      "WHERE p.path @> ARRAY[laplace_id('dog')] ORDER BY 2 DESC LIMIT 24"),
