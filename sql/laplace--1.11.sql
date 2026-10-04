@@ -104,6 +104,33 @@ CREATE OPERATOR CLASS laplace_point4d_ops FOR TYPE geometry USING gist AS
   FUNCTION 8 laplace_point4d_gist_distance(internal, geometry, smallint, oid, internal),
   FUNCTION 11 laplace_point4d_gist_sortsupport(internal),
   STORAGE laplace_box4d;
+-- Angles on S^3 (laplace_angular4d_ops): <=> is the angle in radians between two points' directions, the point over
+-- its length, laplace_direction4d. The class keys each point's direction, so ORDER BY coord <=> q LIMIT k reads the
+-- index in exact angle order on the coordinate column itself; no row is rechecked. The origin has no direction (NaN).
+-- The angle is 2 asin(chord/2), monotone in the chord as the index needs; it is within an ulp or two of the true
+-- angle (a right angle comes out one ulp above pi/2, from the rounded chord).
+CREATE FUNCTION laplace_angular4d(geometry, geometry) RETURNS double precision
+  AS 'MODULE_PATHNAME', 'laplace_angular4d' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE OPERATOR <=> (LEFTARG = geometry, RIGHTARG = geometry, FUNCTION = laplace_angular4d, COMMUTATOR = <=>);
+CREATE FUNCTION laplace_direction4d_ewkb(geometry) RETURNS bytea
+  AS 'MODULE_PATHNAME', 'laplace_direction4d_ewkb' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_direction4d(geometry) RETURNS geometry
+  AS $$ SELECT ST_GeomFromEWKB(laplace_direction4d_ewkb($1)) $$ LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_angular4d_gist_compress(internal) RETURNS internal
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION laplace_angular4d_gist_distance(internal, geometry, smallint, oid, internal) RETURNS double precision
+  AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE OPERATOR CLASS laplace_angular4d_ops FOR TYPE geometry USING gist AS
+  OPERATOR 15 <=> (geometry, geometry) FOR ORDER BY float_ops,
+  FUNCTION 1 laplace_point4d_gist_consistent(internal, geometry, smallint, oid, internal),
+  FUNCTION 2 laplace_point4d_gist_union(internal, internal),
+  FUNCTION 3 laplace_angular4d_gist_compress(internal),
+  FUNCTION 5 laplace_point4d_gist_penalty(internal, internal, internal),
+  FUNCTION 6 laplace_point4d_gist_picksplit(internal, internal),
+  FUNCTION 7 laplace_point4d_gist_same(laplace_box4d, laplace_box4d, internal),
+  FUNCTION 8 laplace_angular4d_gist_distance(internal, geometry, smallint, oid, internal),
+  FUNCTION 11 laplace_point4d_gist_sortsupport(internal),
+  STORAGE laplace_box4d;
 
 CREATE FUNCTION laplace_centroid4d_step(internal, geometry) RETURNS internal
   AS 'MODULE_PATHNAME', 'laplace_centroid4d_step' LANGUAGE C IMMUTABLE PARALLEL SAFE;

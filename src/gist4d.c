@@ -1,4 +1,5 @@
-/* 4D GiST on PostGIS geometry POINT ZM: laplace_point4d_ops.
+/* 4D GiST on PostGIS geometry POINT ZM: laplace_point4d_ops (ordered by <~>, Euclidean) and laplace_angular4d_ops
+ * (ordered by <=>, the angle between directions on S^3; below).
  *
  * The keys are double-precision 4D boxes (laplace_box4d, 64 bytes) built from the geometry's own coordinates, not
  * PostGIS's float32 boxes rounded outward. The ordering operator <~> is the exact 4D Euclidean distance
@@ -52,6 +53,31 @@ Datum laplace_point4d_distance(PG_FUNCTION_ARGS){
     PG_RETURN_FLOAT8(lp_distance4(point_of(PG_GETARG_DATUM(0)), point_of(PG_GETARG_DATUM(1))));
 }
 
+/* Direction on S^3: the point divided by its length (the length summed in lp_distance4's order). The origin has none:
+ * NaN, which orders after every angle. */
+static inline void direction_of(const double p[4], double u[4]){
+    double n = sqrt(((p[0] * p[0] + p[1] * p[1]) + p[2] * p[2]) + p[3] * p[3]);
+    for (int d = 0; d < 4; d++) u[d] = p[d] / n;
+}
+/* The angle from a chord between unit vectors: 2 asin(c/2), with c/2 held to 1 (unit vectors are unit within
+ * rounding, so a chord between opposite ones can exceed 2 by an ulp). Monotone in c. */
+static inline double angle_of_chord(double c){ double h = c / 2.0; return 2.0 * asin(h < 1.0 ? h : 1.0); }
+
+/* <=>: the angle between two points' directions, in radians. */
+PG_FUNCTION_INFO_V1(laplace_angular4d);
+Datum laplace_angular4d(PG_FUNCTION_ARGS){
+    double u[4], v[4];
+    direction_of(point_of(PG_GETARG_DATUM(0)), u); direction_of(point_of(PG_GETARG_DATUM(1)), v);
+    PG_RETURN_FLOAT8(angle_of_chord(lp_distance4(u, v)));
+}
+
+PG_FUNCTION_INFO_V1(laplace_direction4d_ewkb);
+Datum laplace_direction4d_ewkb(PG_FUNCTION_ARGS){
+    double u[4]; direction_of(point_of(PG_GETARG_DATUM(0)), u);
+    bytea *b = palloc(VARHDRSZ + 37); SET_VARSIZE(b, VARHDRSZ + 37); lp_ewkb_point4(u, (uint8 *)VARDATA(b), 37);
+    PG_RETURN_BYTEA_P(b);
+}
+
 /* ---------------------------------------------------------------- box arithmetic */
 static inline void box_of_point(Box4 *b, const double p[4]){ for (int d = 0; d < 4; d++) b->lo[d] = b->hi[d] = p[d]; }
 static inline void box_join(Box4 *a, const Box4 *b){
@@ -82,6 +108,29 @@ Datum laplace_point4d_gist_compress(PG_FUNCTION_ARGS){
     box_of_point(b, point_of(e->key));
     gistentryinit(*r, PointerGetDatum(b), e->rel, e->page, e->offset, false);
     PG_RETURN_POINTER(r);
+}
+
+/* laplace_angular4d_ops: the same keys over each point's direction, ordered by <=>. A leaf's angle is <=>'s, bit for
+ * bit: the same direction, chord and arcsine. An inner box gives a chord no longer than to any direction in it, and
+ * the angle is monotone in the chord, so the order is exact with no recheck. */
+PG_FUNCTION_INFO_V1(laplace_angular4d_gist_compress);
+Datum laplace_angular4d_gist_compress(PG_FUNCTION_ARGS){
+    GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
+    if (!e->leafkey) PG_RETURN_POINTER(e);
+    GISTENTRY *r = palloc(sizeof *r); Box4 *b = palloc(sizeof *b); double u[4];
+    direction_of(point_of(e->key), u); box_of_point(b, u);
+    gistentryinit(*r, PointerGetDatum(b), e->rel, e->page, e->offset, false);
+    PG_RETURN_POINTER(r);
+}
+
+PG_FUNCTION_INFO_V1(laplace_angular4d_gist_distance);
+Datum laplace_angular4d_gist_distance(PG_FUNCTION_ARGS){
+    GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
+    StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
+    if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_angular4d_ops: unknown strategy %u", strategy)));
+    double u[4]; direction_of(point_of(PG_GETARG_DATUM(1)), u);
+    *recheck = false;
+    PG_RETURN_FLOAT8(angle_of_chord(box_distance((const Box4 *)DatumGetPointer(e->key), u)));
 }
 
 PG_FUNCTION_INFO_V1(laplace_point4d_gist_consistent);
