@@ -136,6 +136,10 @@ CREATE OPERATOR CLASS laplace_angular4d_ops FOR TYPE geometry USING gist AS
 -- (the query's vertices to the box, first to first, last to last) and the rows are rechecked, so ORDER BY path <%> q
 -- LIMIT k comes out in exact Fréchet order.
 CREATE OPERATOR <%> (LEFTARG = geometry, RIGHTARG = geometry, FUNCTION = laplace_frechet4d, COMMUTATOR = <%>);
+-- <%%>: the discrete Hausdorff distance between the vertex sets (order ignored), ordered by the same class.
+CREATE FUNCTION laplace_hausdorff4d(geometry, geometry) RETURNS double precision
+  AS 'MODULE_PATHNAME', 'laplace_hausdorff4d' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE OPERATOR <%%> (LEFTARG = geometry, RIGHTARG = geometry, FUNCTION = laplace_hausdorff4d, COMMUTATOR = <%%>);
 CREATE TYPE laplace_path4d_key;
 CREATE FUNCTION laplace_path4d_key_in(cstring) RETURNS laplace_path4d_key AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION laplace_path4d_key_out(laplace_path4d_key) RETURNS cstring AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -153,6 +157,7 @@ CREATE FUNCTION laplace_path4d_gist_distance(internal, geometry, smallint, oid, 
   AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE OPERATOR CLASS laplace_path4d_ops FOR TYPE geometry USING gist AS
   OPERATOR 15 <%> (geometry, geometry) FOR ORDER BY float_ops,
+  OPERATOR 16 <%%> (geometry, geometry) FOR ORDER BY float_ops,
   FUNCTION 1 laplace_point4d_gist_consistent(internal, geometry, smallint, oid, internal),
   FUNCTION 2 laplace_path4d_gist_union(internal, internal),
   FUNCTION 3 laplace_path4d_gist_compress(internal),

@@ -24,7 +24,8 @@
 
 typedef struct { double lo[4], hi[4]; } Box4;
 
-#define LAPLACE_KNN 15   /* ORDER BY geometry <~> geometry */
+#define LAPLACE_KNN 15             /* ORDER BY geometry <~>, <=> or <%> geometry: each class's own distance */
+#define LAPLACE_KNN_HAUSDORFF 16   /* ORDER BY geometry <%%> geometry (laplace_path4d_ops) */
 
 /* ---------------------------------------------------------------- the key type */
 static const double *point_of(Datum d){
@@ -237,7 +238,9 @@ Datum laplace_point4d_gist_distance(PG_FUNCTION_ARGS){
  * vertex of the path, which lies in the box. So the Fréchet distance is at least the largest of: the query vertices'
  * distances to the box, and at a leaf the first-to-first and last-to-last distances. Each is summed in lp_frechet4's
  * order, and the gap to a box is no larger than the difference to any point in it, so the bound never exceeds the
- * exact distance; the leaf is rechecked, which puts the rows in exact Fréchet order. */
+ * exact distance; the leaf is rechecked, which puts the rows in exact Fréchet order. The class also orders by <%%>,
+ * the discrete Hausdorff distance (lp_hausdorff4): it too pairs each query vertex with some vertex of the path, so the
+ * box term bounds it (the ends do not pair up under it). */
 typedef struct { Box4 box; double first[4], last[4]; } PathKey;
 
 static inline double d2_of(const double *a, const double *b){
@@ -296,18 +299,24 @@ PG_FUNCTION_INFO_V1(laplace_path4d_gist_distance);
 Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
     GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
     StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
-    if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_path4d_ops: unknown strategy %u", strategy)));
+    if (strategy != LAPLACE_KNN && strategy != LAPLACE_KNN_HAUSDORFF) ereport(ERROR, (errmsg("laplace_path4d_ops: unknown strategy %u", strategy)));
     const PathKey *k = (const PathKey *)DatumGetPointer(e->key);
     Geo q = path_of(PG_GETARG_DATUM(1));
     double b2 = 0;
     for (uint32 i = 0; i < q.n; i++) { double g = box_gap2(&k->box, q.xyzm + 4 * i); if (g > b2) b2 = g; }
-    if (GIST_LEAF(e)) {
+    if (strategy == LAPLACE_KNN && GIST_LEAF(e)) {   /* the ends pair up under Fréchet only */
         double f = d2_of(q.xyzm, k->first), l = d2_of(q.xyzm + 4 * (q.n - 1), k->last);
         if (f > b2) b2 = f;
         if (l > b2) b2 = l;
     }
     *recheck = true;   /* a lower bound: the executor computes <%> on the row and reorders */
     PG_RETURN_FLOAT8(sqrt(b2));
+}
+
+PG_FUNCTION_INFO_V1(laplace_hausdorff4d);
+Datum laplace_hausdorff4d(PG_FUNCTION_ARGS){
+    Geo a = path_of(PG_GETARG_DATUM(0)), b = path_of(PG_GETARG_DATUM(1));
+    PG_RETURN_FLOAT8(lp_hausdorff4(a.xyzm, a.n, b.xyzm, b.n));
 }
 
 /* ---------------------------------------------------------------- 4D boxes as Hilbert ranges
