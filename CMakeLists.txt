@@ -18,7 +18,7 @@ foreach(v includedir-server pkglibdir sharedir libdir)
   set(PG_${name} ${out})
 endforeach()
 
-add_library(laplace_pg MODULE src/laplace_pg.c)
+add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c)
 set_target_properties(laplace_pg PROPERTIES OUTPUT_NAME laplace PREFIX "" C_VISIBILITY_PRESET hidden
                                             BUILD_RPATH "${LAPLACE_ICU_DIR}/lib" INSTALL_RPATH "${LAPLACE_ICU_DIR}/lib")
 target_link_libraries(laplace_pg PRIVATE laplace_text laplace_static BLAKE3::blake3)
