@@ -30,8 +30,8 @@ typedef struct { double lo[4], hi[4]; } Box4;
 /* ---------------------------------------------------------------- the key type */
 static const double *point_of(Datum d){
     Geo g = geo_of(d);
-    if (g.type != 1 || g.n != 1) ereport(ERROR, (errmsg("laplace_point4d_ops: expected a POINT ZM, not an empty point or a LINESTRING")));
-    return g.xyzm;
+    if (g.type != 1 || g.p.n != 1) ereport(ERROR, (errmsg("laplace_point4d_ops: expected a POINT ZM, not an empty point or a LINESTRING")));
+    return xyzm(&g);
 }
 
 PG_FUNCTION_INFO_V1(laplace_box4d_in);
@@ -254,7 +254,7 @@ static inline double box_gap2(const Box4 *b, const double q[4]){
 }
 static Geo path_of(Datum d){
     Geo g = geo_of(d);
-    if (g.n == 0) ereport(ERROR, (errmsg("laplace_path4d_ops: expected a LINESTRING ZM or POINT ZM with a vertex")));
+    if (g.p.n == 0) ereport(ERROR, (errmsg("laplace_path4d_ops: expected a LINESTRING ZM or POINT ZM with a vertex")));
     return g;
 }
 
@@ -271,11 +271,11 @@ PG_FUNCTION_INFO_V1(laplace_path4d_gist_compress);
 Datum laplace_path4d_gist_compress(PG_FUNCTION_ARGS){
     GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
     if (!e->leafkey) PG_RETURN_POINTER(e);
-    Geo g = path_of(e->key);
+    Geo g = path_of(e->key); const double *x = xyzm(&g); size_t n = g.p.n;
     GISTENTRY *r = palloc(sizeof *r); PathKey *k = palloc(sizeof *k);
-    box_of_point(&k->box, g.xyzm);
-    for (uint32 i = 1; i < g.n; i++) { Box4 v; box_of_point(&v, g.xyzm + 4 * i); box_join(&k->box, &v); }
-    memcpy(k->first, g.xyzm, sizeof k->first); memcpy(k->last, g.xyzm + 4 * (g.n - 1), sizeof k->last);
+    box_of_point(&k->box, x);
+    for (size_t i = 1; i < n; i++) { Box4 v; box_of_point(&v, x + 4 * i); box_join(&k->box, &v); }
+    memcpy(k->first, x, sizeof k->first); memcpy(k->last, x + 4 * (n - 1), sizeof k->last);
     gistentryinit(*r, PointerGetDatum(k), e->rel, e->page, e->offset, false);
     PG_RETURN_POINTER(r);
 }
@@ -301,11 +301,11 @@ Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
     StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
     if (strategy != LAPLACE_KNN && strategy != LAPLACE_KNN_HAUSDORFF) ereport(ERROR, (errmsg("laplace_path4d_ops: unknown strategy %u", strategy)));
     const PathKey *k = (const PathKey *)DatumGetPointer(e->key);
-    Geo q = path_of(PG_GETARG_DATUM(1));
+    Geo q = path_of(PG_GETARG_DATUM(1)); const double *x = xyzm(&q); size_t n = q.p.n;
     double b2 = 0;
-    for (uint32 i = 0; i < q.n; i++) { double g = box_gap2(&k->box, q.xyzm + 4 * i); if (g > b2) b2 = g; }
+    for (size_t i = 0; i < n; i++) { double g = box_gap2(&k->box, x + 4 * i); if (g > b2) b2 = g; }
     if (strategy == LAPLACE_KNN && GIST_LEAF(e)) {   /* the ends pair up under Fréchet only */
-        double f = d2_of(q.xyzm, k->first), l = d2_of(q.xyzm + 4 * (q.n - 1), k->last);
+        double f = d2_of(x, k->first), l = d2_of(x + 4 * (n - 1), k->last);
         if (f > b2) b2 = f;
         if (l > b2) b2 = l;
     }
@@ -316,7 +316,7 @@ Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
 PG_FUNCTION_INFO_V1(laplace_hausdorff4d);
 Datum laplace_hausdorff4d(PG_FUNCTION_ARGS){
     Geo a = path_of(PG_GETARG_DATUM(0)), b = path_of(PG_GETARG_DATUM(1));
-    PG_RETURN_FLOAT8(lp_hausdorff4(a.xyzm, a.n, b.xyzm, b.n));
+    PG_RETURN_FLOAT8(lp_hausdorff4(xyzm(&a), a.p.n, xyzm(&b), b.p.n));
 }
 
 /* ---------------------------------------------------------------- 4D boxes as Hilbert ranges
