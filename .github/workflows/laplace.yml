@@ -48,3 +48,16 @@ jobs:
           if "$LAPLACE_PG_DIR/bin/psql" "$admin" -XAtc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1; then
             "$LAPLACE_PG_DIR/bin/psql" "$LAPLACE_CONNINFO" -X -v ON_ERROR_STOP=1 -c "ALTER EXTENSION laplace UPDATE" -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'laplace'"
           else echo "no database $db yet: the Engine's deploy makes it"; fi
+  # Every merge to main that passes deploys hart-server: Laplace-Operations' deployment runs with every repository at its
+  # main (its laplace.yml, on a repository_dispatch main-merged; the token is the secret LAPLACE_CHECKOUT, agents.sh's).
+  deploy:
+    needs: extension
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, laplace, Laplace-postgres]
+    steps:
+      - name: hart-server deploys main (Laplace-Operations)
+        env:
+          TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository_owner }}/Laplace-Operations/dispatches" -d '{"event_type": "main-merged", "client_payload": {"repository": "${{ github.repository }}", "sha": "${{ github.sha }}"}}'
+          echo "dispatched: Laplace-Operations deploys hart-server with ${{ github.repository }} at ${{ github.sha }}" | tee -a "$GITHUB_STEP_SUMMARY"
