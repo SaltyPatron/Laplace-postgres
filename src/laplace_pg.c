@@ -428,14 +428,17 @@ Datum laplace_text(PG_FUNCTION_ARGS){
  * whatever tier its own recipe composed it, so the claims that hold an entity are found by the ID they hold, among the
  * paths above the entity's tier (only the tiers at and below are pruned), that the consensus knows. */
 /* laplace_claims(parts, fan, bits, refuse): the claims holding every one of the parts, none refused, with the consensus
- * on each: at most fan of them. A claim sits above its highest part, at no fixed distance: every tier above is read, by
+ * on each: at most fan of them, the first fan by ID (a LIMIT alone keeps whatever the scan met first, which differs
+ * between two installs of the same content). A claim sits above its highest part, at no fixed distance: every tier above is read, by
  * the IDs held. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) LIMIT $2", 4, NULL };
+    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL };
 SET_FN(laplace_claims, claims_kept)
 /* laplace_claims_each(ids, fan, bits, refuse): for each of a set of entities, the claims holding it, none refused: one
- * call for a whole level of a walk. i is the entity's place in the set. The entity is a rare key (an observation, a
+ * call for a whole level of a walk. At most fan an entity, whichever the scan meets first: a caller asks for one more
+ * than its fan and treats an entity that returns more than the fan as a hub, reached and never crossed, so what it
+ * uses is every claim of the entity or none of them. i is the entity's place in the set. The entity is a rare key (an observation, a
  * claim), so the path alone is the index condition and the bits are a check on the rows found: the kind bit's posting
  * list is every claim. */
 static Kept each_kept = { "laplace_claims_each",
@@ -480,8 +483,10 @@ static Kept attested_kept = { "laplace_attested",
 SET_FN(laplace_attested, attested_kept)
 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
- * [i..j] of the prompt's constituents: the observations holding all of its parts (at most fan of them, claims left
- * out), how many hold it as a run, and what follows the run in each, counted. One row per continuation (next, times);
+ * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
+ * a run, and what follows the run in each, counted. A segment held by more than fan observations is a hub, reached and
+ * not crossed: its row says paths fan + 1 (more than the fan), runs 0, and nothing follows it. Counting over the first
+ * fan the index met would count a different set on another install of the same content. One row per continuation (next, times);
  * a segment held by nothing, or held where nothing follows the run, has a row with next null. SQL only fetches the
  * paths that hold a segment, through the container index (Architecture: SQL fetches and writes records); the runs are
  * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
@@ -523,14 +528,19 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
             if (!words) { have = 0; continue; }
             if (!have) {
                 MemoryContext old = MemoryContextSwitchTo(rowctx);
-                Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan) };
+                Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan + 1) };
                 kept_run(&forward_kept, types, a);
                 MemoryContextSwitchTo(keepctx);
                 for (uint64 r = 0; r < SPI_processed; r++) { bool nl; Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl);     /* path is NOT NULL */
                     int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
                     lp_push(&held[next], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t }); }
                 SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
-                have = held[next].n < (size_t)fan;                                     /* fewer than the fan: every holder there is */
+                have = held[next].n <= (size_t)fan;                                    /* no more than the fan: every holder there is */
+                if (!have) {                                                           /* a hub: reached, not crossed */
+                    Datum v[6]; bool nl[6] = { false, false, false, false, true, false };
+                    v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum(fan + 1); v[3] = Int64GetDatum(0); v[4] = (Datum)0; v[5] = Int64GetDatum(0);
+                    set_put(fcinfo, ts, td, v, nl); cur = next; continue;
+                }
             } else
                 for (size_t r = 0; r < held[cur].n; r++) { const Held *h = &held[cur].v[r]; Geo g = geo_of(h->path);
                     if (h->tier > floor && lp_path_holds(g.p, &ids[j], 1, true)) lp_push(&held[next], *h); }
@@ -800,11 +810,13 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
     Datum fanp1 = Int64GetDatum(fan + 1), fand = Int64GetDatum(fan);
     /* strands: every claim holding an occurrence, refusals out before the fan; the strand answers with its other end */
     { Datum a[3] = { PointerGetDatum(occa), fanp1, PG_GETARG_DATUM(2) }; Oid t[3] = { idarr, INT8OID, idarr };
-      if (SPI_execute_with_args("SELECT u.i, c.path, s.rating, s.deviation, s.volatility FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
-            "CROSS JOIN LATERAL (SELECT p.entity, p.path FROM physicality p WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND p.mask ? 0::smallint "
-            "AND NOT laplace_middle_any(p.path, $3) LIMIT $2) c JOIN consensus s ON s.claim = c.entity", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
+      if (SPI_execute_with_args("SELECT u.i, c.path, c.rating, c.deviation, c.volatility FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
+            "CROSS JOIN LATERAL (SELECT p.path, s.rating, s.deviation, s.volatility FROM physicality p JOIN consensus s ON s.claim = p.entity WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] "
+            "AND p.mask ? 0::smallint AND NOT laplace_middle_any(p.path, $3) LIMIT $2) c", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
+      int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: what the scan met first is not its strands */
+      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
       for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
-          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc) continue;
+          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc || held[i] > fan) continue;
           Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); lp_id part[64]; size_t np = lp_path_expand(g.p, part, 64); if (np < 2 || np > 64) continue;
           int other = lp_tuple_other(part, np, &occ[i]); if (other < 0) continue;
           lp_rating rt = { DatumGetFloat8(SPI_getbinval(tup, d, 3, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 4, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 5, &nl)) };
