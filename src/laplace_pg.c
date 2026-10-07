@@ -470,17 +470,6 @@ SET_FN(laplace_fills, fills_kept)
 /* laplace_paths(ids): the paths of a set of entities: one DAG level per call. */
 static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicality WHERE entity = ANY($1)", 1, NULL };
 SET_FN(laplace_paths, paths_kept)
-/* laplace_attested(claims): who attested each of a set of claims, with the position given and the witness's trust. A
- * claim witnessed on its own is an attestation; one witnessed within a record is a member of the record's path, and the
- * record is the attestation: both are found, the record's rows through the path index. The records that hold a claim
- * are found by the ID they hold; that they are records is checked on the few rows found, never searched for by itself
- * (every record carries that bit). */
-static Kept attested_kept = { "laplace_attested",
-    "SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) JOIN attestation a ON a.claim = u.id JOIN witness w ON w.id = a.witness "
-    "UNION ALL SELECT u.id, a.witness, a.position, w.trust FROM unnest($1) u(id) "
-    "CROSS JOIN LATERAL (SELECT p.entity FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = u.id) AND p.path @> ARRAY[u.id] AND laplace_mask_has(p.mask, 1::smallint)) k "
-    "JOIN attestation a ON a.claim = k.entity JOIN witness w ON w.id = a.witness", 1, NULL };
-SET_FN(laplace_attested, attested_kept)
 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
