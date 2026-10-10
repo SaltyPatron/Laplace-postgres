@@ -1,8 +1,5 @@
-# Laplace-postgres on its runner: the extension built with icx against the machine's PostgreSQL, installed into its
-# extension directories by rename (the group's right; no root; a backend holding the old library keeps its inode), and
-# the extension updated in the database. Laplace-Native is checked out beside it (private: the secret LAPLACE_CHECKOUT),
-# and Laplace-Operations for laplace.env, the one definition of the database. Before the database is updated, the
-# extension is installed fresh into a scratch database at its newest version, so a script that cannot install fails here.
+# Build and qualify the candidate extension in a private package directory and scratch database.
+# Shared installation and declared-database migration belong to Operations deployment after merge.
 name: Laplace-postgres
 env:
   LAPLACE_CONNINFO: ""   # laplace.env's
@@ -27,27 +24,10 @@ jobs:
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
           cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
-      - name: install by rename
-        run: |
-          stage=$(mktemp -d); DESTDIR=$stage cmake --install "$LAPLACE_BUILD/Laplace-postgres/icx-release" >/dev/null
-          (cd "$stage" && find . -type f) | while read -r f; do mv -f "$stage/$f" "/${f#./}"; echo "/${f#./}"; done; rm -rf "$stage"
-      - name: the extension installed fresh, at its newest version
+      - name: Install and execute the candidate in an isolated database
         run: |
           . Laplace-Operations/laplace.env
-          scratch=laplace_ci_$GITHUB_RUN_ID; admin=$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=postgres/")
-          "$LAPLACE_PG_DIR/bin/psql" "$admin" -X -v ON_ERROR_STOP=1 -qc "CREATE DATABASE $scratch"
-          trap '"$LAPLACE_PG_DIR/bin/psql" "$admin" -X -qc "DROP DATABASE IF EXISTS $scratch WITH (FORCE)"' EXIT
-          "$LAPLACE_PG_DIR/bin/psql" "$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$scratch/")" -X -v ON_ERROR_STOP=1 \
-            -c "CREATE EXTENSION postgis" -c "CREATE EXTENSION laplace" \
-            -c "SELECT extversion FROM pg_extension WHERE extname = 'laplace'"
-      - name: the extension in the database
-        run: |
-          . Laplace-Operations/laplace.env
-          db=$(echo "$LAPLACE_CONNINFO" | sed -n 's/.*dbname=\([^ ]*\).*/\1/p'); admin=$(echo "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=postgres/")
-          [ -n "$db" ] || { echo "laplace.env names no database"; exit 1; }
-          if "$LAPLACE_PG_DIR/bin/psql" "$admin" -XAtc "SELECT 1 FROM pg_database WHERE datname = '$db'" | grep -q 1; then
-            "$LAPLACE_PG_DIR/bin/psql" "$LAPLACE_CONNINFO" -X -v ON_ERROR_STOP=1 -c "ALTER EXTENSION laplace UPDATE" -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'laplace'"
-          else echo "no database $db yet: the Engine's deploy makes it"; fi
+          bash Laplace-postgres/tests/extension-install.sh "$LAPLACE_BUILD/Laplace-postgres/icx-release"
   # Every merge to main that passes deploys hart-server: Laplace-Operations' deployment runs with every repository at its
   # main (its laplace.yml, on a repository_dispatch main-merged; the token is the secret LAPLACE_CHECKOUT, agents.sh's).
   deploy:
