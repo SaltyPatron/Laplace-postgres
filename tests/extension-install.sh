@@ -20,6 +20,7 @@ cleanup() {
     echo "test database cleanup failed; candidate package retained at $stage" >&2
     exit 1
   fi
+  "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS ${db}_writer"
   rm -rf "$stage"
   exit "$result"
 }
@@ -38,7 +39,7 @@ mv "$stage/control" "$share/extension/laplace.control"
 "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
 created=1
 connection=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$db/")
-"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v candidate_share="$share" -v candidate_module="$module" <<'SQL'
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" <<'SQL'
 SELECT set_config('extension_control_path', :'candidate_share' || ':$system', false);
 CREATE EXTENSION postgis;
 CREATE EXTENSION laplace;
@@ -54,5 +55,35 @@ DO $$ BEGIN
     RAISE EXCEPTION 'extension functions are not bound to the candidate module';
   END IF;
 END $$;
+CREATE ROLE :"writer";
+GRANT USAGE ON SCHEMA public TO :"writer";
+GRANT INSERT,TRUNCATE ON public.physicality_00 TO :"writer";
+GRANT EXECUTE ON FUNCTION public.laplace_clean_pending_list(regclass) TO :"writer";
+CREATE TABLE public.candidate_unrelated(values int[]);
+CREATE INDEX candidate_unrelated_gin ON public.candidate_unrelated USING gin(values);
+GRANT INSERT,TRUNCATE ON public.candidate_unrelated TO :"writer";
+SET SESSION AUTHORIZATION :"writer";
+DO $$ DECLARE selected regclass; BEGIN
+  SELECT i.indexrelid INTO STRICT selected FROM pg_index i
+    JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
+    WHERE i.indrelid='public.physicality_00'::regclass AND a.amname='gin';
+  BEGIN
+    PERFORM pg_catalog.gin_clean_pending_list(selected);
+    RAISE EXCEPTION 'runtime unexpectedly owns the index';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  PERFORM public.laplace_clean_pending_list(selected);
+  SELECT i.indexrelid INTO STRICT selected FROM pg_index i
+    JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
+    WHERE i.indrelid='public.physicality_01'::regclass AND a.amname='gin';
+  BEGIN
+    PERFORM public.laplace_clean_pending_list(selected);
+    RAISE EXCEPTION 'unwritable Laplace index maintenance was permitted';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  BEGIN
+    PERFORM public.laplace_clean_pending_list('public.candidate_unrelated_gin'::regclass);
+    RAISE EXCEPTION 'unrelated index maintenance was permitted';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+END $$;
+RESET SESSION AUTHORIZATION;
 SQL
 printf 'PASS candidate extension installed and executed in isolated database %s\n' "$db"
