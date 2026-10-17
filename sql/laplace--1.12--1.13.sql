@@ -34,3 +34,13 @@ BEGIN
   RETURN pg_catalog.gin_clean_pending_list(index_id);
 END $$;
 REVOKE ALL ON FUNCTION public.laplace_clean_pending_list(pg_catalog.regclass) FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION laplace_attested(claims blake3[],
+  OUT claim blake3, OUT trunk blake3, OUT games double precision, OUT tokens double precision, OUT score double precision,
+  OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'laplace_attested' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256;
+CREATE OR REPLACE FUNCTION laplace_attribution(claims blake3[],
+  OUT claim blake3, OUT trunk blake3, OUT games double precision, OUT tokens double precision, OUT score double precision,
+  OUT trust double precision, OUT share_bp integer) RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'laplace_attribution' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256;
+

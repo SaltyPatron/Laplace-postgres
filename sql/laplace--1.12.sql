@@ -491,3 +491,14 @@ CREATE FUNCTION laplace_couple(occ blake3[], fan bigint, refuse blake3[], shape 
   OUT entity blake3, OUT occ integer, OUT route smallint, OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
   OUT via blake3, OUT rel blake3, OUT tier smallint, OUT distance double precision, OUT vertices blake3[]) RETURNS SETOF record
   AS 'MODULE_PATHNAME', 'laplace_couple' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 4096;
+-- Provenance by containment and exact basis-point royalty attribution (Engine#22; Semantics: Attestations, Witnesses):
+-- walks up the container index from claims to their trunks and witnesses in one native SPI operator.
+CREATE FUNCTION laplace_attested(claims blake3[],
+  OUT claim blake3, OUT trunk blake3, OUT games double precision, OUT tokens double precision, OUT score double precision,
+  OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'laplace_attested' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256;
+CREATE FUNCTION laplace_attribution(claims blake3[],
+  OUT claim blake3, OUT trunk blake3, OUT games double precision, OUT tokens double precision, OUT score double precision,
+  OUT trust double precision, OUT share_bp integer) RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'laplace_attribution' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256;
+
