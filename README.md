@@ -20,7 +20,9 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 ## The schema
 
-`CREATE EXTENSION laplace` makes the four tables (entity, physicality, witness, consensus), their partitions, their indexes and the lookups, as PostGIS makes `spatial_ref_sys`; their data goes with a dump. `physicality.mask` holds what a row is and the types it holds, indexed with the path's constituents in one GIN (`laplace_path_ops`, `laplace_mask_ops`). The highway (`laplace.highway`) gives a type's slot, bit and mappings in place. `laplace_schema_indexes()` makes every index again if one was dropped.
+`CREATE EXTENSION laplace` makes the four tables (`entity`, `physicality`, `witness`, `consensus`), their partitions, their indexes and the lookups, as PostGIS makes `spatial_ref_sys`; their data goes with a dump. `physicality.mask` holds what a row is and the types it holds, indexed with the path's constituents in one GIN (`laplace_path_ops`, `laplace_mask_ops`). The highway (`laplace.highway`) gives a type's slot, bit and mappings in place. `laplace_schema_indexes()` makes every index again if one was dropped.
+
+Provenance is containment (`LP_SAID_RECORD`, `LP_SAID_CLAIM` vertices under each file's trunk in `physicality`), walked natively in C by `laplace_attested(claims blake3[], scope blake3[] DEFAULT '{}')` and aggregated into Glicko-2 Fisher-information basis-point shares (`share_bp` summing to `10000`) by `laplace_attribution(claims blake3[], scope blake3[] DEFAULT '{}')`.
 
 ## CI installation boundary
 
