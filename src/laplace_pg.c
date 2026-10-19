@@ -26,8 +26,9 @@
 #include "utils/varbit.h"
 #include "varatt.h"
 #include "laplace/laplace.h"
+#include "laplace/highway.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.11");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.14");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"
@@ -670,15 +671,79 @@ Datum laplace_path_times(PG_FUNCTION_ARGS){
 }
 
 /* ---------------------------------------------------------------- GIN over the mask
- * A row's mask (Semantics: Claims, Masks) is 256 bits: what the row is (a claim, a record, a tuple, a file), and the
- * types it holds, by the highway's layout. Its keys are the positions of its set bits, so "claims that hold X" is
+ * A row's carrier is exactly 64 bits. SQL bit position i corresponds to Native's uint64 bit i;
+ * the SQL binary representation writes the most significant bit of each byte first.
+ * Its keys are positions of set bits, so "claims that hold X" is
  * the intersection of X's posting list with the claim bit's, in the one index over (path, mask). */
 #define LP_STRAT_HASBIT  1        /* mask ? int2 */
 #define LP_STRAT_HASALL  2        /* mask ?& int2[] */
 #define LP_STRAT_HASANY  3        /* mask ?| int2[] */
+static VarBit *carrier64(VarBit *mask){
+    if (VARBITLEN(mask) != LP_MASK_BITS)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: a carrier mask must have exactly 64 bits")));
+    return mask;
+}
+static uint8 reverse_byte(uint8 b){
+    b = (uint8)(((b & 0x55u) << 1) | ((b >> 1) & 0x55u));
+    b = (uint8)(((b & 0x33u) << 2) | ((b >> 2) & 0x33u));
+    return (uint8)((b << 4) | (b >> 4));
+}
+static lp_mask mask_native(VarBit *mask){
+    carrier64(mask); lp_mask value = 0;
+    for (unsigned i = 0; i < 8; i++) value |= (uint64)reverse_byte(VARBITS(mask)[i]) << (8 * i);
+    return value;
+}
+static VarBit *mask_sql(lp_mask value){
+    VarBit *mask = palloc0(VARBITTOTALLEN(LP_MASK_BITS));
+    SET_VARSIZE(mask, VARBITTOTALLEN(LP_MASK_BITS)); VARBITLEN(mask) = LP_MASK_BITS;
+    for (unsigned i = 0; i < 8; i++) VARBITS(mask)[i] = reverse_byte((uint8)(value >> (8 * i)));
+    return mask;
+}
+static const lp_bank *mask_bank(text *name){
+    char *bank = text_to_cstring(name); const lp_bank *descriptor = lp_highway_bank(highway(), bank);
+    if (!descriptor) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: no bank \"%s\" (manifest/banks.tsv)", bank)));
+    return descriptor;
+}
+static int64 mask_slot(const lp_bank *bank, text *value){
+    if (!VARSIZE_ANY_EXHDR(value)) return -1;
+    lp_ref ref = trunk_of(value, NULL, 0, NULL);
+    return lp_highway_slot(highway(), bank->list, &ref.id);
+}
+
+PG_FUNCTION_INFO_V1(laplace_mask_slot);
+Datum laplace_mask_slot(PG_FUNCTION_ARGS){
+    const lp_bank *bank = mask_bank(PG_GETARG_TEXT_PP(0));
+    int64 slot = mask_slot(bank, PG_GETARG_TEXT_PP(1)); lp_mask value = 0;
+    if (slot < 0 || !lp_mask_put(&value, bank, (uint32)slot)) PG_RETURN_NULL();
+    PG_RETURN_VARBIT_P(mask_sql(value));
+}
+PG_FUNCTION_INFO_V1(laplace_mask_field);
+Datum laplace_mask_field(PG_FUNCTION_ARGS){ PG_RETURN_VARBIT_P(mask_sql(lp_mask_field(mask_bank(PG_GETARG_TEXT_PP(0))))); }
+PG_FUNCTION_INFO_V1(laplace_mask_value);
+Datum laplace_mask_value(PG_FUNCTION_ARGS){
+    PG_RETURN_INT16((int16)lp_mask_get(mask_native(PG_GETARG_VARBIT_P(0)), mask_bank(PG_GETARG_TEXT_PP(1))));
+}
+PG_FUNCTION_INFO_V1(laplace_mask_has_value);
+Datum laplace_mask_has_value(PG_FUNCTION_ARGS){
+    lp_mask value = mask_native(PG_GETARG_VARBIT_P(0));
+    const lp_bank *bank = mask_bank(PG_GETARG_TEXT_PP(1)); int64 slot = mask_slot(bank, PG_GETARG_TEXT_PP(2));
+    PG_RETURN_BOOL(slot >= 0 && lp_mask_has(value, bank, (uint32)slot));
+}
+PG_FUNCTION_INFO_V1(laplace_mask_valid);
+Datum laplace_mask_valid(PG_FUNCTION_ARGS){
+    lp_mask value = mask_native(PG_GETARG_VARBIT_P(0)), merged;
+    PG_RETURN_BOOL(lp_mask_merge(highway(), value, 0, &merged));
+}
+PG_FUNCTION_INFO_V1(laplace_mask_merge);
+Datum laplace_mask_merge(PG_FUNCTION_ARGS){
+    lp_mask a = mask_native(PG_GETARG_VARBIT_P(0)), b = mask_native(PG_GETARG_VARBIT_P(1)), merged;
+    if (!lp_mask_merge(highway(), a, b, &merged))
+        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace: conflicting enum values or reserved bits in carrier mask merge")));
+    PG_RETURN_VARBIT_P(mask_sql(merged));
+}
 PG_FUNCTION_INFO_V1(laplace_mask_extract_value);
 Datum laplace_mask_extract_value(PG_FUNCTION_ARGS){
-    VarBit *m = PG_GETARG_VARBIT_P(0); int32 *n = (int32 *)PG_GETARG_POINTER(1);
+    VarBit *m = carrier64(PG_GETARG_VARBIT_P(0)); int32 *n = (int32 *)PG_GETARG_POINTER(1);
     int len = VARBITLEN(m); const bits8 *b = VARBITS(m); Datum *k = palloc(sizeof(Datum) * (len ? len : 1)); int c = 0;
     for (int i = 0; i < len; i++) if (b[i >> 3] & (0x80 >> (i & 7))) k[c++] = Int16GetDatum((int16)i);
     *n = c; PG_RETURN_POINTER(k);
@@ -688,6 +753,7 @@ Datum laplace_mask_extract_query(PG_FUNCTION_ARGS){
     int32 *n = (int32 *)PG_GETARG_POINTER(1); StrategyNumber st = PG_GETARG_UINT16(2); int32 *mode = (int32 *)PG_GETARG_POINTER(6);
     if (st == LP_STRAT_HASBIT) { Datum *k = palloc(sizeof(Datum)); k[0] = Int16GetDatum(PG_GETARG_INT16(0)); *n = 1; PG_RETURN_POINTER(k); }
     ArrayType *a = PG_GETARG_ARRAYTYPE_P(0); Datum *v; bool *nulls; int c; deconstruct_array(a, INT2OID, 2, true, TYPALIGN_SHORT, &v, &nulls, &c);
+    for (int i = 0; i < c; i++) if (nulls[i]) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace: mask bit arrays cannot contain nulls")));
     *n = c; if (c == 0) *mode = st == LP_STRAT_HASALL ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
     PG_RETURN_POINTER(v);
 }
@@ -702,29 +768,29 @@ Datum laplace_mask_triconsistent(PG_FUNCTION_ARGS){
     const GinTernaryValue *check = (const GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
     PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_HASANY ? tri_any(check, n) : tri_all(check, n));
 }
-static bool mask_bit(VarBit *m, int16 i){ return i >= 0 && i < VARBITLEN(m) && (VARBITS(m)[i >> 3] & (0x80 >> (i & 7))); }
+static bool mask_bit(VarBit *m, int16 i){ carrier64(m); return i >= 0 && i < LP_MASK_BITS && (VARBITS(m)[i >> 3] & (0x80 >> (i & 7))); }
 PG_FUNCTION_INFO_V1(laplace_mask_has);
 Datum laplace_mask_has(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_bit(PG_GETARG_VARBIT_P(0), PG_GETARG_INT16(1))); }
 static bool mask_has_array(VarBit *m, ArrayType *a, bool all){
+    carrier64(m);
     Datum *v; bool *nulls; int c; deconstruct_array(a, INT2OID, 2, true, TYPALIGN_SHORT, &v, &nulls, &c);
-    for (int i = 0; i < c; i++) { bool has = mask_bit(m, DatumGetInt16(v[i])); if (all && !has) return false; if (!all && has) return true; }
+    for (int i = 0; i < c; i++) if (nulls[i]) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace: mask bit arrays cannot contain nulls")));
+    for (int i = 0; i < c; i++) {
+        bool has = mask_bit(m, DatumGetInt16(v[i])); if (all && !has) return false; if (!all && has) return true;
+    }
     return all;
 }
 PG_FUNCTION_INFO_V1(laplace_mask_has_all);
 Datum laplace_mask_has_all(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
 PG_FUNCTION_INFO_V1(laplace_mask_has_any);
 Datum laplace_mask_has_any(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
-/* A value's bit in a bank (manifest/banks.tsv): its frozen slot in the bank's list, by its content as text; for the
- * row's own bank, kind, the kinds by name. -1 when the bank does not hold it. */
+/* Only flag banks have single bits. Enum callers use laplace_mask_slot and compare the entire field. */
 PG_FUNCTION_INFO_V1(laplace_bank_bit);
 Datum laplace_bank_bit(PG_FUNCTION_ARGS){
-    char *bank = text_to_cstring(PG_GETARG_TEXT_PP(0)); text *t = PG_GETARG_TEXT_PP(1);
-    const lp_bank *b = lp_highway_bank(highway(), bank); if (!b) ereport(ERROR, (errmsg("laplace: no bank \"%s\" (manifest/banks.tsv)", bank)));
-    if (!b->list) { char *v = text_to_cstring(t); static const char *kinds[] = { "claim", "record", "tuple", "file" };
-        for (int k = 0; k < 4; k++) if (!strcmp(v, kinds[k])) PG_RETURN_INT16(k); PG_RETURN_INT16(-1); }
-    if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_INT16(-1);
-    lp_ref r = trunk_of(t, NULL, 0, NULL); int64 slot = lp_highway_slot(highway(), b->list, &r.id);
-    PG_RETURN_INT16(slot >= 0 && slot < b->width ? (int16)slot : -1);
+    const lp_bank *bank = mask_bank(PG_GETARG_TEXT_PP(0));
+    if (!bank->flags) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: enum banks use laplace_mask_slot, not a single bit")));
+    int64 slot = mask_slot(bank, PG_GETARG_TEXT_PP(1));
+    PG_RETURN_INT16(slot >= 0 && slot < bank->width ? (int16)(bank->offset + slot) : -1);
 }
 /* The bank a type is a value of, and its bit there, by the type's ID; no row when it is a value of no bank. */
 PG_FUNCTION_INFO_V1(laplace_bank_of);

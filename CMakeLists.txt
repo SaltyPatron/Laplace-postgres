@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
-project(LaplacePostgres VERSION 1.11.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.14.0 LANGUAGES C CXX ASM)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
 if(DEFINED ENV{LAPLACE_NATIVE} AND NOT "$ENV{LAPLACE_NATIVE}" STREQUAL "")
@@ -56,3 +56,18 @@ else()
   install(TARGETS laplace_pg LIBRARY DESTINATION ${PG_pkglibdir})
 endif()
 install(FILES laplace.control ${LAPLACE_EXTENSION_SQL} DESTINATION ${PG_sharedir}/extension)
+
+if(PROJECT_IS_TOP_LEVEL)
+  enable_testing()
+  find_program(LAPLACE_PG_REGRESS NAMES pg_regress
+               HINTS "${LAPLACE_PG_DIR}/lib/pgxs/src/test/regress" "${LAPLACE_PG_DIR}/bin")
+  if(NOT LAPLACE_PG_REGRESS)
+    message(FATAL_ERROR "PostgreSQL regression driver not found under LAPLACE_PG_DIR")
+  endif()
+  add_test(NAME postgres_regress COMMAND ${CMAKE_COMMAND}
+    "-DPG_REGRESS=${LAPLACE_PG_REGRESS}" "-DPG_BINDIR=${PG_bindir}"
+    "-DMODULE=$<TARGET_FILE:laplace_pg>" "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}" "-DTIER0=${LAPLACE_TIER0}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-regress.cmake")
+  set_tests_properties(postgres_regress PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
