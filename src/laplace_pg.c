@@ -34,7 +34,7 @@
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.15");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.16");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"

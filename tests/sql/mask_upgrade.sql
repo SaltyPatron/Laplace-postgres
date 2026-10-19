@@ -17,7 +17,7 @@ CREATE TEMP TABLE upgrade_paths (path geometry, keep boolean);
 INSERT INTO upgrade_paths VALUES (laplace_path(ARRAY[laplace_cp_id(97),laplace_cp_id(98),laplace_cp_id(99)]), true);
 CREATE INDEX upgrade_paths_gin ON upgrade_paths USING gin(path laplace_path_ops) WHERE keep;
 COMMENT ON INDEX upgrade_paths_gin IS 'preserve this partial index';
-ALTER EXTENSION laplace UPDATE TO '1.15';
+ALTER EXTENSION laplace UPDATE;
 DO $$
 BEGIN
   IF NOT (SELECT bit_length(mask) = 64 AND laplace_mask_valid(mask)
