@@ -1,4 +1,4 @@
--- Laplace 1.4 -> 1.5: the ledger and the statistics partitioned by the claim's ID hash, as the content is.
+-- Laplace 1.4 -> 1.5: the attestation history and the statistics partitioned by the claim's ID hash, as the content is.
 \echo Use "ALTER EXTENSION laplace UPDATE" to load this file. \quit
 
 -- A database that has the two as single tables: each is renamed, made anew partitioned, filled from the old as one set,

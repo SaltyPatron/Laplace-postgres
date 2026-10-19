@@ -299,7 +299,7 @@ CREATE TABLE IF NOT EXISTS witness (
   lineage  blake3,                                 -- the witness it derives from, so copies are not independent
   trust    double precision NOT NULL             -- -1 .. 1: MANDATE is 1, no information 0, reliably wrong -1
 );
-CREATE TABLE IF NOT EXISTS attestation (         -- the ledger: append-only, in reading order
+CREATE TABLE IF NOT EXISTS attestation (         -- the attestation history: append-only, in reading order
   claim    blake3 NOT NULL,
   witness  blake3 NOT NULL,
   score    real NOT NULL,                        -- win 1, draw 0.5, loss 0, or a score between
@@ -321,8 +321,8 @@ BEGIN
   END LOOP;
 END $$;
 -- The indexes, all of them from the start; laplace index makes them again if one was dropped. Each is created on
--- the partitioned parent, which builds one per partition: IDs (the lookups deduplication and the ledger need), the
--- Hilbert order, the real coordinates (GiST, 4D), the containers and the mask together (GIN), the ledger by claim
+-- the partitioned parent, which builds one per partition: IDs (the lookups deduplication and the attestation history need), the
+-- Hilbert order, the real coordinates (GiST, 4D), the containers and the mask together (GIN), the attestation history by claim
 -- and by witness.
 CREATE FUNCTION laplace_schema_indexes() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
