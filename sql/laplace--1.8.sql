@@ -301,10 +301,10 @@ CREATE TABLE IF NOT EXISTS witness (
   lineage  blake3,                                 -- the witness it derives from, so copies are not independent
   trust    double precision NOT NULL             -- -1 .. 1: MANDATE is 1, no information 0, reliably wrong -1
 );
--- The ledger and the statistics are partitioned as the content is: by the claim's ID hash, sixteen ways by its first
+-- The attestation history and the statistics are partitioned as the content is: by the claim's ID hash, sixteen ways by its first
 -- hex digit (Storage: Physicality, "Partitions go by the ID hash"; Sequence: Database 8.10, "entities, paths, and
--- statistics"). A lookup or an update by claim prunes to one partition; the ledger appends evenly across sixteen.
-CREATE TABLE IF NOT EXISTS attestation (         -- the ledger: append-only, in reading order
+-- statistics"). A lookup or an update by claim prunes to one partition; the attestation history appends evenly across sixteen.
+CREATE TABLE IF NOT EXISTS attestation (         -- the attestation history: append-only, in reading order
   claim    blake3 NOT NULL,
   witness  blake3 NOT NULL,
   score    real NOT NULL,                        -- win 1, draw 0.5, loss 0, or a score between
@@ -337,8 +337,8 @@ BEGIN
   END LOOP;
 END $$;
 -- The indexes, all of them from the start; laplace index makes them again if one was dropped. Each is created on
--- the partitioned parent, which builds one per partition: IDs (the lookups deduplication and the ledger need), the
--- Hilbert order, the real coordinates (GiST, 4D), the containers and the mask together (GIN), the ledger by claim
+-- the partitioned parent, which builds one per partition: IDs (the lookups deduplication and the attestation history need), the
+-- Hilbert order, the real coordinates (GiST, 4D), the containers and the mask together (GIN), the attestation history by claim
 -- and by witness.
 CREATE FUNCTION laplace_schema_indexes() RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
