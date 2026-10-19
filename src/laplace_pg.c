@@ -833,7 +833,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
             uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt);
             Datum a[2] = { PointerGetDatum(bytes_datum(pt, pl)), fand }; Oid t[2] = { BYTEAOID, INT8OID };
-            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id, e.tier FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <~> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id AND p.tier = e.tier", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
+            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <~> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
             for (uint64 r = 0; r < SPI_processed; r++) { bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
                 nominate(&cv, seen, &id, SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl)); }
             /* every child's real coordinate, once; each curve realized and measured */
