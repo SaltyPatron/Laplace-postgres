@@ -13,22 +13,28 @@
 #include "access/gin.h"
 #include "access/stratnum.h"
 #include "catalog/pg_type.h"
+#include "catalog/namespace.h"
+#include "commands/extension.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 #include "utils/varbit.h"
 #include "varatt.h"
 #include "laplace/laplace.h"
 #include "laplace/highway.h"
+#include "laplace/geometry.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.14");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.15");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"
@@ -148,10 +154,45 @@ Datum laplace_path_ewkb(PG_FUNCTION_ARGS){
     PG_RETURN_BYTEA_P(b);
 }
 
-/* The distinct IDs a path holds: the keys of the container index. */
-static lp_id *path_keys(const Geo *g, int *n){ lp_id *k = palloc(sizeof(lp_id) * (g->p.n ? g->p.n : 1)); *n = (int)lp_path_keys(g->p, k); return k; }
+/* PostGIS owns its private serialization. Ask its qualified EWKB exporter once
+ * per value, then use Native's validated reader for every geometry family. */
+static bytea *path_ewkb(Datum geometry){
+    static Oid exporter;
+    if (!OidIsValid(exporter)) {
+        Oid schema = get_extension_schema(get_extension_oid("postgis", false));
+        Oid type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("geometry"), ObjectIdGetDatum(schema));
+        exporter = LookupFuncName(list_make2(makeString(get_namespace_name(schema)), makeString("st_asewkb")), 1, &type, false);
+    }
+    bytea *ewkb = DatumGetByteaP(OidFunctionCall1(exporter, geometry));
+    if (!lp_ewkb_visit((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), NULL, NULL, NULL))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: expected a complete ZM geometry")));
+    return ewkb;
+}
+static lp_id *path_keys(bytea *ewkb, int *n){
+    size_t count;
+    if (!lp_ewkb_keys((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), NULL, 0, &count)
+        || count > MaxAllocSize / sizeof(lp_id) || count > INT_MAX - 2)
+        ereport(ERROR, (errmsg("laplace: geometry has too many vertices")));
+    lp_id *keys = palloc(sizeof(lp_id) * (count ? count : 1));
+    if (!lp_ewkb_keys((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), keys, count, &count))
+        ereport(ERROR, (errmsg("laplace: cannot read geometry vertices")));
+    *n = (int)count; return keys;
+}
+typedef struct { lp_id first, last; bool found; } PathEnds;
+static bool path_end_span(void *context, const lp_ewkb_span *span){
+    PathEnds *ends = context; double vertex[4];
+    if (!ends->found) { lp_ewkb_vertex(span, 0, vertex); lp_xyz_to_id(vertex, &ends->first); }
+    lp_ewkb_vertex(span, span->count - 1, vertex); lp_xyz_to_id(vertex, &ends->last); ends->found = true;
+    return true;
+}
+static PathEnds path_ends(bytea *ewkb){
+    PathEnds ends = {0};
+    if (!lp_ewkb_visit((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), path_end_span, &ends, NULL))
+        ereport(ERROR, (errmsg("laplace: cannot read geometry endpoints")));
+    return ends;
+}
 PG_FUNCTION_INFO_V1(laplace_vertex_ids);
-Datum laplace_vertex_ids(PG_FUNCTION_ARGS){ Geo g = geo_of(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(&g, &m); PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, k, m)); }
+Datum laplace_vertex_ids(PG_FUNCTION_ARGS){ bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(ewkb, &m); PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, k, m)); }
 
 /* laplace_middle_any(path, ids): whether a path holds any of the IDs between its first part and its last, the place a
  * claim's predicate takes, runs counted as the parts they repeat. The claim reads take out the strands a firmware
@@ -608,6 +649,15 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
  * present, so containment and overlap are answered by the index alone: no recheck, no path decoded twice. */
 #define LP_STRAT_CONTAINS 7        /* path @> blake3[] */
 #define LP_STRAT_OVERLAPS 3        /* path && blake3[] */
+#define LP_STRAT_FIRST 8           /* path ^@ blake3 */
+#define LP_STRAT_LAST 9            /* path @^ blake3 */
+enum { PATH_MEMBER, PATH_FIRST, PATH_LAST };
+/* The role byte belongs to an index key, never to an entity's identity. Keeping
+ * all 128 ID bits avoids collisions between membership and endpoint postings. */
+static Datum path_key(const lp_id *id, uint8 role){
+    uint8 bytes[17]; bytes[0] = role; memcpy(bytes + 1, id->b, 16);
+    return PointerGetDatum(bytes_datum(bytes, sizeof bytes));
+}
 
 /* Whether every check is true (all) or any is; GIN's maybe stays maybe. */
 static GinTernaryValue tri_all(const GinTernaryValue *check, int32 n){ GinTernaryValue r = GIN_TRUE; for (int i = 0; i < n; i++) { if (check[i] == GIN_FALSE) return GIN_FALSE; if (check[i] == GIN_MAYBE) r = GIN_MAYBE; } return r; }
@@ -617,15 +667,24 @@ static bool bool_any(const bool *check, int32 n){ for (int i = 0; i < n; i++) if
 
 PG_FUNCTION_INFO_V1(laplace_gin_extract_value);
 Datum laplace_gin_extract_value(PG_FUNCTION_ARGS){
-    int32 *n = (int32 *)PG_GETARG_POINTER(1); Geo g = geo_of(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(&g, &m);
-    Datum *d = palloc(sizeof(Datum) * (m ? m : 1)); for (int i = 0; i < m; i++) d[i] = PointerGetDatum(&k[i]);
+    int32 *n = (int32 *)PG_GETARG_POINTER(1); bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(ewkb, &m);
+    PathEnds ends = path_ends(ewkb);
+    Datum *d = palloc(sizeof(Datum) * (m + 2));
+    for (int i = 0; i < m; i++) d[i] = path_key(&k[i], PATH_MEMBER);
+    if (ends.found) { d[m++] = path_key(&ends.first, PATH_FIRST); d[m++] = path_key(&ends.last, PATH_LAST); }
     *n = m; PG_RETURN_POINTER(d);
 }
 PG_FUNCTION_INFO_V1(laplace_gin_extract_query);
 Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
     int32 *n = (int32 *)PG_GETARG_POINTER(1); StrategyNumber st = PG_GETARG_UINT16(2); int32 *mode = (int32 *)PG_GETARG_POINTER(6);
+    if (st == LP_STRAT_FIRST || st == LP_STRAT_LAST) {
+        Datum *d = palloc(sizeof(Datum));
+        d[0] = path_key((const lp_id *)PG_GETARG_POINTER(0), st == LP_STRAT_FIRST ? PATH_FIRST : PATH_LAST);
+        *n = 1; PG_RETURN_POINTER(d);
+    }
+    if (st != LP_STRAT_CONTAINS && st != LP_STRAT_OVERLAPS) ereport(ERROR, (errmsg("laplace: unknown path GIN strategy %u", st)));
     int k; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &k);
-    Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = PointerGetDatum(&ids[i]);
+    Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = path_key(&ids[i], PATH_MEMBER);
     *n = k; if (k == 0) *mode = st == LP_STRAT_CONTAINS ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
     PG_RETURN_POINTER(d);
 }
@@ -633,16 +692,27 @@ PG_FUNCTION_INFO_V1(laplace_gin_consistent);
 Datum laplace_gin_consistent(PG_FUNCTION_ARGS){
     bool *check = (bool *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
     *(bool *)PG_GETARG_POINTER(5) = false;                                   /* keys are the exact IDs: no recheck */
-    PG_RETURN_BOOL(st == LP_STRAT_CONTAINS ? bool_all(check, n) : bool_any(check, n));
+    PG_RETURN_BOOL(st == LP_STRAT_OVERLAPS ? bool_any(check, n) : bool_all(check, n));
 }
 PG_FUNCTION_INFO_V1(laplace_gin_triconsistent);
 Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     const GinTernaryValue *check = (const GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
-    PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_CONTAINS ? tri_all(check, n) : tri_any(check, n));
+    PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
 }
 
 /* The operators themselves, for plans that do not use the index. */
-static bool path_has(Datum path, ArrayType *q, bool all){ Geo g = geo_of(path); int k; lp_id *ids = ids_of(q, &k); return lp_path_holds(g.p, ids, (size_t)k, all); }
+static bool path_has(Datum path, ArrayType *q, bool all){
+    bytea *ewkb = path_ewkb(path); int n, k; lp_id *keys = path_keys(ewkb, &n), *ids = ids_of(q, &k);
+    for (int i = 0; i < k; i++) {
+        bool found = bsearch(&ids[i], keys, (size_t)n, sizeof(lp_id), lp_id_cmp) != NULL;
+        if (found != all) return !all;
+    }
+    return all;
+}
+PG_FUNCTION_INFO_V1(laplace_path_starts);
+Datum laplace_path_starts(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.first, (const lp_id *)PG_GETARG_POINTER(1))); }
+PG_FUNCTION_INFO_V1(laplace_path_ends);
+Datum laplace_path_ends(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.last, (const lp_id *)PG_GETARG_POINTER(1))); }
 PG_FUNCTION_INFO_V1(laplace_path_contains);
 Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
 PG_FUNCTION_INFO_V1(laplace_path_overlaps);
