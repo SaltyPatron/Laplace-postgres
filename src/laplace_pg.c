@@ -34,7 +34,7 @@
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.16");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.17");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"
@@ -96,6 +96,14 @@ static const lp_tier0_record *tier0(void){
     if (!t) ereport(ERROR, (errmsg("laplace: cannot map tier 0 at \"%s\" (laplace.tier0)", tier0_path)));
     return t;
 }
+static lp_text *text_context(void){
+    static lp_text *context;
+    if (!context) {
+        context = lp_text_new(tier0());
+        if (!context) ereport(ERROR, (errmsg("laplace: cannot open ICU's break iterators")));
+    }
+    return context;
+}
 static const lp_layout *flags(void){
     const lp_layout *l = lp_flags_map(flags_path);
     if (!l) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", flags_path ? flags_path : lp_flags_path())));
@@ -113,7 +121,7 @@ static void tx_release(void *p){ pfree(p); }
 void _PG_init(void);
 void _PG_init(void){
     lp_allocator(tx_grow, tx_release);
-    DefineCustomStringVariable("laplace.tier0", "Path of the tier-0 perf-cache (1,114,112 64-byte records).", NULL, &tier0_path,
+    DefineCustomStringVariable("laplace.tier0", "Path of the tier-0 perf-cache (1,112,064 scalar records, 64 bytes each).", NULL, &tier0_path,
                                lp_tier0_path(), PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", NULL, &flags_path,
                                lp_flags_path(), PGC_SUSET, 0, NULL, NULL, NULL);
@@ -132,7 +140,7 @@ Datum laplace_cp_id(PG_FUNCTION_ARGS){
 PG_FUNCTION_INFO_V1(laplace_text_id);
 Datum laplace_text_id(PG_FUNCTION_ARGS){
     text *t = PG_GETARG_TEXT_PP(0); lp_id id;
-    if (!lp_id_codepoints_utf8(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
+    if (!lp_text_id(text_context(), VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
     return id_datum(&id);
 }
 
@@ -316,11 +324,9 @@ Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id((const uint8 *)PG
  * The one decomposition of text (UAX #29, Laplace-Native), composed without recording: the ID, tier, coordinate and
  * constituents the engine gives the same text. A constant argument folds at plan time, so the query becomes an index
  * lookup on the result. */
-static lp_text *TX;
 static lp_ref trunk_of(text *t, lp_ref *parts, size_t cap, size_t *np){
-    if (!TX) { TX = lp_text_new(tier0()); if (!TX) ereport(ERROR, (errmsg("laplace: cannot open ICU's break iterators"))); }
     lp_ref one; size_t n;
-    return lp_text_parts(TX, (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), parts ? parts : &one, parts ? cap : 1, np ? np : &n);
+    return lp_text_parts(text_context(), (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), parts ? parts : &one, parts ? cap : 1, np ? np : &n);
 }
 #define TEXT_ARG(t) text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL()
 
