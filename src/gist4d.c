@@ -5,7 +5,7 @@
  * PostGIS's float32 boxes rounded outward. The ordering operator <~> is the exact 4D Euclidean distance
  * (lp_distance4). A leaf key is its point (min == max), and its distance is computed exactly as lp_distance4 computes
  * it: the same differences, squared and summed in the same order, ((dx^2 + dy^2) + dz^2) + dm^2, then a correctly
- * rounded sqrt. So the index returns rows in <~> order with no recheck. An inner key's distance takes, on each axis,
+ * rounded sqrt. Leaf recheck also applies the query operator to the heap value. An inner key's distance takes, on each axis,
  * the gap from the query to the box (0 inside it), which is no larger than the difference to any point in the box;
  * rounding is monotone, so the bound is never above the exact distance of anything under it.
  *
@@ -115,7 +115,7 @@ Datum laplace_point4d_gist_compress(PG_FUNCTION_ARGS){
 
 /* laplace_angular4d_ops: the same keys over each point's direction, ordered by <=>. A leaf's angle is <=>'s, bit for
  * bit: the same direction, chord and arcsine. An inner box gives a chord no longer than to any direction in it, and
- * the angle is monotone in the chord, so the order is exact with no recheck. */
+ * the angle is monotone in the chord. The executor rechecks leaf values. */
 PG_FUNCTION_INFO_V1(laplace_angular4d_gist_compress);
 Datum laplace_angular4d_gist_compress(PG_FUNCTION_ARGS){
     GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
@@ -132,7 +132,7 @@ Datum laplace_angular4d_gist_distance(PG_FUNCTION_ARGS){
     StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
     if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_angular4d_ops: unknown strategy %u", strategy)));
     double u[4]; direction_of(point_of(PG_GETARG_DATUM(1)), u);
-    *recheck = false;
+    *recheck = true;
     PG_RETURN_FLOAT8(angle_of_chord(box_distance((const Box4 *)DatumGetPointer(e->key), u)));
 }
 
@@ -227,7 +227,7 @@ Datum laplace_point4d_gist_distance(PG_FUNCTION_ARGS){
     GISTENTRY *e = (GISTENTRY *)PG_GETARG_POINTER(0);
     StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
     if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_point4d_ops: unknown strategy %u", strategy)));
-    *recheck = false;   /* a leaf's distance is lp_distance4's, bit for bit (header) */
+    *recheck = true;    /* always evaluate the exact ordering operator on heap leaves */
     PG_RETURN_FLOAT8(box_distance((const Box4 *)DatumGetPointer(e->key), point_of(PG_GETARG_DATUM(1))));
 }
 
