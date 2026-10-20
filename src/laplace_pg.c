@@ -33,8 +33,9 @@
 #include "laplace/laplace.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
+#include "laplace/consensus.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.17");
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.18");
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"
@@ -201,6 +202,58 @@ static PathEnds path_ends(bytea *ewkb){
 }
 PG_FUNCTION_INFO_V1(laplace_vertex_ids);
 Datum laplace_vertex_ids(PG_FUNCTION_ARGS){ bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(ewkb, &m); PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, k, m)); }
+
+PG_FUNCTION_INFO_V1(laplace_path_length);
+Datum laplace_path_length(PG_FUNCTION_ARGS){
+    Geo g = geo_of(PG_GETARG_DATUM(0)); size_t n = lp_path_len(g.p);
+    if (n > PG_INT64_MAX) ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("laplace_path_length: run count exceeds bigint")));
+    PG_RETURN_INT64((int64)n);
+}
+
+/* One Native solve for a complete claim, not sequential updates of its previous
+ * standing. Scores here are mean outcomes; containment's summed wins are
+ * divided by its games by the SQL orchestrator. Native owns all rating math. */
+PG_FUNCTION_INFO_V1(laplace_series);
+Datum laplace_series(PG_FUNCTION_ARGS){
+    ArrayType *arrays[4]; Datum *values[4]; bool *nulls[4]; int counts[4];
+    const Oid types[4] = { InvalidOid, INT8OID, FLOAT8OID, FLOAT8OID };
+    const int16 sizes[4] = { 16, 8, 8, 8 };
+    const char alignments[4] = { TYPALIGN_CHAR, TYPALIGN_DOUBLE, TYPALIGN_DOUBLE, TYPALIGN_DOUBLE };
+    for (int k = 0; k < 4; k++) {
+        arrays[k] = PG_GETARG_ARRAYTYPE_P(k);
+        if (ARR_NDIM(arrays[k]) > 1)
+            ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR), errmsg("laplace_series: one-dimensional arrays required")));
+        deconstruct_array(arrays[k], k ? types[k] : ARR_ELEMTYPE(arrays[k]), sizes[k], k != 0,
+                          alignments[k], &values[k], &nulls[k], &counts[k]);
+        if (k && counts[k] != counts[0])
+            ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR), errmsg("laplace_series: array lengths must agree")));
+    }
+    if ((size_t)counts[0] > MaxAllocSize / sizeof(lp_series_entry))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("laplace_series: too many observations")));
+    lp_series_entry *entries = palloc(sizeof(*entries) * (counts[0] ? counts[0] : 1));
+    for (int i = 0; i < counts[0]; i++) {
+        for (int k = 0; k < 4; k++) if (nulls[k][i])
+            ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_series: null observation or cyclic witness lineage")));
+        int64 games = DatumGetInt64(values[1][i]);
+        double score = DatumGetFloat8(values[2][i]), trust = DatumGetFloat8(values[3][i]);
+        if (games < 0 || games > INT64CONST(9007199254740992) || !isfinite(score) || score < 0 || score > 1
+            || !isfinite(trust) || trust < 0 || trust > 1)
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_series: invalid games, mean score or trust")));
+        lp_id root; memcpy(root.b, DatumGetPointer(values[0][i]), sizeof root.b);
+        entries[i] = lp_series_observation(root, (uint64_t)games, (double)games * score, trust);
+    }
+    lp_standing standing;
+    if (!lp_series(entries, (size_t)counts[0], &standing) || standing.matches > PG_INT64_MAX || standing.witnesses > PG_INT64_MAX)
+        ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("laplace_series: invalid or non-convergent rooted series")));
+    pfree(entries);
+    TupleDesc td;
+    if (get_call_result_type(fcinfo, NULL, &td) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("laplace_series: composite result expected")));
+    Datum result[5] = { Float8GetDatum(standing.rating), Float8GetDatum(standing.deviation), Float8GetDatum(standing.volatility),
+                        Int64GetDatum((int64)standing.matches), Int64GetDatum((int64)standing.witnesses) };
+    bool missing[5] = {0};
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), result, missing)));
+}
 
 /* laplace_middle_any(path, ids): whether a path holds any of the IDs between its first part and its last, the place a
  * claim's predicate takes, runs counted as the parts they repeat. The claim reads take out the strands a firmware

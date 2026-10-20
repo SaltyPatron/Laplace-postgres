@@ -1,0 +1,199 @@
+\set ECHO none
+\pset format unaligned
+\pset tuples_only on
+SET client_min_messages = warning;
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS stage;
+CREATE UNLOGGED TABLE stage.attestation_test (
+  claim blake3 NOT NULL, witness blake3 NOT NULL, lineage blake3,
+  games bigint NOT NULL, score double precision NOT NULL, trust double precision NOT NULL,
+  PRIMARY KEY (claim, witness)
+);
+
+-- Real canonical content, coordinates and containment paths. Tier-0 atoms
+-- remain in the mapped cache; no codepoint rows are inserted in the database.
+CREATE TEMP TABLE series_words AS SELECT unnest(ARRAY['dog','is','noun','source','file','one','two','three']) AS content;
+INSERT INTO entity (id, tier, coord, hilbert)
+  SELECT laplace_id(content), laplace_tier(content), laplace_coord(content), laplace_hilbert(content) FROM series_words;
+INSERT INTO physicality (entity, tier, hilbert, path)
+  SELECT laplace_id(content), laplace_tier(content), laplace_hilbert(content),
+    laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(content, '') c)) FROM series_words;
+CREATE FUNCTION pg_temp.series_node(parts blake3[], kind text DEFAULT NULL, metadata bigint[] DEFAULT NULL) RETURNS blake3
+LANGUAGE plpgsql AS $$
+DECLARE composed blake3 := laplace_compose(parts); point geometry; path geometry := laplace_path(parts);
+        coord geometry; altitude smallint; hilbert bigint; carrier bit(64) := B'0'::bit(64); i integer;
+BEGIN
+  SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(e.coord)), (max(e.tier) + 1)::smallint
+    INTO coord, altitude FROM unnest(parts) p JOIN entity e ON e.id = p;
+  hilbert := laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
+  IF kind IS NOT NULL THEN carrier := laplace_mask_slot('kind', kind); END IF;
+  IF metadata IS NOT NULL THEN
+    IF cardinality(metadata) <> ST_NPoints(path) THEN RAISE EXCEPTION 'fixture metadata does not match RLE vertices'; END IF;
+    FOR i IN 1..cardinality(metadata) LOOP
+      point := ST_PointN(path, i);
+      path := ST_SetPoint(path, i - 1, ST_MakePoint(ST_X(point), ST_Y(point), ST_Z(point), ST_M(point) + metadata[i]));
+    END LOOP;
+  END IF;
+  INSERT INTO entity (id, tier, coord, hilbert, mask) VALUES (composed, altitude, coord, hilbert, carrier) ON CONFLICT DO NOTHING;
+  INSERT INTO physicality (entity, tier, hilbert, path, mask) VALUES (composed, altitude, hilbert, path, carrier) ON CONFLICT DO NOTHING;
+  RETURN composed;
+END $$;
+CREATE TEMP TABLE series_claims (name text PRIMARY KEY, id blake3);
+INSERT INTO series_claims VALUES
+  ('a', pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')], 'claim')),
+  ('b', pg_temp.series_node(ARRAY[laplace_id('noun'),laplace_id('is'),laplace_id('dog')], 'claim'));
+CREATE TEMP TABLE series_sources (name text PRIMARY KEY, id blake3);
+DO $$
+DECLARE source_name text; a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
+        b blake3 := (SELECT id FROM series_claims WHERE name = 'b'); rec blake3; file_meta blake3; file_trunk blake3; source_meta blake3;
+BEGIN
+  FOREACH source_name IN ARRAY ARRAY['one','two','three'] LOOP
+    -- A record says claim a 1000 times and claim b 3 times; both counts are
+    -- real RLE runs in M, above which file and source trunks contain them.
+    rec := pg_temp.series_node(array_fill(a, ARRAY[1000]) || array_fill(b, ARRAY[3]) || ARRAY[laplace_id(source_name)], 'record',
+                              ARRAY[2147483648,2147483648,0]::bigint[]);
+    file_meta := pg_temp.series_node(ARRAY[laplace_id('file'),laplace_id(source_name)], 'tuple');
+    file_trunk := pg_temp.series_node(ARRAY[file_meta,rec], 'file', ARRAY[4294967296,5368709120]::bigint[]);
+    source_meta := pg_temp.series_node(ARRAY[laplace_id('source'),laplace_id(source_name)], 'tuple');
+    INSERT INTO series_sources VALUES (source_name, pg_temp.series_node(ARRAY[source_meta,file_trunk], 'file', ARRAY[4294967296,5368709120]::bigint[]));
+  END LOOP;
+END $$;
+INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
+  FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'one';
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); first consensus%ROWTYPE; expected record; result record;
+BEGIN
+  IF laplace_attest_series('stage.attestation_test') <> 1 THEN RAISE EXCEPTION 'first claim not merged'; END IF;
+  SELECT * INTO first FROM consensus WHERE claim = a;
+  SELECT s.* INTO expected FROM stage.attestation_test p,
+    LATERAL laplace_series(ARRAY[p.witness], ARRAY[p.games], ARRAY[p.score], ARRAY[p.trust]) s;
+  IF (first.rating, first.deviation, first.volatility, first.matches) IS DISTINCT FROM
+     (expected.rating, expected.deviation, expected.volatility, expected.matches)
+     OR first.rating <= 1500 OR first.deviation >= 350 OR first.matches <> 1000 THEN
+    RAISE EXCEPTION 'set merge differs from the Native standing';
+  END IF;
+  PERFORM laplace_attest_series('stage.attestation_test');
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF result IS DISTINCT FROM first THEN RAISE EXCEPTION 'replay changed the standing'; END IF;
+  SELECT * INTO expected FROM laplace_series(ARRAY[a], ARRAY[3000000000::bigint], ARRAY[1.0::float8], ARRAY[0.85::float8]);
+  IF expected.matches <> 3000000000 OR expected.witnesses <> 1 THEN RAISE EXCEPTION 'bigint games truncated'; END IF;
+END $$;
+CREATE TEMP TABLE series_single AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'a');
+-- A second claim exercises changed-window isolation during subsequent updates.
+INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 3, 1, 0.85
+  FROM series_claims c, series_sources w WHERE c.name = 'b' AND w.name = 'one';
+SELECT laplace_attest_series('stage.attestation_test', ARRAY[(SELECT id FROM series_claims WHERE name = 'b')]) = 1;
+CREATE TEMP TABLE series_untouched AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'b');
+INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
+  FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'two';
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE;
+BEGIN
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF result.rating <= 1832.828 OR result.deviation >= (SELECT deviation FROM series_single) OR result.matches <> 2000 THEN
+    RAISE EXCEPTION 'independent agreement did not exceed one source''s limiting rating and reduce uncertainty';
+  END IF;
+  IF EXISTS ((SELECT * FROM consensus WHERE claim = (SELECT claim FROM series_untouched)) EXCEPT SELECT * FROM series_untouched) THEN
+    RAISE EXCEPTION 'changed window updated a different claim';
+  END IF;
+END $$;
+CREATE TEMP TABLE series_independent AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'a');
+-- A derived source shares root one: 1000+1000 games at that root, not another
+-- independent vote. The canonical Native fold must give exactly the same bits.
+INSERT INTO stage.attestation_test SELECT c.id, w.id, root.id, 1000, 1, 0.85
+  FROM series_claims c, series_sources w, series_sources root WHERE c.name = 'a' AND w.name = 'three' AND root.name = 'one';
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); one blake3 := (SELECT id FROM series_sources WHERE name = 'one');
+        two blake3 := (SELECT id FROM series_sources WHERE name = 'two'); result consensus%ROWTYPE; expected record;
+BEGIN
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  SELECT * INTO expected FROM laplace_series(ARRAY[one,two], ARRAY[2000,1000]::bigint[], ARRAY[1,1]::float8[], ARRAY[0.85,0.85]::float8[]);
+  IF (result.rating, result.deviation, result.volatility, result.matches) IS DISTINCT FROM
+     (expected.rating, expected.deviation, expected.volatility, expected.matches) OR expected.witnesses <> 2 THEN
+    RAISE EXCEPTION 'dependent witnesses were not folded before the solve';
+  END IF;
+END $$;
+CREATE TEMP TABLE series_folded AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'a');
+-- Reverse physical staging order, then replay: every standing bit is identical.
+CREATE TEMP TABLE series_reordered AS SELECT * FROM stage.attestation_test ORDER BY witness DESC;
+TRUNCATE stage.attestation_test;
+INSERT INTO stage.attestation_test SELECT * FROM series_reordered;
+DO $$
+BEGIN
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[(SELECT id FROM series_claims WHERE name = 'a')]);
+  IF EXISTS ((SELECT * FROM consensus WHERE claim = (SELECT claim FROM series_folded)) EXCEPT SELECT * FROM series_folded) THEN
+    RAISE EXCEPTION 'staging order changed the standing';
+  END IF;
+END $$;
+-- Register the real source trunks. The upward GIN walk reads their record M
+-- runs; pending rows overlay that same evidence and must not double its games.
+INSERT INTO witness SELECT id, CASE WHEN name = 'three' THEN (SELECT id FROM series_sources WHERE name = 'one') END, 0.85 FROM series_sources;
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE;
+BEGIN
+  IF (SELECT count(*) FROM laplace_attested(ARRAY[a]) WHERE witness AND games = 1000 AND score = 1000) <> 3 THEN
+    RAISE EXCEPTION 'real containment did not recover all three source series';
+  END IF;
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF result IS DISTINCT FROM (SELECT s FROM series_folded s) THEN RAISE EXCEPTION 'pending and recorded evidence counted twice'; END IF;
+  DELETE FROM stage.attestation_test;
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF result IS DISTINCT FROM (SELECT s FROM series_folded s) THEN RAISE EXCEPTION 'containment handoff changed the standing'; END IF;
+END $$;
+-- Two-hop lineage, then a cycle: transitive copies fold; cycles fail atomically.
+UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE id = (SELECT id FROM series_sources WHERE name = 'two');
+UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE id = (SELECT id FROM series_sources WHERE name = 'three');
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE; expected record; before_cycle consensus%ROWTYPE;
+BEGIN
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  SELECT * INTO expected FROM laplace_series(ARRAY[(SELECT id FROM series_sources WHERE name = 'one')], ARRAY[3000]::bigint[], ARRAY[1]::float8[], ARRAY[0.85]::float8[]);
+  IF (result.rating, result.deviation, result.volatility, result.matches) IS DISTINCT FROM
+     (expected.rating, expected.deviation, expected.volatility, expected.matches) THEN RAISE EXCEPTION 'transitive lineage did not fold'; END IF;
+  before_cycle := result;
+  BEGIN
+    UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'three') WHERE id = (SELECT id FROM series_sources WHERE name = 'one');
+    PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+    RAISE EXCEPTION 'cyclic lineage was accepted';
+  EXCEPTION WHEN null_value_not_allowed THEN NULL;
+  END;
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF result IS DISTINCT FROM before_cycle THEN RAISE EXCEPTION 'cyclic lineage partially updated consensus'; END IF;
+  UPDATE witness SET trust = -0.85;
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  SELECT * INTO result FROM consensus WHERE claim = a;
+  IF abs(result.rating + before_cycle.rating - 3000) > 1e-8 OR abs(result.deviation - before_cycle.deviation) > 1e-8 THEN
+    RAISE EXCEPTION 'signed trust did not reverse the outcome symmetrically';
+  END IF;
+  DELETE FROM witness;
+  PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
+  IF EXISTS (SELECT FROM consensus WHERE claim = a) THEN RAISE EXCEPTION 'standing survived removal of every witness'; END IF;
+END $$;
+DO $$
+DECLARE id blake3 := (SELECT id FROM series_claims WHERE name = 'a');
+BEGIN
+  BEGIN
+    PERFORM laplace_series(ARRAY[id], ARRAY[1,2]::bigint[], ARRAY[1]::float8[], ARRAY[0.85]::float8[]);
+    RAISE EXCEPTION 'mismatched arrays accepted';
+  EXCEPTION WHEN array_subscript_error THEN NULL; END;
+  BEGIN
+    PERFORM laplace_series(ARRAY[id], ARRAY[1]::bigint[], ARRAY['NaN'::float8], ARRAY[0.85]::float8[]);
+    RAISE EXCEPTION 'NaN score accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_attest_series('series_folded');
+    RAISE EXCEPTION 'non-stage table accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  INSERT INTO stage.attestation_test VALUES (laplace_id('dog'), id, NULL, 1, 1, 0.85);
+  BEGIN
+    PERFORM laplace_attest_series('stage.attestation_test');
+    RAISE EXCEPTION 'content admitted to consensus as a claim';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
+ROLLBACK;
+SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
