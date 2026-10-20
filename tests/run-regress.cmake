@@ -43,7 +43,7 @@ execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
-  mask_upgrade mask geometry gin_path gist4d text_id attestation
+  mask_upgrade mask geometry gin_path gist4d text_id attestation stage
   WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
 endif()
 if(NOT result EQUAL 0)
