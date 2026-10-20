@@ -48,6 +48,29 @@ SELECT entity_rows = 0 AND physicality_rows = 0 AND updated_rows = 3 AS carriers
 FROM laplace_merge_stage('stage.merge_entities', 'stage.merge_paths');
 SELECT bool_and(laplace_mask_has_value(p.mask, 'kind', 'tuple')) AS carriers_preserved
 FROM physicality p WHERE p.entity = ANY(ARRAY[laplace_id('dog'),laplace_id('cat'),laplace_id('ant')]);
+-- Complete set validation must still reject identity conflicts and missing
+-- partner rows, leaving the caller's copied batch available for correction.
+DO $$ BEGIN
+  PERFORM pg_temp.fill_stage();
+  UPDATE stage.merge_entities SET hilbert = hilbert + 1 WHERE id = laplace_id('dog');
+  BEGIN
+    PERFORM laplace_merge_stage('stage.merge_entities', 'stage.merge_paths');
+    RAISE EXCEPTION 'conflicting identity accepted';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  IF (SELECT count(*) FROM stage.merge_entities) <> 3 THEN
+    RAISE EXCEPTION 'identity rejection consumed pending input';
+  END IF;
+  TRUNCATE stage.merge_entities, stage.merge_paths;
+  INSERT INTO stage.merge_entities (id, tier, coord, hilbert)
+    SELECT laplace_id('new'), laplace_tier('new'), laplace_coord('new'), laplace_hilbert('new');
+  BEGIN
+    PERFORM laplace_merge_stage('stage.merge_entities', 'stage.merge_paths');
+    RAISE EXCEPTION 'unpaired entity accepted';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  IF (SELECT count(*) FROM stage.merge_entities) <> 1 THEN
+    RAISE EXCEPTION 'pair rejection consumed pending input';
+  END IF;
+END $$;
 DO $$ BEGIN
   BEGIN
     PERFORM laplace_merge_stage('public.entity', 'stage.merge_paths');
