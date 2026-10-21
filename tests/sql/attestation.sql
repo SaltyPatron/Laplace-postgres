@@ -224,5 +224,52 @@ BEGIN
       AND laplace_path_starts(p.path,laplace_compose(ARRAY[laplace_id('file'),laplace_id('one')]));
   IF found<>1 THEN RAISE EXCEPTION 'file diagnostic omitted the containing file'; END IF;
 END $$;
+-- One corpus may contain curated and calculated testimony. Calculation is a
+-- contained registry-class qualifier, not a second witness. Copies of that
+-- calculation in another corpus still share its dependence root.
+DO $$
+DECLARE c blake3; cls blake3 := laplace_text_id('DerivedCalculation');
+        calculated blake3; curated blake3; first_source blake3; second_source blake3;
+        expected record; actual consensus%ROWTYPE; found integer;
+BEGIN
+  INSERT INTO entity (id,tier,coord,hilbert) VALUES
+    (cls,laplace_tier('DerivedCalculation'),laplace_coord('DerivedCalculation'),laplace_hilbert('DerivedCalculation'));
+  INSERT INTO physicality (entity,tier,hilbert,path) VALUES
+    (cls,laplace_tier('DerivedCalculation'),laplace_hilbert('DerivedCalculation'),
+     laplace_path(ARRAY(SELECT laplace_cp_id(ascii(ch)) FROM regexp_split_to_table('DerivedCalculation','') ch)));
+  c := pg_temp.series_node(ARRAY[laplace_id('source'),laplace_id('is'),laplace_id('noun')],'claim');
+  calculated := pg_temp.series_node(ARRAY[cls,c,laplace_id('one')],'record',ARRAY[7516192768,1073741824,0]::bigint[]);
+  curated := pg_temp.series_node(ARRAY[c,laplace_id('two')],'record',ARRAY[1073741824,0]::bigint[]);
+  first_source := pg_temp.series_node(ARRAY[laplace_id('source'),calculated,curated],'file',ARRAY[4294967296,5368709120,5368709120]::bigint[]);
+  second_source := pg_temp.series_node(ARRAY[laplace_id('three'),calculated],'file',ARRAY[4294967296,5368709120]::bigint[]);
+  INSERT INTO witness VALUES (first_source,NULL,0.85),(second_source,NULL,0.85);
+  SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
+    WHERE witness AND dependence_root=cls AND trust=0.70 AND games=1 AND score=1;
+  IF found<>2 THEN RAISE EXCEPTION 'contained calculation did not retain its class root and trust'; END IF;
+  SELECT count(*) INTO found FROM laplace_attested(ARRAY[c])
+    WHERE witness AND trunk=first_source AND games=2 AND score=2 AND trust=0.85;
+  IF found<>1 THEN RAISE EXCEPTION 'source provenance created extra calculation witnesses'; END IF;
+  SELECT s.* INTO expected FROM laplace_series(ARRAY[first_source,cls,cls],ARRAY[1,1,1]::bigint[],
+    ARRAY[1,1,1]::float8[],ARRAY[0.85,0.70,0.70]::float8[]) s;
+  CREATE UNLOGGED TABLE stage.attestation_scope_test (LIKE stage.attestation_test INCLUDING DEFAULTS);
+  PERFORM laplace_attest_series('stage.attestation_scope_test',ARRAY[c]);
+  SELECT * INTO actual FROM consensus WHERE claim=c;
+  IF ROW(float8send(actual.rating),float8send(actual.deviation),float8send(actual.volatility),actual.matches)
+     IS DISTINCT FROM ROW(float8send(expected.rating),float8send(expected.deviation),float8send(expected.volatility),expected.matches)
+  THEN RAISE EXCEPTION 'stored dependence scopes disagree with Native rooted solving'; END IF;
+  INSERT INTO stage.attestation_scope_test VALUES (c,first_source,NULL,1,1,0.85),(c,first_source,cls,1,1,0.70);
+  PERFORM laplace_attest_series('stage.attestation_scope_test',ARRAY[c]);
+  PERFORM laplace_attest_series('stage.attestation_scope_test',ARRAY[c]);
+  SELECT * INTO actual FROM consensus WHERE claim=c;
+  IF ROW(float8send(actual.rating),float8send(actual.deviation),float8send(actual.volatility),actual.matches)
+     IS DISTINCT FROM ROW(float8send(expected.rating),float8send(expected.deviation),float8send(expected.volatility),expected.matches)
+  THEN RAISE EXCEPTION 'cumulative multi-root source replay duplicated games or replaced calculation trust'; END IF;
+  BEGIN
+    PERFORM pg_temp.series_node(ARRAY[laplace_id('dog'),c],'record',ARRAY[7516192768,1073741824]::bigint[]);
+    PERFORM * FROM laplace_attested_series(ARRAY[c]);
+    RAISE EXCEPTION 'unknown dependence class accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
+SELECT 'dependence: source witness retained; stored and cumulative class-rooted series agree exactly';
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
