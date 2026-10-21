@@ -1051,13 +1051,15 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
 /* ---- provenance by containment and basis-point royalty attribution (laplace_attested, laplace_attribution)
  * Walks up the container index from claims to their trunks and witnesses in one native SPI operator. */
 #define PG_NONE ((size_t)-1)
-typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t in_next; } PgEdge;
+typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t in_next;
+                 lp_id dependence; double dependence_trust; uint8_t has_dependence; } PgEdge;
 typedef struct { lp_id id; int nparents; size_t in_head; uint8_t file; } PgWNode;
 typedef lp_vec(PgWNode) PgWNodes;
 typedef lp_vec(PgEdge)  PgEdges;
 typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
-typedef struct { double games, tokens, score; uint32_t position; } PgTally;
-typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness, share_bp; } PgAttrRow;
+typedef struct { double games, tokens, score; uint32_t position; lp_id claim, dependence; double dependence_trust; uint8_t has_dependence; } PgTally;
+typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness, share_bp;
+                 lp_id dependence; double source_trust; uint8_t has_dependence; } PgAttrRow;
 typedef lp_vec(PgAttrRow) PgAttrRows;
 
 static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
@@ -1075,7 +1077,7 @@ static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
 static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
 {
     size_t k = d->e.n;
-    PgEdge e = { p, c, v->run, v->outcome, v->spare, v->position, 0, 0, d->n.v[c].in_head };
+    PgEdge e = { .p=p,.c=c,.times=v->run,.outcome=v->outcome,.spare=v->spare,.position=v->position,.in_next=d->n.v[c].in_head };
     lp_push(&d->e, e);
     d->n.v[c].in_head = k;
     d->n.v[c].nparents++;
@@ -1110,7 +1112,7 @@ static double *pg_down_from(const PgDag *d, size_t top)
     return cnt;
 }
 
-static void pg_tally_under(const PgDag *d, const double *cnt, lp_idmap *per_claim)
+static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_claim)
 {
     for (size_t k = 0; k < d->e.n; k++) {
         const PgEdge *e = &d->e.v[k];
@@ -1120,8 +1122,11 @@ static void pg_tally_under(const PgDag *d, const double *cnt, lp_idmap *per_clai
         double tk = c * (double)e->times;
         double s = g * lp_outcome_score(e->outcome, e->spare);
         bool fresh;
-        PgTally *t = lp_idmap_get(per_claim, &d->n.v[e->c].id, &fresh);
-        if (fresh) *t = (PgTally){ 0, 0, 0, 0 };
+        uint8_t key[32]={0}; memcpy(key,d->n.v[e->c].id.b,16);
+        if (e->has_dependence) memcpy(key+16,e->dependence.b,16);
+        PgTally *t = lp_strmap_get(per_claim,key,sizeof key,&fresh);
+        if (fresh) *t = (PgTally){ .claim=d->n.v[e->c].id,.dependence=e->dependence,
+            .dependence_trust=e->dependence_trust,.has_dependence=e->has_dependence };
         t->games += g; t->tokens += tk; t->score += s;
         if (e->position && (!t->position || e->position < t->position)) t->position = e->position;
     }
@@ -1133,7 +1138,9 @@ static int by_attr_row(const void *a, const void *b)
     int c = memcmp(x->claim.b, y->claim.b, 16); if (c) return c;
     if (x->witness != y->witness) return y->witness - x->witness;
     if (x->games != y->games) return x->games > y->games ? -1 : 1;
-    return memcmp(x->trunk.b, y->trunk.b, 16);
+    c=memcmp(x->trunk.b, y->trunk.b, 16); if (c) return c;
+    if (x->has_dependence!=y->has_dependence) return (int)x->has_dependence-(int)y->has_dependence;
+    return memcmp(x->dependence.b,y->dependence.b,16);
 }
 
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only, int include_files, PgAttrRows *out)
@@ -1146,6 +1153,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         pg_dag_node(&d, &claims[i], NULL);
     }
     lp_vec(lp_vertex) vx = {0};
+    lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         int nb = (int)lp_idmap_count(front);
         Datum a[1] = { PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb)) }; Oid t[1] = { idarr };
@@ -1162,7 +1170,17 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
             lp_vec_reserve(&vx, (size_t)nv);
             if (lp_path_decode(g.p, vx.v, (size_t)nv) != (size_t)nv) continue;
             size_t pi = PG_NONE; int fresh = 0;
+            const lp_trust_class *pending_class=NULL; lp_id pending_id={{0}};
             for (int k = 0; k < nv; k++) {
+                if (vx.v[k].said==LP_SAID_DEPENDENCE) {
+                    bool added; const lp_trust_class **c=lp_idmap_get(classes,&vx.v[k].id,&added);
+                    if (added) *c=lp_trust_class_for_id(text_context(),&vx.v[k].id);
+                    if (!*c || vx.v[k].run!=1 || k+1==nv
+                        || (vx.v[k+1].said!=LP_SAID_CLAIM && vx.v[k+1].said!=LP_SAID_RECORD))
+                        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_attested: invalid dependence-class qualifier")));
+                    pending_class=*c; pending_id=vx.v[k].id; continue;
+                }
+                const lp_trust_class *scope=pending_class; pending_class=NULL;
                 if (lp_idmap_find(front, &vx.v[k].id) < 0) continue;
                 uint32_t sd = vx.v[k].said;
                 if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
@@ -1173,7 +1191,9 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
                 }
                 size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
                 PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
-                if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD); }
+                if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD);
+                    if (scope) { e->has_dependence=1; e->dependence=pending_id; e->dependence_trust=scope->prior; }
+                }
             }
             if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
         }
@@ -1182,6 +1202,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     }
     lp_idmap_free(front);
     lp_vec_free(&vx);
+    lp_idmap_free(classes);
 
     lp_vec(size_t) rix = {0};
     lp_vec(lp_id)  rids = {0};
@@ -1215,15 +1236,17 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         double tr = is_w ? *wtr : 0.0;
         if (witnessed_only && (!is_w || tr <= 0.0)) continue;
         double *cnt = pg_down_from(&d, top);
-        lp_idmap *per_claim = lp_idmap_sized(sizeof(PgTally));
+        lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d, cnt, per_claim);
-        for (size_t i = 0; i < lp_idmap_count(per_claim); i++) {
-            const PgTally *tl = lp_idmap_at(per_claim, i);
+        for (size_t i = 0; i < lp_strmap_count(per_claim); i++) {
+            const PgTally *tl = lp_strmap_at(per_claim, i);
             if (tl->games <= 0) continue;
-            PgAttrRow row = { lp_idmap_keys(per_claim)[i], tid, tl->games, tl->tokens, tl->score, tl->position, tr, is_w, 0 };
+            PgAttrRow row = { .claim=tl->claim,.trunk=tid,.games=tl->games,.tokens=tl->tokens,.score=tl->score,
+                .position=tl->position,.trust=tl->has_dependence ? tl->dependence_trust : tr,.witness=is_w,
+                .dependence=tl->dependence,.source_trust=tr,.has_dependence=tl->has_dependence };
             lp_push(out, row);
         }
-        lp_idmap_free(per_claim);
+        lp_strmap_free(per_claim);
         pfree(cnt);
     }
     lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
@@ -1268,6 +1291,41 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     lp_idmap_free(d.m); lp_vec_free(&d.n); lp_vec_free(&d.e);
 }
 
+/* The source-facing provenance API remains one row per corpus/container. The
+ * series API below retains each explicit dependence scope for Native solving. */
+static void pg_rollup_sources(PgAttrRows *rows){
+    lp_strmap *map=lp_strmap_sized(sizeof(PgAttrRow));
+    for (size_t i=0; i<rows->n; i++) {
+        const PgAttrRow *r=rows->v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
+        bool fresh; PgAttrRow *v=lp_strmap_get(map,key,sizeof key,&fresh);
+        if (fresh) { *v=*r; v->trust=r->source_trust; v->has_dependence=0; memset(&v->dependence,0,sizeof v->dependence); }
+        else { v->games+=r->games; v->tokens+=r->tokens; v->score+=r->score; v->share_bp+=r->share_bp;
+            if (r->position && (!v->position || r->position<v->position)) v->position=r->position; }
+    }
+    rows->n=0;
+    for (size_t i=0; i<lp_strmap_count(map); i++) lp_push(rows,*(PgAttrRow *)lp_strmap_at(map,i));
+    lp_strmap_free(map); lp_sort(rows->v,rows->n,sizeof(PgAttrRow),by_attr_row);
+}
+
+PG_FUNCTION_INFO_V1(laplace_attested_series);
+Datum laplace_attested_series(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts=set_begin(fcinfo,"laplace_attested_series",&td);
+    int n; lp_id *claims=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n); if (!n) PG_RETURN_NULL();
+    Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
+    if (SPI_connect()!=SPI_OK_CONNECT) ereport(ERROR,(errmsg("laplace_attested_series: SPI_connect")));
+    PgAttrRows rows={0};
+    compute_attested_rows(claims,n,idarr,0,0,&rows);
+    for (size_t i=0; i<rows.n; i++) {
+        const PgAttrRow *r=rows.v+i;
+        Datum v[9]={id_datum(&r->claim),id_datum(&r->trunk),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
+            Float8GetDatum(r->score),Int32GetDatum((int32)r->position),Float8GetDatum(r->trust),BoolGetDatum(r->witness!=0),
+            r->has_dependence ? id_datum(&r->dependence) : (Datum)0};
+        bool nl[9]={false,false,false,false,false,false,false,false,!r->has_dependence};
+        set_put(fcinfo,ts,td,v,nl);
+    }
+    lp_vec_free(&rows); SPI_finish(); PG_RETURN_NULL();
+}
+
 PG_FUNCTION_INFO_V1(laplace_attested);
 Datum laplace_attested(PG_FUNCTION_ARGS)
 {
@@ -1279,6 +1337,7 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
     PgAttrRows rows = {0};
     int include_files = PG_NARGS() > 1 && !PG_ARGISNULL(1) && PG_GETARG_BOOL(1);
     compute_attested_rows(claims, n, idarr, 0, include_files, &rows);
+    pg_rollup_sources(&rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
         Datum v[8] = {
@@ -1304,6 +1363,7 @@ Datum laplace_attribution(PG_FUNCTION_ARGS)
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attribution: SPI_connect")));
     PgAttrRows rows = {0};
     compute_attested_rows(claims, n, idarr, 1, 0, &rows);
+    pg_rollup_sources(&rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
         Datum v[7] = {
