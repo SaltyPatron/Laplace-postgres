@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
-project(LaplacePostgres VERSION 1.20.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.21.0 LANGUAGES C CXX ASM)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
 if(DEFINED ENV{LAPLACE_NATIVE} AND NOT "$ENV{LAPLACE_NATIVE}" STREQUAL "")
@@ -28,13 +28,13 @@ target_link_libraries(laplace_pg PRIVATE laplace_text laplace_static BLAKE3::bla
 if(WIN32)
   # PostgreSQL's Windows port headers come first, as in its own build; a module takes the server's symbols from the
   # import library postgres.lib, and exports only what PG_FUNCTION_INFO_V1 and PG_MODULE_MAGIC mark PGDLLEXPORT.
-  target_include_directories(laplace_pg PRIVATE ${PG_includedir_server}/port/win32_msvc ${PG_includedir_server}/port/win32
+  target_include_directories(laplace_pg SYSTEM PRIVATE ${PG_includedir_server}/port/win32_msvc ${PG_includedir_server}/port/win32
                                                 ${PG_includedir_server})
   target_compile_definitions(laplace_pg PRIVATE WIN32)
   target_compile_options(laplace_pg PRIVATE ${LP_C_FLAGS} -Wno-unused-function /clang:-fwrapv /clang:-fno-strict-aliasing)
   target_link_libraries(laplace_pg PRIVATE "${PG_libdir}/postgres.lib")
 else()
-  target_include_directories(laplace_pg PRIVATE ${PG_includedir_server})
+  target_include_directories(laplace_pg SYSTEM PRIVATE ${PG_includedir_server})
   target_compile_options(laplace_pg PRIVATE ${LP_C_FLAGS} -Wno-unused-function -fwrapv -fno-strict-aliasing)   # PostgreSQL requires wrapping arithmetic
   target_link_libraries(laplace_pg PRIVATE m)
   target_link_options(laplace_pg PRIVATE -Wl,--exclude-libs,ALL)
