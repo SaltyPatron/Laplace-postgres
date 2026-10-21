@@ -1052,7 +1052,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
  * Walks up the container index from claims to their trunks and witnesses in one native SPI operator. */
 #define PG_NONE ((size_t)-1)
 typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t in_next; } PgEdge;
-typedef struct { lp_id id; int nparents; size_t in_head; } PgWNode;
+typedef struct { lp_id id; int nparents; size_t in_head; uint8_t file; } PgWNode;
 typedef lp_vec(PgWNode) PgWNodes;
 typedef lp_vec(PgEdge)  PgEdges;
 typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
@@ -1065,7 +1065,7 @@ static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
     bool fresh = false;
     size_t i = lp_idmap_put(d->m, id, &fresh);
     if (fresh) {
-        PgWNode w = { *id, 0, PG_NONE };
+        PgWNode w = { *id, 0, PG_NONE, 0 };
         lp_push(&d->n, w);
     }
     if (fresh_out) *fresh_out = fresh ? 1 : 0;
@@ -1136,7 +1136,7 @@ static int by_attr_row(const void *a, const void *b)
     return memcmp(x->trunk.b, y->trunk.b, 16);
 }
 
-static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only, PgAttrRows *out)
+static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only, int include_files, PgAttrRows *out)
 {
     Oid idelm = get_element_type(idarr);
     PgDag d = { lp_idmap_new(), {0}, {0} };
@@ -1146,13 +1146,12 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         pg_dag_node(&d, &claims[i], NULL);
     }
     lp_vec(lp_vertex) vx = {0};
-    for (int lvl = 0; lp_idmap_count(front) && lvl < 64; lvl++) {
+    for (int lvl = 0; lp_idmap_count(front); lvl++) {
         int nb = (int)lp_idmap_count(front);
         Datum a[1] = { PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb)) }; Oid t[1] = { idarr };
         if (SPI_execute_with_args(
             "SELECT p.entity, p.path FROM physicality p "
-            "WHERE p.tier > (SELECT min(e.tier) FROM entity e WHERE e.id = ANY($1)) "
-            "  AND p.path && $1 ORDER BY p.entity", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
+            "WHERE p.path && $1 ORDER BY p.entity", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
         lp_idmap *next = lp_idmap_new();
         for (uint64 r = 0; r < SPI_processed; r++) {
@@ -1168,7 +1167,10 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
                 uint32_t sd = vx.v[k].said;
                 if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
                 if (lvl > 0 && sd == LP_SAID_METADATA) continue;
-                if (pi == PG_NONE) pi = pg_dag_node(&d, &pid, &fresh);
+                if (pi == PG_NONE) {
+                    pi = pg_dag_node(&d, &pid, &fresh);
+                    d.n.v[pi].file = vx.v[0].said == LP_SAID_METADATA;
+                }
                 size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
                 PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
                 if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD); }
@@ -1183,8 +1185,10 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
 
     lp_vec(size_t) rix = {0};
     lp_vec(lp_id)  rids = {0};
-    for (size_t i = (size_t)n; i < d.n.n; i++) if (d.n.v[i].nparents == 0) {
-        lp_push(&rix, i);
+    /* A registered source can itself be contained by another trunk. Its own
+     * assertion must not disappear merely because it is not a graph root.
+     * The input can also repeat IDs, so input length is not a DAG index. */
+    for (size_t i = 0; i < d.n.n; i++) {
         lp_push(&rids, d.n.v[i].id);
     }
     lp_idmap *wmap = lp_idmap_sized(sizeof(double));
@@ -1199,6 +1203,9 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
             bool wf; *(double *)lp_idmap_get(wmap, &wid, &wf) = tr;
         }
     }
+
+    for (size_t i = 0; i < d.n.n; i++)
+        if (d.n.v[i].nparents == 0 || (include_files && d.n.v[i].file) || lp_idmap_lookup(wmap, &d.n.v[i].id)) lp_push(&rix, i);
 
     for (size_t r = 0; r < rix.n; r++) {
         size_t top = rix.v[r];
@@ -1270,7 +1277,8 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attested: SPI_connect")));
     PgAttrRows rows = {0};
-    compute_attested_rows(claims, n, idarr, 0, &rows);
+    int include_files = PG_NARGS() > 1 && !PG_ARGISNULL(1) && PG_GETARG_BOOL(1);
+    compute_attested_rows(claims, n, idarr, 0, include_files, &rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
         Datum v[8] = {
@@ -1295,7 +1303,7 @@ Datum laplace_attribution(PG_FUNCTION_ARGS)
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attribution: SPI_connect")));
     PgAttrRows rows = {0};
-    compute_attested_rows(claims, n, idarr, 1, &rows);
+    compute_attested_rows(claims, n, idarr, 1, 0, &rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
         Datum v[7] = {

@@ -195,5 +195,34 @@ BEGIN
     RAISE EXCEPTION 'content admitted to consensus as a claim';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- Registered sources remain witnesses inside another trunk. Global tier
+-- metadata, duplicate inputs and deep packaging must not hide containment.
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
+        inner_source blake3 := (SELECT id FROM series_sources WHERE name = 'one');
+        outer_source blake3; deep_source blake3; found integer;
+BEGIN
+  INSERT INTO witness VALUES (inner_source,NULL,0.85);
+  outer_source := pg_temp.series_node(ARRAY[laplace_id('three'),inner_source], 'file', ARRAY[4294967296,0]::bigint[]);
+  INSERT INTO witness VALUES (outer_source,NULL,0.85);
+  UPDATE entity SET tier=1 WHERE id=outer_source;
+  UPDATE physicality SET tier=1 WHERE entity=outer_source;
+  SELECT count(*) INTO found FROM laplace_attested(ARRAY[a,a])
+    WHERE witness AND trunk IN (inner_source,outer_source) AND games=1000 AND score=1000;
+  IF found<>2 THEN RAISE EXCEPTION 'nested witness, duplicate input or global tier lost provenance'; END IF;
+  deep_source := outer_source;
+  FOR i IN 1..70 LOOP
+    deep_source := pg_temp.series_node(ARRAY[laplace_id('one'),deep_source], 'file', ARRAY[4294967296,0]::bigint[]);
+  END LOOP;
+  INSERT INTO witness VALUES (deep_source,NULL,0.85);
+  SELECT count(*) INTO found FROM laplace_attested(ARRAY[a])
+    WHERE witness AND trunk IN (inner_source,outer_source,deep_source) AND games=1000 AND score=1000;
+  IF found<>3 THEN RAISE EXCEPTION 'deep containment truncated a registered witness'; END IF;
+  SELECT count(*) INTO found FROM laplace_attested(ARRAY[a],true) evidence
+    JOIN physicality p ON p.entity=evidence.trunk
+    WHERE NOT evidence.witness AND evidence.games=1000
+      AND laplace_path_starts(p.path,laplace_compose(ARRAY[laplace_id('file'),laplace_id('one')]));
+  IF found<>1 THEN RAISE EXCEPTION 'file diagnostic omitted the containing file'; END IF;
+END $$;
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
