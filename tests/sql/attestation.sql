@@ -271,5 +271,56 @@ BEGIN
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
 SELECT 'dependence: source witness retained; stored and cumulative class-rooted series agree exactly';
+-- Claim semantics come from the carrier kind, never a triple-only shape.
+-- Exercise the same cumulative and persisted containment path at arities two
+-- and four, including a four-part claim stored as one RLE vertex.
+DO $$
+DECLARE binary_claim blake3; joint_claim blake3; repeated_claim blake3;
+        record_node blake3; source_node blake3; unasserted blake3; c blake3;
+        wanted record; actual consensus%ROWTYPE; first consensus%ROWTYPE; found integer;
+BEGIN
+  binary_claim := pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('noun')],'claim');
+  joint_claim := pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun'),laplace_id('two')],'claim');
+  repeated_claim := pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[4]),'claim');
+  IF NOT EXISTS (SELECT FROM physicality WHERE entity=repeated_claim
+                 AND laplace_path_length(path)=4 AND ST_NPoints(path)=1) THEN
+    RAISE EXCEPTION 'n-ary RLE fixture lost logical arity';
+  END IF;
+  record_node := pg_temp.series_node(ARRAY[binary_claim,joint_claim,repeated_claim],'record',
+                                     ARRAY[1073741824,1073741824,1073741824]::bigint[]);
+  source_node := pg_temp.series_node(ARRAY[laplace_id('source'),record_node],'file',
+                                     ARRAY[4294967296,5368709120]::bigint[]);
+  INSERT INTO witness VALUES (source_node,NULL,0.85);
+  CREATE UNLOGGED TABLE stage.attestation_arity_test (LIKE stage.attestation_test INCLUDING DEFAULTS);
+  INSERT INTO stage.attestation_arity_test
+    SELECT id,source_node,NULL,1,1,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
+  IF laplace_attest_series('stage.attestation_arity_test') <> 3 THEN
+    RAISE EXCEPTION 'binary or n-ary claim was not admitted';
+  END IF;
+  FOREACH c IN ARRAY ARRAY[binary_claim,joint_claim,repeated_claim] LOOP
+    SELECT * INTO first FROM consensus WHERE claim=c;
+    SELECT * INTO wanted FROM laplace_series(ARRAY[source_node],ARRAY[1]::bigint[],ARRAY[1]::float8[],ARRAY[0.85]::float8[]);
+    IF first.claim IS NULL OR ROW(float8send(first.rating),float8send(first.deviation),float8send(first.volatility),first.matches)
+       IS DISTINCT FROM ROW(float8send(wanted.rating),float8send(wanted.deviation),float8send(wanted.volatility),wanted.matches) THEN
+      RAISE EXCEPTION 'n-ary cumulative standing differs from Native';
+    END IF;
+    SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
+      WHERE witness AND trunk=source_node AND games=1 AND score=1 AND trust=0.85;
+    IF found<>1 THEN RAISE EXCEPTION 'n-ary claim lost its source containment'; END IF;
+    PERFORM laplace_attest_series('stage.attestation_arity_test',ARRAY[c]);
+    SELECT * INTO actual FROM consensus WHERE claim=c;
+    IF actual IS DISTINCT FROM first THEN RAISE EXCEPTION 'n-ary cumulative replay added a game'; END IF;
+    DELETE FROM stage.attestation_arity_test WHERE claim=c;
+    PERFORM laplace_attest_series('stage.attestation_arity_test',ARRAY[c]);
+    SELECT * INTO actual FROM consensus WHERE claim=c;
+    IF actual IS DISTINCT FROM first THEN RAISE EXCEPTION 'n-ary stored containment disagrees with cumulative input'; END IF;
+  END LOOP;
+  unasserted := pg_temp.series_node(ARRAY[laplace_id('noun'),laplace_id('two'),laplace_id('is'),laplace_id('dog')],'tuple');
+  INSERT INTO stage.attestation_arity_test VALUES (unasserted,source_node,NULL,1,1,0.85);
+  BEGIN
+    PERFORM laplace_attest_series('stage.attestation_arity_test');
+    RAISE EXCEPTION 'a non-claim n-ary tuple acquired a standing';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
