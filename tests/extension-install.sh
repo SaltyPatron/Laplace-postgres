@@ -3,6 +3,7 @@
 # newly created test database. Shared extension files and application DBs stay untouched.
 set -euo pipefail
 build=${1:?usage: extension-install.sh /path/to/cmake-build}
+source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${LAPLACE_PG_DIR:?PostgreSQL installation required}"
 : "${LAPLACE_CONNINFO:?declared PostgreSQL connection required}"
 : "${LAPLACE_WORK:?declared scratch volume required}"
@@ -39,7 +40,7 @@ mv "$stage/control" "$share/extension/laplace.control"
 "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
 created=1
 connection=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$db/")
-"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" <<'SQL'
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" <<'SQL'
 SELECT set_config('extension_control_path', :'candidate_share' || ':$system', false);
 CREATE EXTENSION postgis;
 CREATE EXTENSION laplace;
@@ -85,5 +86,8 @@ DO $$ DECLARE selected regclass; BEGIN
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
 END $$;
 RESET SESSION AUTHORIZATION;
+-- Run the real KNN and shared-namespace cold-install cases with this session's
+-- candidate package path, rather than accidentally loading an installed copy.
+\i :gist4d_cases
 SQL
 printf 'PASS candidate extension installed and executed in isolated database %s\n' "$db"
