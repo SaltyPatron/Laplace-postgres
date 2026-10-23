@@ -318,10 +318,13 @@ Datum laplace_centroid4d_final(PG_FUNCTION_ARGS){
 }
 
 /* ---------------------------------------------------------------- the tier-0 perf-cache: coordinates computed in place */
-/* The coordinate of a text taken as one composition of its codepoints: the exact centroid of their tier-0 points. */
+/* Identity, coordinate and Hilbert placement belong to the same UAX #29 trunk.
+ * Flattening codepoints here changes the weights of words and sentences. */
 static bool text_coord(text *t, lp_coord *out){
-    bool ok; lp_ref r = lp_ref_codepoints(tier0(), (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &ok);
-    *out = r.c; return ok;
+    const char *bytes=VARDATA_ANY(t); int length=VARSIZE_ANY_EXHDR(t);
+    if (!length || !pg_verify_mbstr(PG_UTF8,bytes,length,true)) return false;
+    lp_ref trunk=lp_text_decompose(text_context(),(const uint8_t *)bytes,(size_t)length,NULL,NULL);
+    *out=trunk.c; return true;
 }
 
 PG_FUNCTION_INFO_V1(laplace_text_coord_ewkb);
