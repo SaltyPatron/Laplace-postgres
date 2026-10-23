@@ -18,6 +18,17 @@ BEGIN
       RAISE EXCEPTION 'SQL text identity differs from Engine for %', r.content;
     END IF;
   END LOOP;
+  -- The phrase's coordinate weights its actual three word segments equally,
+  -- as Native composition does; a flat codepoint centroid gives another point.
+  IF laplace_text_coord_ewkb('United States') IS DISTINCT FROM (
+      SELECT laplace_centroid4d_ewkb(point) FROM unnest(ARRAY[
+          laplace_text_coord('United'), laplace_text_coord(' '),
+          laplace_text_coord('States')]) AS segment(point)) THEN
+    RAISE EXCEPTION 'text coordinate flattened the canonical Native tree';
+  END IF;
+  IF laplace_text_coord_ewkb('') IS NOT NULL OR laplace_text_coord_ewkb(NULL) IS NOT NULL THEN
+    RAISE EXCEPTION 'empty-content coordinate semantics failed';
+  END IF;
   IF laplace_text_id(U&'A\030A') <> laplace_compose(ARRAY[laplace_cp_id(65),laplace_cp_id(778)])
      OR laplace_text_id(U&'A\030A') = laplace_text_id(U&'\00C5')
      OR laplace_text_id(U&'\+01F44D\+01F3FD') <> laplace_compose(ARRAY[laplace_cp_id(128077),laplace_cp_id(127997)])
