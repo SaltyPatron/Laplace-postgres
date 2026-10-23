@@ -1,6 +1,14 @@
 -- Exact native 4D KNN; PostGIS's public 2D <-> keeps its own semantics.
 \echo Use "ALTER EXTENSION laplace UPDATE TO '1.16'" to load this file. \quit
-CREATE SCHEMA IF NOT EXISTS laplace;
+-- The monorepo already uses this namespace. CREATE ... IF NOT EXISTS inside
+-- an extension script cannot skip an object owned outside that extension.
+-- Reuse it without taking ownership or changing its owner/ACLs.
+DO $$
+BEGIN
+  IF to_regnamespace('laplace') IS NULL THEN
+    CREATE SCHEMA laplace;
+  END IF;
+END $$;
 CREATE OPERATOR laplace.<-> (LEFTARG = geometry, RIGHTARG = geometry,
   FUNCTION = laplace_frechet4d, COMMUTATOR = OPERATOR(laplace.<->));
 COMMENT ON OPERATOR laplace.<-> (geometry, geometry) IS
