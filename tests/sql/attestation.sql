@@ -60,6 +60,45 @@ BEGIN
 END $$;
 INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
   FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'one';
+-- Private computation shares the real Native solver without publishing an
+-- unregistered source or retaining a consensus bucket lock during streaming.
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
+        b blake3 := (SELECT id FROM series_claims WHERE name = 'b');
+        snapshot record; expected record; before_rows text; after_rows text;
+        before_locks bigint; after_locks bigint;
+BEGIN
+  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO before_rows FROM consensus c;
+  SELECT count(*) INTO before_locks FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory';
+  SELECT * INTO snapshot FROM laplace_series_snapshot('stage.attestation_test', ARRAY[a, a]);
+  SELECT s.* INTO expected FROM stage.attestation_test p,
+    LATERAL laplace_series(ARRAY[p.witness], ARRAY[p.games], ARRAY[p.score], ARRAY[p.trust]) s;
+  IF (snapshot.rating, snapshot.deviation, snapshot.volatility, snapshot.matches) IS DISTINCT FROM
+     (expected.rating, expected.deviation, expected.volatility, expected.matches) THEN
+    RAISE EXCEPTION 'private snapshot differs from Native standing';
+  END IF;
+  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO after_rows FROM consensus c;
+  SELECT count(*) INTO after_locks FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory';
+  IF before_rows <> after_rows OR before_locks <> after_locks THEN
+    RAISE EXCEPTION 'private snapshot changed public state or acquired a consensus lock';
+  END IF;
+  IF (SELECT count(*) FROM laplace_series_snapshot('stage.attestation_test', ARRAY[a, a])) <> 1
+     OR EXISTS (SELECT FROM laplace_series_snapshot('stage.attestation_test', ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'snapshot duplicate/empty selection changed';
+  END IF;
+  SELECT * INTO snapshot FROM laplace_series_snapshot('stage.attestation_test', ARRAY[b]);
+  IF snapshot.claim IS DISTINCT FROM b OR snapshot.rating IS NOT NULL OR snapshot.matches IS NOT NULL THEN
+    RAISE EXCEPTION 'snapshot did not preserve an evidence-free removal candidate';
+  END IF;
+  BEGIN
+    PERFORM laplace_series_snapshot('public.consensus');
+    RAISE EXCEPTION 'snapshot accepted a public pending table';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_series_snapshot('stage.attestation_test', ARRAY[laplace_id('dog')]);
+    RAISE EXCEPTION 'snapshot accepted a non-claim';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); first consensus%ROWTYPE; expected record; result record;
 BEGIN
