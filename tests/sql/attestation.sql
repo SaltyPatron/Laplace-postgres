@@ -77,6 +77,22 @@ BEGIN
      EXCEPT ALL
      SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_contained_series(trunks))
   ) THEN RAISE EXCEPTION 'downward series differs from upward Native containment'; END IF;
+  IF EXISTS (
+    (SELECT * FROM laplace_contained_series(trunks,ARRAY[claims[1],claims[1]])
+     EXCEPT ALL
+     SELECT * FROM laplace_contained_series(trunks) WHERE claim=claims[1])
+    UNION ALL
+    (SELECT * FROM laplace_contained_series(trunks) WHERE claim=claims[1]
+     EXCEPT ALL
+     SELECT * FROM laplace_contained_series(trunks,ARRAY[claims[1],claims[1]]))
+  ) OR (SELECT count(*) FROM laplace_contained_series(trunks,ARRAY[claims[1]]))<>3 THEN
+    RAISE EXCEPTION 'selected downward series changed testimony or returned unrelated claims';
+  END IF;
+  IF EXISTS(SELECT FROM laplace_contained_series(trunks,ARRAY[]::blake3[]))
+     OR EXISTS(SELECT FROM laplace_contained_series(ARRAY[]::blake3[],claims))
+     OR EXISTS(SELECT FROM laplace_contained_series(trunks,ARRAY[laplace_id('dog')])) THEN
+    RAISE EXCEPTION 'empty or unattested claim selection returned testimony';
+  END IF;
   IF (SELECT count(*) FROM laplace_contained_series(ARRAY[trunks[1],trunks[1]]))<>2
      OR EXISTS(SELECT FROM laplace_contained_series(ARRAY[]::blake3[])) THEN
     RAISE EXCEPTION 'duplicate or empty trunk selection changed Native series';
@@ -85,6 +101,27 @@ BEGIN
     PERFORM laplace_contained_series(ARRAY['00000000000000000000000000000000'::blake3]);
     RAISE EXCEPTION 'absent stored root accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_contained_series(ARRAY['00000000000000000000000000000000'::blake3],claims);
+    RAISE EXCEPTION 'selected series accepted an absent stored root';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
+-- An unpublished source may already have committed structural containers.
+-- Those containers are not independent historical witnesses for its pending
+-- observations, however deep their packaging becomes.
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        orphan blake3; before_row record; after_row record;
+BEGIN
+  SELECT * INTO before_row FROM laplace_series_snapshot('stage.attestation_test',ARRAY[a]);
+  orphan := pg_temp.series_node(ARRAY[a,laplace_id('file')],'record',ARRAY[1073741824,0]::bigint[]);
+  FOR i IN 1..80 LOOP
+    orphan := pg_temp.series_node(ARRAY[laplace_id('file'),orphan],'file',ARRAY[4294967296,0]::bigint[]);
+  END LOOP;
+  SELECT * INTO after_row FROM laplace_series_snapshot('stage.attestation_test',ARRAY[a]);
+  IF before_row IS DISTINCT FROM after_row THEN
+    RAISE EXCEPTION 'unpublished source containers changed historical evidence';
+  END IF;
 END $$;
 -- Private computation shares the real Native solver without publishing an
 -- unregistered source or retaining a consensus bucket lock during streaming.
@@ -286,6 +323,12 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[inner_source,outer_source,deep_source])
     WHERE claim=a AND games=1000 AND score=1000;
   IF found<>3 THEN RAISE EXCEPTION 'downward traversal lost nested roots or relied on global tier'; END IF;
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[inner_source,outer_source,deep_source],ARRAY[a])
+    WHERE games=1000 AND score=1000;
+  IF found<>3 THEN RAISE EXCEPTION 'selected series lost nested registered witnesses'; END IF;
+  IF EXISTS(SELECT FROM laplace_contained_series(ARRAY[deep_source],ARRAY[laplace_id('dog')])) THEN
+    RAISE EXCEPTION 'reverse selection admitted ordinary content as a claim';
+  END IF;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a],true) evidence
     JOIN physicality p ON p.entity=evidence.trunk
     WHERE NOT evidence.witness AND evidence.games=1000
@@ -317,6 +360,9 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[first_source,second_source])
     WHERE claim=c AND dependence_root=cls AND dependence_trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'downward calculation lost its dependence root or trust'; END IF;
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[first_source,second_source],ARRAY[c])
+    WHERE dependence_root=cls AND dependence_trust=0.70 AND games=1 AND score=1;
+  IF found<>2 THEN RAISE EXCEPTION 'selected calculation lost its dependence root or trust'; END IF;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[c])
     WHERE witness AND trunk=first_source AND games=2 AND score=2 AND trust=0.85;
   IF found<>1 THEN RAISE EXCEPTION 'source provenance created extra calculation witnesses'; END IF;
@@ -396,24 +442,6 @@ BEGIN
     RAISE EXCEPTION 'a non-claim n-ary tuple acquired a standing';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
--- Registered-series selection retains signed trust and the original evidence.
-SAVEPOINT registered_signed_series;
-UPDATE public.witness SET trust=-abs(trust);
-DO $$
-DECLARE selected blake3[] := ARRAY(SELECT id FROM series_claims ORDER BY name);
-BEGIN
-  IF NOT EXISTS (SELECT FROM laplace_attested_series(selected,true)) OR EXISTS (
-    (SELECT * FROM laplace_attested_series(selected,true)
-     EXCEPT ALL SELECT * FROM laplace_attested_series(selected) WHERE witness)
-    UNION ALL
-    (SELECT * FROM laplace_attested_series(selected) WHERE witness
-     EXCEPT ALL SELECT * FROM laplace_attested_series(selected,true))) THEN
-    RAISE EXCEPTION 'registered series filter changed signed witness evidence';
-  END IF;
-END $$;
-ROLLBACK TO registered_signed_series;
-RELEASE registered_signed_series;
-
 -- More than one cursor fetch must preserve every registered contribution.
 -- These canonical RLE containers have no witness, so they cannot alter shares.
 CREATE TEMP TABLE cursor_expected AS

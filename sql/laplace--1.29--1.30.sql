@@ -1,12 +1,16 @@
 \echo Use "ALTER EXTENSION laplace UPDATE TO '1.30'" to load this file. \quit
 
--- Snapshot publication already selects registered witnesses. Apply that
--- selection before tallying every unregistered container, retaining signed trust.
-CREATE FUNCTION laplace_attested_series(claims blake3[], registered_only boolean,
-  OUT claim blake3, OUT trunk blake3, OUT games double precision, OUT tokens double precision, OUT score double precision,
-  OUT "position" integer, OUT trust double precision, OUT witness boolean, OUT dependence_root blake3) RETURNS SETOF record
-  AS 'MODULE_PATHNAME', 'laplace_attested_series' LANGUAGE C STABLE STRICT PARALLEL SAFE ROWS 256
-  SET search_path = public, pg_temp;
+-- Historical testimony belongs to registered corpus witnesses. Starting at
+-- these roots avoids walking unpublished source containers during each batch.
+-- Claim selection bounds the root-side search before using the shared upward
+-- kernel for sparse selections in large estates. Both directions retain the
+-- same Native run/outcome/dependence tallies and requested source identities.
+CREATE FUNCTION laplace_contained_series(trunks blake3[], claims blake3[],
+  OUT trunk blake3, OUT claim blake3, OUT games double precision, OUT tokens double precision,
+  OUT score double precision, OUT "position" integer, OUT dependence_root blake3,
+  OUT dependence_trust double precision) RETURNS SETOF record
+  AS 'MODULE_PATHNAME', 'laplace_contained_series'
+  LANGUAGE C STABLE STRICT PARALLEL SAFE SET search_path = public, pg_temp ROWS 256;
 
 CREATE OR REPLACE FUNCTION laplace_series_snapshot(pending regclass, changed blake3[] DEFAULT NULL,
   OUT claim blake3, OUT rating double precision, OUT deviation double precision,
@@ -43,9 +47,10 @@ BEGIN
     p AS MATERIALIZED (SELECT * FROM %1$s WHERE claim = ANY($1)),
     observed AS MATERIALIZED (
       SELECT a.claim, a.trunk AS witness, coalesce(a.dependence_root, w.lineage) AS lineage, a.games::bigint AS games,
-             a.score / a.games AS score, a.trust
-      FROM laplace_attested_series($1,true) a JOIN public.witness w ON w.id = a.trunk
-      WHERE a.witness AND a.games > 0
+             a.score / a.games AS score, coalesce(a.dependence_trust, w.trust) AS trust
+      FROM laplace_contained_series(ARRAY(SELECT id FROM public.witness ORDER BY id), $1) a
+      JOIN public.witness w ON w.id = a.trunk
+      WHERE a.games > 0
         AND NOT EXISTS (SELECT FROM p WHERE p.claim = a.claim AND p.witness = a.trunk)
       UNION ALL
       SELECT p.claim, p.witness, p.lineage, p.games, p.score, p.trust FROM p
