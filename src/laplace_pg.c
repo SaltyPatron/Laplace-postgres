@@ -21,6 +21,7 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "nodes/makefuncs.h"
+#include "nodes/params.h"
 #include "parser/parse_func.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -1157,12 +1158,23 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     }
     lp_vec(lp_vertex) vx = {0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
+    /* A custom plan copies the complete frontier into every partition's
+     * scan. Serializing that plan for parallel workers can exceed 1 GiB.
+     * Keep one parameter without PARAM_FLAG_CONST: the planner can estimate
+     * its actual search keys without embedding its value in every scan. */
+    SPIPlanPtr upward = SPI_prepare_cursor(
+        "SELECT p.entity, p.path FROM physicality p "
+        "WHERE p.path && $1 ORDER BY p.entity", 1, &idarr,
+        CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_PARALLEL_OK);
+    if (!upward) ereport(ERROR, (errmsg("laplace_attested: upward plan failed")));
+    ParamListInfo frontier_params = makeParamList(1);
+    frontier_params->params[0].ptype = idarr;
+    frontier_params->params[0].isnull = false;
+    frontier_params->params[0].pflags = 0;
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         int nb = (int)lp_idmap_count(front);
-        Datum a[1] = { PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb)) }; Oid t[1] = { idarr };
-        if (SPI_execute_with_args(
-            "SELECT p.entity, p.path FROM physicality p "
-            "WHERE p.path && $1 ORDER BY p.entity", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
+        frontier_params->params[0].value = PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb));
+        if (SPI_execute_plan_with_paramlist(upward, frontier_params, true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
         lp_idmap *next = lp_idmap_new();
         for (uint64 r = 0; r < SPI_processed; r++) {
@@ -1203,6 +1215,8 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         lp_idmap_free(front);
         front = next;
     }
+    SPI_freeplan(upward);
+    pfree(frontier_params);
     lp_idmap_free(front);
     lp_vec_free(&vx);
     lp_idmap_free(classes);

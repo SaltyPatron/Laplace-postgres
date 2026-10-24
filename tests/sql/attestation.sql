@@ -322,5 +322,34 @@ BEGIN
     RAISE EXCEPTION 'a non-claim n-ary tuple acquired a standing';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- A large frontier must remain a parameter while a parallel worker plan is
+-- serialized. Expanding these IDs into all 256 partition scans exceeds 1 GiB.
+CREATE TEMP TABLE frontier_expected AS
+SELECT * FROM laplace_attribution(ARRAY[laplace_compose(ARRAY[laplace_id('dog'),laplace_id('noun')])]);
+CREATE TEMP TABLE frontier_actual (LIKE frontier_expected);
+DO $$ BEGIN
+  IF (SELECT sum(share_bp) FROM frontier_expected) IS DISTINCT FROM 10000 THEN
+    RAISE EXCEPTION 'large-frontier fixture has no complete witness attribution';
+  END IF;
+END $$;
+SET LOCAL debug_parallel_query = on;
+SET LOCAL max_parallel_workers_per_gather = 1;
+SET LOCAL statement_timeout = '60s';
+-- The real fold is an INSERT. Keep the outer command nonparallel so the
+-- containment query itself, rather than the entire function, runs in workers.
+INSERT INTO frontier_actual
+SELECT * FROM laplace_attribution(
+  ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(1,120000) i)
+  || ARRAY[laplace_compose(ARRAY[laplace_id('dog'),laplace_id('noun')])]);
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT FROM (
+      (TABLE frontier_actual EXCEPT ALL TABLE frontier_expected)
+      UNION ALL
+      (TABLE frontier_expected EXCEPT ALL TABLE frontier_actual)
+    ) differences
+  ) THEN RAISE EXCEPTION 'large frontier changed witness attribution'; END IF;
+END $$;
+SELECT 'attestation: large frontier preserves exact witness attribution';
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
