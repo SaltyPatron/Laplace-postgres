@@ -18,9 +18,10 @@ static inline Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, 
 
 static inline ArrayType *id_array_of(Oid el, const lp_id *ids, int n){
     Datum *d = palloc(sizeof(Datum) * (n ? n : 1));
-    for (int i = 0; i < n; i++) d[i] = id_datum(&ids[i]);
+    /* construct_array copies each fixed-width ID before returning. Borrow the
+     * caller's immutable input instead of allocating and freeing every ID. */
+    for (int i = 0; i < n; i++) d[i] = PointerGetDatum(ids + i);
     ArrayType *array = construct_array(d, n, el, 16, false, TYPALIGN_CHAR);
-    for (int i = 0; i < n; i++) pfree(DatumGetPointer(d[i]));
     pfree(d);
     return array;
 }
