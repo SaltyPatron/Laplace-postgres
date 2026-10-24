@@ -758,6 +758,41 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
  * Only Const/external Param arguments are query-stable; row-varying arrays
  * must be rebuilt. PostgreSQL owns the cache and its complete lifetime. */
 typedef struct { lp_id *ids; size_t count; ArrayType *array; } PathQuery;
+typedef struct PathScanQuery {
+    struct PathScanQuery *next;
+    MemoryContext context;
+    int parameter;
+    Oid type;
+    PathQuery *query;
+    MemoryContextCallback cleanup;
+} PathScanQuery;
+static PathScanQuery *path_scan_queries;
+static void path_scan_query_reset(void *argument){
+    PathScanQuery *query = argument;
+    PathScanQuery **at = &path_scan_queries;
+    while (*at && *at != query) at = &(*at)->next;
+    if (*at) *at = query->next;
+}
+static PathScanQuery *path_scan_query(FunctionCallInfo fcinfo){
+    Node *expr = fcinfo->flinfo->fn_expr;
+    List *args;
+    if (IsA(expr, OpExpr)) args = ((OpExpr *)expr)->args;
+    else if (IsA(expr, FuncExpr)) args = ((FuncExpr *)expr)->args;
+    else return NULL;
+    if (!IsA(linitial(args), Var) || !IsA(lsecond(args), Param)) return NULL;
+    Param *parameter = lsecond(args);
+    if (parameter->paramkind != PARAM_EXTERN) return NULL;
+    MemoryContext context = fcinfo->flinfo->fn_mcxt;
+    for (PathScanQuery *query = path_scan_queries; query; query = query->next)
+        if (query->context == context && query->parameter == parameter->paramid && query->type == parameter->paramtype)
+            return query;
+    PathScanQuery *query = MemoryContextAllocZero(context, sizeof *query);
+    query->context = context; query->parameter = parameter->paramid; query->type = parameter->paramtype;
+    query->cleanup.func = path_scan_query_reset; query->cleanup.arg = query;
+    MemoryContextRegisterResetCallback(context, &query->cleanup);
+    query->next = path_scan_queries; path_scan_queries = query;
+    return query;
+}
 static bool path_query_scan(FunctionCallInfo fcinfo){
     Node *expr = fcinfo->flinfo->fn_expr;
     List *args;
@@ -773,6 +808,11 @@ static bool path_has(FunctionCallInfo fcinfo, bool all){
     bool stable = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
     bool scan_stable = stable && path_query_scan(fcinfo);
     PathQuery *query = stable ? fcinfo->flinfo->fn_extra : NULL;
+    /* Partition scans share one external parameter and executor context.
+     * Prepare its IDs once per executor, rather than retaining a separate
+     * complete copy for every partition's expression. */
+    PathScanQuery *shared = !query && scan_stable ? path_scan_query(fcinfo) : NULL;
+    if (shared) query = shared->query;
     ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
     /* PL/pgSQL can retain FmgrInfo across executions with new parameters.
      * Compare the original array, not its sorted/deduplicated projection. */
@@ -790,8 +830,9 @@ static bool path_has(FunctionCallInfo fcinfo, bool all){
         else { pfree(query->ids); pfree(query->array); }
         *query = (PathQuery){ .ids=ids,.count=distinct,.array=copy };
         MemoryContextSwitchTo(previous);
-        if (stable) fcinfo->flinfo->fn_extra = query;
     }
+    if (stable) fcinfo->flinfo->fn_extra = query;
+    if (shared) shared->query = query;
     PG_FREE_IF_COPY(array, 1);
     bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0));
     int count; lp_id *keys = path_keys(ewkb, &count);
