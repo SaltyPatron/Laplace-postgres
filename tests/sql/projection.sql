@@ -105,5 +105,56 @@ DO $$ DECLARE missing blake3:=laplace_id('unrecorded projection child'); parent 
     RAISE EXCEPTION 'duplicate child bindings accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+CREATE TEMP TABLE projection_floor AS
+SELECT laplace_cp_id(cp) AS id,laplace_coord(chr(cp)) AS coord,laplace_hilbert(chr(cp)) AS hilbert
+FROM unnest(ARRAY[100,55295,57344,1114111]) cp;
+INSERT INTO public.entity(id,tier,coord,hilbert)
+SELECT id,0,ST_MakePoint(0,0,0,0),0 FROM projection_floor;
+INSERT INTO public.physicality(entity,tier,hilbert,path)
+SELECT id,0,0,laplace_path(ARRAY[id]) FROM projection_floor;
+CREATE TEMP TABLE projection_floor_before AS SELECT
+  (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM public.entity e) AS entities,
+  (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) AS paths;
+DO $$ DECLARE changes record; BEGIN
+  SELECT * INTO changes FROM laplace_recoordinate();
+  IF changes.entity_rows<>4 OR changes.physicality_rows<>4 THEN
+    RAISE EXCEPTION 'stored canonical atoms were not projected from the floor: %',changes;
+  END IF;
+  IF (SELECT entities FROM projection_floor_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM public.entity e)
+     OR (SELECT paths FROM projection_floor_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) THEN
+    RAISE EXCEPTION 'stored-atom audit changed public rows';
+  END IF;
+  SELECT * INTO changes FROM laplace_recoordinate(true);
+  IF changes.entity_rows<>4 OR changes.physicality_rows<>4 THEN RAISE EXCEPTION 'stored-atom apply count differs from audit'; END IF;
+  IF EXISTS (SELECT FROM projection_floor f JOIN public.entity e USING(id)
+      JOIN public.physicality p ON p.entity=f.id WHERE e.tier<>0 OR p.tier<>0
+        OR ST_AsEWKB(e.coord)<>ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert OR p.hilbert<>f.hilbert
+        OR ST_AsEWKB(p.path)<>ST_AsEWKB(laplace_path(ARRAY[f.id]))) THEN
+    RAISE EXCEPTION 'stored-atom repair changed content or missed canonical projection';
+  END IF;
+  SELECT * INTO changes FROM laplace_recoordinate();
+  IF changes.entity_rows<>0 OR changes.physicality_rows<>0 THEN RAISE EXCEPTION 'stored-atom repair is not idempotent'; END IF;
+END $$;
+DO $$ DECLARE invalid blake3:=laplace_cp_id(55296); BEGIN
+  BEGIN
+    INSERT INTO public.entity(id,tier,coord,hilbert) VALUES(invalid,0,ST_MakePoint(0,0,0,0),0);
+    INSERT INTO public.physicality(entity,tier,hilbert,path) VALUES(invalid,0,0,laplace_path(ARRAY[invalid]));
+    PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'unknown surrogate atom accepted';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN
+    UPDATE public.physicality SET path=laplace_path(ARRAY[entity,entity]) WHERE tier=0;
+    PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'run-compressed composition accepted as an atom';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  BEGIN
+    UPDATE public.physicality SET path=laplace_path(ARRAY[laplace_cp_id(120)]) WHERE tier=0;
+    PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'another scalar accepted as an atomic self-path';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  IF EXISTS (SELECT FROM projection_floor f JOIN public.entity e USING(id)
+      JOIN public.physicality p ON p.entity=f.id WHERE ST_AsEWKB(e.coord)<>ST_AsEWKB(f.coord)
+        OR e.hilbert<>f.hilbert OR p.hilbert<>f.hilbert OR ST_AsEWKB(p.path)<>ST_AsEWKB(laplace_path(ARRAY[f.id]))) THEN
+    RAISE EXCEPTION 'invalid-atom rejection did not roll back completely';
+  END IF;
+END $$;
 ROLLBACK;
 SELECT 'projection: Native run-weighted identity, canonical floor, audit, atomic repair, preservation and rollback passed';
+SELECT 'projection floor: stored canonical atoms repaired; unknown and non-atomic leaves rejected';

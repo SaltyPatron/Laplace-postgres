@@ -1,2 +1,3 @@
 \set ECHO none
 projection: Native run-weighted identity, canonical floor, audit, atomic repair, preservation and rollback passed
+projection floor: stored canonical atoms repaired; unknown and non-atomic leaves rejected
