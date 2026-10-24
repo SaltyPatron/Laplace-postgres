@@ -269,7 +269,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
                     }
                 }
                 if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
-                }
+            }
             SPI_freetuptable(SPI_tuptable);
             pfree(window);
         }

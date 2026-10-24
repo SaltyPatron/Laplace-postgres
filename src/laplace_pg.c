@@ -768,12 +768,15 @@ static bool path_has(FunctionCallInfo fcinfo, bool all){
         || memcmp(array, query->array, VARSIZE(array))) {
         MemoryContext previous = CurrentMemoryContext;
         if (stable) MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+        int count;
+        lp_id *ids = ids_of(array, &count);
+        size_t distinct = lp_ids_unique(ids, (size_t)count);
+        ArrayType *copy = stable ? DatumGetArrayTypePCopy(PointerGetDatum(array)) : NULL;
+        /* Publish only a complete validated replacement: a caught null-ID
+         * error must leave an expression's previous cached set usable. */
         if (!query) query = palloc0(sizeof *query);
         else { pfree(query->ids); pfree(query->array); }
-        int count;
-        query->ids = ids_of(array, &count);
-        query->count = lp_ids_unique(query->ids, (size_t)count);
-        if (stable) query->array = DatumGetArrayTypePCopy(PointerGetDatum(array));
+        *query = (PathQuery){ .ids=ids,.count=distinct,.array=copy };
         MemoryContextSwitchTo(previous);
         if (stable) fcinfo->flinfo->fn_extra = query;
     }
