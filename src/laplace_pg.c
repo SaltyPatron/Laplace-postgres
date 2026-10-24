@@ -753,23 +753,50 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
 }
 
-/* The operators themselves, for plans that do not use the index. */
-static bool path_has(Datum path, ArrayType *q, bool all){
-    bytea *ewkb = path_ewkb(path); int n, k; lp_id *keys = path_keys(ewkb, &n), *ids = ids_of(q, &k);
-    for (int i = 0; i < k; i++) {
-        bool found = bsearch(&ids[i], keys, (size_t)n, sizeof(lp_id), lp_id_cmp) != NULL;
-        if (found != all) return !all;
+/* A scan can test millions of short paths against one large frontier. Build
+ * its canonical Native ID set once, then search it for each path vertex.
+ * Only Const/external Param arguments are query-stable; row-varying arrays
+ * must be rebuilt. PostgreSQL owns the cache and its complete lifetime. */
+typedef struct { lp_id *ids; size_t count; } PathQuery;
+static bool path_has(FunctionCallInfo fcinfo, bool all){
+    bool stable = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
+    PathQuery *query = stable ? fcinfo->flinfo->fn_extra : NULL;
+    if (!query) {
+        ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
+        MemoryContext previous = CurrentMemoryContext;
+        if (stable) MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+        query = palloc(sizeof *query);
+        int count;
+        query->ids = ids_of(array, &count);
+        query->count = lp_ids_unique(query->ids, (size_t)count);
+        MemoryContextSwitchTo(previous);
+        PG_FREE_IF_COPY(array, 1);
+        if (stable) fcinfo->flinfo->fn_extra = query;
     }
-    return all;
+    bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0));
+    int count; lp_id *keys = path_keys(ewkb, &count);
+    size_t matched = 0;
+    if (!all || query->count <= (size_t)count) {
+        for (int i = 0; i < count; i++) {
+            if (bsearch(keys + i, query->ids, query->count, sizeof(lp_id), lp_id_cmp)) {
+                matched++;
+                if (!all) break;
+            }
+        }
+    }
+    bool result = all ? matched == query->count : matched != 0;
+    pfree(keys); pfree(ewkb);
+    if (!stable) { pfree(query->ids); pfree(query); }
+    return result;
 }
 PG_FUNCTION_INFO_V1(laplace_path_starts);
 Datum laplace_path_starts(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.first, (const lp_id *)PG_GETARG_POINTER(1))); }
 PG_FUNCTION_INFO_V1(laplace_path_ends);
 Datum laplace_path_ends(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.last, (const lp_id *)PG_GETARG_POINTER(1))); }
 PG_FUNCTION_INFO_V1(laplace_path_contains);
-Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
+Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(fcinfo, true)); }
 PG_FUNCTION_INFO_V1(laplace_path_overlaps);
-Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
+Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(fcinfo, false)); }
 
 /* How many times a path holds each of the given IDs, runs included: one pass over the path, a binary search per vertex.
  * Returns only the IDs it holds. */
