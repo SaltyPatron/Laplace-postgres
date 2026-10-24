@@ -1,4 +1,5 @@
 \set ECHO none
 t
 dependence: source witness retained; stored and cumulative class-rooted series agree exactly
+attestation: large frontier preserves exact witness attribution
 attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed
