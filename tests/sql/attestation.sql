@@ -60,6 +60,32 @@ BEGIN
 END $$;
 INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
   FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'one';
+DO $$
+DECLARE trunks blake3[] := ARRAY(SELECT id FROM series_sources ORDER BY id);
+        claims blake3[] := ARRAY(SELECT id FROM series_claims ORDER BY id); found integer;
+BEGIN
+  SELECT count(*) INTO found FROM laplace_contained_series(trunks);
+  IF found<>6 THEN RAISE EXCEPTION 'downward Native series lost a source or claim'; END IF;
+  IF EXISTS (
+    (SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_contained_series(trunks)
+     EXCEPT ALL
+     SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_attested_series(claims)
+     WHERE trunk=ANY(trunks))
+    UNION ALL
+    (SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_attested_series(claims)
+     WHERE trunk=ANY(trunks)
+     EXCEPT ALL
+     SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_contained_series(trunks))
+  ) THEN RAISE EXCEPTION 'downward series differs from upward Native containment'; END IF;
+  IF (SELECT count(*) FROM laplace_contained_series(ARRAY[trunks[1],trunks[1]]))<>2
+     OR EXISTS(SELECT FROM laplace_contained_series(ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'duplicate or empty trunk selection changed Native series';
+  END IF;
+  BEGIN
+    PERFORM laplace_contained_series(ARRAY['00000000000000000000000000000000'::blake3]);
+    RAISE EXCEPTION 'absent stored root accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 -- Private computation shares the real Native solver without publishing an
 -- unregistered source or retaining a consensus bucket lock during streaming.
 DO $$
@@ -257,6 +283,9 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a])
     WHERE witness AND trunk IN (inner_source,outer_source,deep_source) AND games=1000 AND score=1000;
   IF found<>3 THEN RAISE EXCEPTION 'deep containment truncated a registered witness'; END IF;
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[inner_source,outer_source,deep_source])
+    WHERE claim=a AND games=1000 AND score=1000;
+  IF found<>3 THEN RAISE EXCEPTION 'downward traversal lost nested roots or relied on global tier'; END IF;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a],true) evidence
     JOIN physicality p ON p.entity=evidence.trunk
     WHERE NOT evidence.witness AND evidence.games=1000
@@ -285,6 +314,9 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
     WHERE witness AND dependence_root=cls AND trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'contained calculation did not retain its class root and trust'; END IF;
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[first_source,second_source])
+    WHERE claim=c AND dependence_root=cls AND dependence_trust=0.70 AND games=1 AND score=1;
+  IF found<>2 THEN RAISE EXCEPTION 'downward calculation lost its dependence root or trust'; END IF;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[c])
     WHERE witness AND trunk=first_source AND games=2 AND score=2 AND trust=0.85;
   IF found<>1 THEN RAISE EXCEPTION 'source provenance created extra calculation witnesses'; END IF;
@@ -336,6 +368,9 @@ BEGIN
   IF laplace_attest_series('stage.attestation_arity_test') <> 3 THEN
     RAISE EXCEPTION 'binary or n-ary claim was not admitted';
   END IF;
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[source_node])
+    WHERE claim=ANY(ARRAY[binary_claim,joint_claim,repeated_claim]) AND games=1 AND score=1;
+  IF found<>3 THEN RAISE EXCEPTION 'downward Native traversal lost binary or n-ary RLE claims'; END IF;
   FOREACH c IN ARRAY ARRAY[binary_claim,joint_claim,repeated_claim] LOOP
     SELECT * INTO first FROM consensus WHERE claim=c;
     SELECT * INTO wanted FROM laplace_series(ARRAY[source_node],ARRAY[1]::bigint[],ARRAY[1]::float8[],ARRAY[0.85]::float8[]);

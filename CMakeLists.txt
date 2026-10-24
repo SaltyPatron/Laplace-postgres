@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
-project(LaplacePostgres VERSION 1.27.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.28.0 LANGUAGES C CXX ASM)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
 if(DEFINED ENV{LAPLACE_NATIVE} AND NOT "$ENV{LAPLACE_NATIVE}" STREQUAL "")
@@ -21,7 +21,7 @@ foreach(v includedir-server pkglibdir sharedir libdir bindir)
   set(PG_${name} ${out})
 endforeach()
 
-add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c src/projection.c)
+add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c src/projection.c src/provenance.c)
 set_target_properties(laplace_pg PROPERTIES OUTPUT_NAME laplace PREFIX "" C_VISIBILITY_PRESET hidden
                                             BUILD_RPATH "${LAPLACE_ICU_DIR}/lib" INSTALL_RPATH "${LAPLACE_ICU_DIR}/lib")
 target_link_libraries(laplace_pg PRIVATE laplace_text laplace_static BLAKE3::blake3)

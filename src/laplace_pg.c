@@ -35,6 +35,7 @@
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
+#include "pg_core.h"
 
 PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.18");
 
@@ -42,28 +43,16 @@ PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.18");
 #include "geo.h"
 
 /* ---------------------------------------------------------------- IDs as Datums */
-static Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
+
 /* An array of IDs of a given element type. */
-static ArrayType *id_array_of(Oid el, const lp_id *ids, int n){
-    Datum *d = palloc(sizeof(Datum) * (n ? n : 1));
-    for (int i = 0; i < n; i++) d[i] = id_datum(&ids[i]);
-    return construct_array(d, n, el, 16, false, TYPALIGN_CHAR);
-}
+
 /* An array of IDs, of the type the function is declared to return. */
 static ArrayType *id_array(FunctionCallInfo fcinfo, const lp_id *ids, int n){
     Oid el = get_element_type(get_fn_expr_rettype(fcinfo->flinfo));
     if (!OidIsValid(el)) ereport(ERROR, (errmsg("laplace: the function does not return an array of IDs")));
     return id_array_of(el, ids, n);
 }
-static lp_id *ids_of(ArrayType *a, int *n){
-    Datum *d; bool *nulls; deconstruct_array(a, ARR_ELEMTYPE(a), 16, false, TYPALIGN_CHAR, &d, &nulls, n);
-    lp_id *ids = palloc(sizeof(lp_id) * (*n ? *n : 1));
-    for (int i = 0; i < *n; i++) {
-        if (nulls[i]) ereport(ERROR, (errmsg("laplace: IDs cannot be null")));
-        memcpy(ids[i].b, DatumGetPointer(d[i]), 16);
-    }
-    return ids;
-}
+
 static bytea *bytes_datum(const uint8 *b, size_t n){ bytea *r = palloc(VARHDRSZ + n); SET_VARSIZE(r, VARHDRSZ + n); memcpy(VARDATA(r), b, n); return r; }
 static bytea *coord_ewkb(const lp_coord *c){ uint8 e[37]; lp_ewkb_coord(c, e, sizeof e); return bytes_datum(e, sizeof e); }
 static text *fingerprint_text(const uint8 fp[32]){ char hex[65]; lp_hex(fp, 32, hex); return cstring_to_text(hex); }
@@ -93,15 +82,15 @@ Datum blake3_hash_extended(PG_FUNCTION_ARGS){ return hash_any_extended((const un
 
 /* ---------------------------------------------------------------- the perf-caches, mapped in this backend */
 static char *tier0_path = NULL, *flags_path = NULL, *highway_path = NULL;
-static const lp_tier0_record *tier0(void){
+const lp_tier0_record *lp_pg_tier0(void){
     const lp_tier0_record *t = lp_tier0_map(tier0_path);
     if (!t) ereport(ERROR, (errmsg("laplace: cannot map tier 0 at \"%s\" (laplace.tier0)", tier0_path)));
     return t;
 }
-static lp_text *text_context(void){
+lp_text *lp_pg_text_context(void){
     static lp_text *context;
     if (!context) {
-        context = lp_text_new(tier0());
+        context = lp_text_new(lp_pg_tier0());
         if (!context) ereport(ERROR, (errmsg("laplace: cannot open ICU's break iterators")));
     }
     return context;
@@ -142,7 +131,7 @@ Datum laplace_cp_id(PG_FUNCTION_ARGS){
 PG_FUNCTION_INFO_V1(laplace_text_id);
 Datum laplace_text_id(PG_FUNCTION_ARGS){
     text *t = PG_GETARG_TEXT_PP(0); lp_id id;
-    if (!lp_text_id(text_context(), VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
+    if (!lp_text_id(lp_pg_text_context(), VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), &id)) PG_RETURN_NULL();
     return id_datum(&id);
 }
 
@@ -336,7 +325,7 @@ Datum laplace_centroid4d_final(PG_FUNCTION_ARGS){
 static bool text_coord(text *t, lp_coord *out){
     const char *bytes=VARDATA_ANY(t); int length=VARSIZE_ANY_EXHDR(t);
     if (!length || !pg_verify_mbstr(PG_UTF8,bytes,length,true)) return false;
-    lp_ref trunk=lp_text_decompose(text_context(),(const uint8_t *)bytes,(size_t)length,NULL,NULL);
+    lp_ref trunk=lp_text_decompose(lp_pg_text_context(),(const uint8_t *)bytes,(size_t)length,NULL,NULL);
     *out=trunk.c; return true;
 }
 
@@ -350,7 +339,7 @@ Datum laplace_text_hilbert(PG_FUNCTION_ARGS){ lp_coord c; if (!text_coord(PG_GET
 PG_FUNCTION_INFO_V1(laplace_cp_coord_ewkb);
 Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
     int32 cp = PG_GETARG_INT32(0); if (cp < 0 || (uint32)cp >= LP_NCP) PG_RETURN_NULL();
-    lp_ref a = lp_ref_atom(tier0(), (uint32)cp); PG_RETURN_BYTEA_P(coord_ewkb(&a.c));
+    lp_ref a = lp_ref_atom(lp_pg_tier0(), (uint32)cp); PG_RETURN_BYTEA_P(coord_ewkb(&a.c));
 }
 
 /* ---------------------------------------------------------------- the flags that go with tier 0
@@ -361,7 +350,7 @@ static const lp_field *field_of(text *t){
     if (!f) ereport(ERROR, (errmsg("laplace: the standard lists no property \"%s\"", n)));
     return f;
 }
-static int64 cp_of_id(const uint8 *u){ return lp_tier0_codepoint(tier0(), (const lp_id *)u); }
+static int64 cp_of_id(const uint8 *u){ return lp_tier0_codepoint(lp_pg_tier0(), (const lp_id *)u); }
 static Datum said(int64 cp, text *property){
     if (cp < 0 || cp >= LP_NCP) return (Datum)0;
     const lp_layout *l = flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
@@ -395,7 +384,7 @@ Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id((const uint8 *)PG
  * lookup on the result. */
 static lp_ref trunk_of(text *t, lp_ref *parts, size_t cap, size_t *np){
     lp_ref one; size_t n;
-    return lp_text_parts(text_context(), (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), parts ? parts : &one, parts ? cap : 1, np ? np : &n);
+    return lp_text_parts(lp_pg_text_context(), (const uint8_t *)VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), parts ? parts : &one, parts ? cap : 1, np ? np : &n);
 }
 #define TEXT_ARG(t) text *t = PG_GETARG_TEXT_PP(0); if (VARSIZE_ANY_EXHDR(t) == 0) PG_RETURN_NULL()
 
@@ -424,7 +413,7 @@ Datum laplace_parts(PG_FUNCTION_ARGS){
 
 /* Which tier 0 this database computes with. */
 PG_FUNCTION_INFO_V1(laplace_fingerprint);
-Datum laplace_fingerprint(PG_FUNCTION_ARGS){ uint8 h[32]; lp_tier0_fingerprint(tier0(), h); PG_RETURN_TEXT_P(fingerprint_text(h)); }
+Datum laplace_fingerprint(PG_FUNCTION_ARGS){ uint8 h[32]; lp_tier0_fingerprint(lp_pg_tier0(), h); PG_RETURN_TEXT_P(fingerprint_text(h)); }
 
 /* ---------------------------------------------------------------- shape measures on real coordinates */
 PG_FUNCTION_INFO_V1(laplace_frechet4d_outliers);
@@ -462,20 +451,9 @@ static SPIPlanPtr kept_plan(Kept *k, const Oid *types){
 static void kept_run(Kept *k, const Oid *types, Datum *args){
     if (SPI_execute_plan(kept_plan(k, types), args, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("%s: %s", k->name, SPI_result_code_string(SPI_result))));
 }
-static Tuplestorestate *set_begin(FunctionCallInfo fcinfo, const char *name, TupleDesc *td){
-    ReturnSetInfo *rsi = (ReturnSetInfo *)fcinfo->resultinfo;
-    if (!rsi || !IsA(rsi, ReturnSetInfo) || !(rsi->allowedModes & SFRM_Materialize)) ereport(ERROR, (errmsg("%s: set-valued function called in a context that cannot accept a set", name)));
-    if (get_call_result_type(fcinfo, NULL, td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("%s: composite result expected", name)));
-    MemoryContext old = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
-    Tuplestorestate *ts = tuplestore_begin_heap(true, false, 65536); *td = CreateTupleDescCopy(*td); MemoryContextSwitchTo(old);
-    rsi->returnMode = SFRM_Materialize; rsi->setResult = ts; rsi->setDesc = *td;
-    return ts;
-}
+
 /* A row into the set, in the query's memory (the tuplestore's), whatever memory the caller is in. */
-static void set_put(FunctionCallInfo fcinfo, Tuplestorestate *ts, TupleDesc td, Datum *v, bool *nl){
-    MemoryContext m = MemoryContextSwitchTo(((ReturnSetInfo *)fcinfo->resultinfo)->econtext->ecxt_per_query_memory);
-    tuplestore_putvalues(ts, td, v, nl); MemoryContextSwitchTo(m);
-}
+
 /* Run a kept statement over the call's own arguments, its argument types the call's, and hand every row through. */
 static void set_run(FunctionCallInfo fcinfo, Kept *k){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, k->name, &td);
@@ -500,7 +478,7 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k){
 typedef struct { uint32 *kid; uint32 nkid; bool have; } TNode;     /* kid: the node's children, by their places in the map, one per occurrence */
 static uint32 tnode(lp_idmap *t, const lp_id *id){
     bool fresh; size_t i = lp_idmap_put(t, id, &fresh);
-    if (fresh) ((TNode *)lp_idmap_at(t, i))->have = lp_tier0_codepoint(tier0(), id) >= 0;     /* an atom has nothing to read */
+    if (fresh) ((TNode *)lp_idmap_at(t, i))->have = lp_tier0_codepoint(lp_pg_tier0(), id) >= 0;     /* an atom has nothing to read */
     return (uint32)i;
 }
 static Kept level_kept = { "laplace_text", "SELECT entity, st_asewkb(path) FROM physicality WHERE entity = ANY($1)", 1, NULL };
@@ -525,7 +503,7 @@ static void read_levels(lp_idmap *t, Oid idarr, MemoryContext keep){
     }
 }
 static void render(lp_idmap *t, uint32 i, StringInfo out){
-    const TNode *x = lp_idmap_at(t, i); int64 cp = x->nkid ? -1 : lp_tier0_codepoint(tier0(), lp_idmap_key(t, i));
+    const TNode *x = lp_idmap_at(t, i); int64 cp = x->nkid ? -1 : lp_tier0_codepoint(lp_pg_tier0(), lp_idmap_key(t, i));
     if (cp >= 0) { uint8_t u[4]; appendBinaryStringInfo(out, (const char *)u, (int)lp_utf8_put((uint32)cp, u)); return; }
     for (uint32 k = 0; k < x->nkid; k++) render(t, ((const TNode *)lp_idmap_at(t, i))->kid[k], out);
 }
@@ -1060,350 +1038,6 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
         }
     }
     lp_idmap_free(seen); lp_vec_free(&cv);
-    SPI_finish();
-    PG_RETURN_NULL();
-}
-
-/* ---- provenance by containment and basis-point royalty attribution (laplace_attested, laplace_attribution)
- * Walks up the container index from claims to their trunks and witnesses in one native SPI operator. */
-#define PG_NONE ((size_t)-1)
-typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t in_next;
-                 lp_id dependence; double dependence_trust; uint8_t has_dependence; } PgEdge;
-typedef struct { lp_id id; int nparents; size_t in_head; uint8_t file; } PgWNode;
-typedef lp_vec(PgWNode) PgWNodes;
-typedef lp_vec(PgEdge)  PgEdges;
-typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
-typedef struct { double games, tokens, score; uint32_t position; lp_id claim, dependence; double dependence_trust; uint8_t has_dependence; } PgTally;
-typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness, share_bp;
-                 lp_id dependence; double source_trust; uint8_t has_dependence; } PgAttrRow;
-typedef lp_vec(PgAttrRow) PgAttrRows;
-
-static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
-{
-    bool fresh = false;
-    size_t i = lp_idmap_put(d->m, id, &fresh);
-    if (fresh) {
-        PgWNode w = { *id, 0, PG_NONE, 0 };
-        lp_push(&d->n, w);
-    }
-    if (fresh_out) *fresh_out = fresh ? 1 : 0;
-    return i;
-}
-
-static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
-{
-    size_t k = d->e.n;
-    PgEdge e = { .p=p,.c=c,.times=v->run,.outcome=v->outcome,.spare=v->spare,.position=v->position,.in_next=d->n.v[c].in_head };
-    lp_push(&d->e, e);
-    d->n.v[c].in_head = k;
-    d->n.v[c].nparents++;
-    return &d->e.v[k];
-}
-
-static double *pg_down_from(const PgDag *d, size_t top)
-{
-    size_t n = d->n.n;
-    double *cnt = palloc0((n ? n : 1) * sizeof(double));
-    int *indeg = palloc0((n ? n : 1) * sizeof(int));
-    size_t *head = palloc((n ? n : 1) * sizeof(size_t));
-    size_t *link = palloc((d->e.n ? d->e.n : 1) * sizeof(size_t));
-    for (size_t i = 0; i < n; i++) head[i] = PG_NONE;
-    for (size_t k = 0; k < d->e.n; k++) {
-        link[k] = head[d->e.v[k].p];
-        head[d->e.v[k].p] = k;
-        indeg[d->e.v[k].c]++;
-    }
-    size_t *q = palloc((n ? n : 1) * sizeof(size_t)), qh = 0, qt = 0;
-    for (size_t i = 0; i < n; i++) if (!indeg[i]) q[qt++] = i;
-    cnt[top] = 1.0;
-    while (qh < qt) {
-        size_t p = q[qh++];
-        for (size_t k = head[p]; k != PG_NONE; k = link[k]) {
-            size_t c = d->e.v[k].c;
-            cnt[c] += cnt[p] * (double)d->e.v[k].times;
-            if (!--indeg[c]) q[qt++] = c;
-        }
-    }
-    pfree(indeg); pfree(head); pfree(link); pfree(q);
-    return cnt;
-}
-
-static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_claim)
-{
-    for (size_t k = 0; k < d->e.n; k++) {
-        const PgEdge *e = &d->e.v[k];
-        if (!e->claim) continue;
-        double c = cnt[e->p]; if (c <= 0) continue;
-        double g = e->rec ? c * (double)e->times : c;
-        double tk = c * (double)e->times;
-        double s = g * lp_outcome_score(e->outcome, e->spare);
-        bool fresh;
-        uint8_t key[32]={0}; memcpy(key,d->n.v[e->c].id.b,16);
-        if (e->has_dependence) memcpy(key+16,e->dependence.b,16);
-        PgTally *t = lp_strmap_get(per_claim,key,sizeof key,&fresh);
-        if (fresh) *t = (PgTally){ .claim=d->n.v[e->c].id,.dependence=e->dependence,
-            .dependence_trust=e->dependence_trust,.has_dependence=e->has_dependence };
-        t->games += g; t->tokens += tk; t->score += s;
-        if (e->position && (!t->position || e->position < t->position)) t->position = e->position;
-    }
-}
-
-static int by_attr_row(const void *a, const void *b)
-{
-    const PgAttrRow *x = a, *y = b;
-    int c = memcmp(x->claim.b, y->claim.b, 16); if (c) return c;
-    if (x->witness != y->witness) return y->witness - x->witness;
-    if (x->games != y->games) return x->games > y->games ? -1 : 1;
-    c=memcmp(x->trunk.b, y->trunk.b, 16); if (c) return c;
-    if (x->has_dependence!=y->has_dependence) return (int)x->has_dependence-(int)y->has_dependence;
-    return memcmp(x->dependence.b,y->dependence.b,16);
-}
-
-static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only, int include_files, PgAttrRows *out)
-{
-    Oid idelm = get_element_type(idarr);
-    PgDag d = { lp_idmap_new(), {0}, {0} };
-    lp_idmap *front = lp_idmap_new();
-    for (int i = 0; i < n; i++) {
-        lp_idmap_put(front, &claims[i], NULL);
-        pg_dag_node(&d, &claims[i], NULL);
-    }
-    lp_vec(lp_vertex) vx = {0};
-    lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
-    /* A custom plan copies the complete frontier into every partition's
-     * scan. Serializing that plan for parallel workers can exceed 1 GiB.
-     * Keep one parameter without PARAM_FLAG_CONST: the planner can estimate
-     * its actual search keys without embedding its value in every scan. */
-    SPIPlanPtr upward = SPI_prepare_cursor(
-        "SELECT p.entity, p.path FROM physicality p "
-        "WHERE p.path && $1 ORDER BY p.entity", 1, &idarr,
-        CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_PARALLEL_OK);
-    if (!upward) ereport(ERROR, (errmsg("laplace_attested: upward plan failed")));
-    ParamListInfo frontier_params = makeParamList(1);
-    frontier_params->params[0].ptype = idarr;
-    frontier_params->params[0].isnull = false;
-    frontier_params->params[0].pflags = 0;
-    for (int lvl = 0; lp_idmap_count(front); lvl++) {
-        int nb = (int)lp_idmap_count(front);
-        frontier_params->params[0].value = PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb));
-        if (SPI_execute_plan_with_paramlist(upward, frontier_params, true, 0) != SPI_OK_SELECT)
-            ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
-        lp_idmap *next = lp_idmap_new();
-        for (uint64 r = 0; r < SPI_processed; r++) {
-            bool nl; lp_id pid;
-            memcpy(pid.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
-            Geo g = geo_of(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-            int nv = (int)g.p.n; if (nv <= 0) continue;
-            lp_vec_reserve(&vx, (size_t)nv);
-            if (lp_path_decode(g.p, vx.v, (size_t)nv) != (size_t)nv) continue;
-            size_t pi = PG_NONE; int fresh = 0;
-            const lp_trust_class *pending_class=NULL; lp_id pending_id={{0}};
-            for (int k = 0; k < nv; k++) {
-                if (vx.v[k].said==LP_SAID_DEPENDENCE) {
-                    bool added; const lp_trust_class **c=lp_idmap_get(classes,&vx.v[k].id,&added);
-                    if (added) *c=lp_trust_class_for_id(text_context(),&vx.v[k].id);
-                    if (!*c || vx.v[k].run!=1 || k+1==nv
-                        || (vx.v[k+1].said!=LP_SAID_CLAIM && vx.v[k+1].said!=LP_SAID_RECORD))
-                        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_attested: invalid dependence-class qualifier")));
-                    pending_class=*c; pending_id=vx.v[k].id; continue;
-                }
-                const lp_trust_class *scope=pending_class; pending_class=NULL;
-                if (lp_idmap_find(front, &vx.v[k].id) < 0) continue;
-                uint32_t sd = vx.v[k].said;
-                if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
-                if (lvl > 0 && sd == LP_SAID_METADATA) continue;
-                if (pi == PG_NONE) {
-                    pi = pg_dag_node(&d, &pid, &fresh);
-                    d.n.v[pi].file = vx.v[0].said == LP_SAID_METADATA;
-                }
-                size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
-                PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
-                if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD);
-                    if (scope) { e->has_dependence=1; e->dependence=pending_id; e->dependence_trust=scope->prior; }
-                }
-            }
-            if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
-        }
-        lp_idmap_free(front);
-        front = next;
-    }
-    SPI_freeplan(upward);
-    pfree(frontier_params);
-    lp_idmap_free(front);
-    lp_vec_free(&vx);
-    lp_idmap_free(classes);
-
-    lp_vec(size_t) rix = {0};
-    lp_vec(lp_id)  rids = {0};
-    /* A registered source can itself be contained by another trunk. Its own
-     * assertion must not disappear merely because it is not a graph root.
-     * The input can also repeat IDs, so input length is not a DAG index. */
-    for (size_t i = 0; i < d.n.n; i++) {
-        lp_push(&rids, d.n.v[i].id);
-    }
-    lp_idmap *wmap = lp_idmap_sized(sizeof(double));
-    if (rids.n > 0) {
-        Datum a[1] = { PointerGetDatum(id_array_of(idelm, rids.v, (int)rids.n)) }; Oid t[1] = { idarr };
-        if (SPI_execute_with_args("SELECT id, trust FROM witness WHERE id = ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
-            ereport(ERROR, (errmsg("laplace_attested: witness lookup failed")));
-        for (uint64 r = 0; r < SPI_processed; r++) {
-            bool nl; lp_id wid;
-            memcpy(wid.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
-            double tr = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-            bool wf; *(double *)lp_idmap_get(wmap, &wid, &wf) = tr;
-        }
-    }
-
-    for (size_t i = 0; i < d.n.n; i++)
-        if (d.n.v[i].nparents == 0 || (include_files && d.n.v[i].file) || lp_idmap_lookup(wmap, &d.n.v[i].id)) lp_push(&rix, i);
-
-    for (size_t r = 0; r < rix.n; r++) {
-        size_t top = rix.v[r];
-        lp_id tid = d.n.v[top].id;
-        const double *wtr = lp_idmap_lookup(wmap, &tid);
-        int is_w = (wtr != NULL);
-        double tr = is_w ? *wtr : 0.0;
-        if (witnessed_only && (!is_w || tr <= 0.0)) continue;
-        double *cnt = pg_down_from(&d, top);
-        lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
-        pg_tally_under(&d, cnt, per_claim);
-        for (size_t i = 0; i < lp_strmap_count(per_claim); i++) {
-            const PgTally *tl = lp_strmap_at(per_claim, i);
-            if (tl->games <= 0) continue;
-            PgAttrRow row = { .claim=tl->claim,.trunk=tid,.games=tl->games,.tokens=tl->tokens,.score=tl->score,
-                .position=tl->position,.trust=tl->has_dependence ? tl->dependence_trust : tr,.witness=is_w,
-                .dependence=tl->dependence,.source_trust=tr,.has_dependence=tl->has_dependence };
-            lp_push(out, row);
-        }
-        lp_strmap_free(per_claim);
-        pfree(cnt);
-    }
-    lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
-
-    /* Largest-remainder basis-point attribution per claim across witnessed trunks with positive weight */
-    for (size_t i = 0; i < out->n;) {
-        size_t j = i + 1;
-        while (j < out->n && memcmp(out->v[j].claim.b, out->v[i].claim.b, 16) == 0) j++;
-        double wsum = 0.0;
-        for (size_t k = i; k < j; k++) if (out->v[k].witness && out->v[k].trust > 0.0)
-            wsum += out->v[k].games * out->v[k].trust;
-        if (wsum > 0.0) {
-            int bp_sum = 0;
-            double *rem = palloc((j - i) * sizeof(double));
-            for (size_t k = i; k < j; k++) {
-                if (out->v[k].witness && out->v[k].trust > 0.0) {
-                    double exact = (out->v[k].games * out->v[k].trust * 10000.0) / wsum;
-                    int fl = (int)floor(exact);
-                    out->v[k].share_bp = fl;
-                    rem[k - i] = exact - (double)fl;
-                    bp_sum += fl;
-                } else {
-                    out->v[k].share_bp = 0;
-                    rem[k - i] = -1.0;
-                }
-            }
-            while (bp_sum < 10000) {
-                size_t best = i; double best_r = -1.0;
-                for (size_t k = i; k < j; k++) if (rem[k - i] > best_r) { best_r = rem[k - i]; best = k; }
-                if (best_r < 0.0) break;
-                out->v[best].share_bp++;
-                rem[best - i] = -1.0;
-                bp_sum++;
-            }
-            pfree(rem);
-        }
-        i = j;
-    }
-
-    lp_idmap_free(wmap);
-    lp_vec_free(&rix); lp_vec_free(&rids);
-    lp_idmap_free(d.m); lp_vec_free(&d.n); lp_vec_free(&d.e);
-}
-
-/* The source-facing provenance API remains one row per corpus/container. The
- * series API below retains each explicit dependence scope for Native solving. */
-static void pg_rollup_sources(PgAttrRows *rows){
-    lp_strmap *map=lp_strmap_sized(sizeof(PgAttrRow));
-    for (size_t i=0; i<rows->n; i++) {
-        const PgAttrRow *r=rows->v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
-        bool fresh; PgAttrRow *v=lp_strmap_get(map,key,sizeof key,&fresh);
-        if (fresh) { *v=*r; v->trust=r->source_trust; v->has_dependence=0; memset(&v->dependence,0,sizeof v->dependence); }
-        else { v->games+=r->games; v->tokens+=r->tokens; v->score+=r->score; v->share_bp+=r->share_bp;
-            if (r->position && (!v->position || r->position<v->position)) v->position=r->position; }
-    }
-    rows->n=0;
-    for (size_t i=0; i<lp_strmap_count(map); i++) lp_push(rows,*(PgAttrRow *)lp_strmap_at(map,i));
-    lp_strmap_free(map); lp_sort(rows->v,rows->n,sizeof(PgAttrRow),by_attr_row);
-}
-
-PG_FUNCTION_INFO_V1(laplace_attested_series);
-Datum laplace_attested_series(PG_FUNCTION_ARGS){
-    TupleDesc td; Tuplestorestate *ts=set_begin(fcinfo,"laplace_attested_series",&td);
-    int n; lp_id *claims=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n); if (!n) PG_RETURN_NULL();
-    Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
-    if (SPI_connect()!=SPI_OK_CONNECT) ereport(ERROR,(errmsg("laplace_attested_series: SPI_connect")));
-    PgAttrRows rows={0};
-    compute_attested_rows(claims,n,idarr,0,0,&rows);
-    for (size_t i=0; i<rows.n; i++) {
-        const PgAttrRow *r=rows.v+i;
-        Datum v[9]={id_datum(&r->claim),id_datum(&r->trunk),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
-            Float8GetDatum(r->score),Int32GetDatum((int32)r->position),Float8GetDatum(r->trust),BoolGetDatum(r->witness!=0),
-            r->has_dependence ? id_datum(&r->dependence) : (Datum)0};
-        bool nl[9]={false,false,false,false,false,false,false,false,!r->has_dependence};
-        set_put(fcinfo,ts,td,v,nl);
-    }
-    lp_vec_free(&rows); SPI_finish(); PG_RETURN_NULL();
-}
-
-PG_FUNCTION_INFO_V1(laplace_attested);
-Datum laplace_attested(PG_FUNCTION_ARGS)
-{
-    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attested", &td);
-    int n; lp_id *claims = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
-    if (!n) PG_RETURN_NULL();
-    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attested: SPI_connect")));
-    PgAttrRows rows = {0};
-    int include_files = PG_NARGS() > 1 && !PG_ARGISNULL(1) && PG_GETARG_BOOL(1);
-    compute_attested_rows(claims, n, idarr, 0, include_files, &rows);
-    pg_rollup_sources(&rows);
-    for (size_t i = 0; i < rows.n; i++) {
-        const PgAttrRow *r = &rows.v[i];
-        Datum v[8] = {
-            id_datum(&r->claim), id_datum(&r->trunk),
-            Float8GetDatum(r->games), Float8GetDatum(r->tokens), Float8GetDatum(r->score),
-            Int32GetDatum((int32)r->position), Float8GetDatum(r->trust), BoolGetDatum(r->witness != 0)
-        };
-        bool nl[8] = {0};
-        set_put(fcinfo, ts, td, v, nl);
-    }
-    lp_vec_free(&rows);
-    SPI_finish();
-    PG_RETURN_NULL();
-}
-
-PG_FUNCTION_INFO_V1(laplace_attribution);
-Datum laplace_attribution(PG_FUNCTION_ARGS)
-{
-    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_attribution", &td);
-    int n; lp_id *claims = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
-    if (!n) PG_RETURN_NULL();
-    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attribution: SPI_connect")));
-    PgAttrRows rows = {0};
-    compute_attested_rows(claims, n, idarr, 1, 0, &rows);
-    pg_rollup_sources(&rows);
-    for (size_t i = 0; i < rows.n; i++) {
-        const PgAttrRow *r = &rows.v[i];
-        Datum v[7] = {
-            id_datum(&r->claim), id_datum(&r->trunk),
-            Float8GetDatum(r->games), Float8GetDatum(r->tokens), Float8GetDatum(r->score),
-            Float8GetDatum(r->trust), Int32GetDatum(r->share_bp)
-        };
-        bool nl[7] = {0};
-        set_put(fcinfo, ts, td, v, nl);
-    }
-    lp_vec_free(&rows);
     SPI_finish();
     PG_RETURN_NULL();
 }
