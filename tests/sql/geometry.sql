@@ -25,4 +25,44 @@ BEGIN
   EXCEPTION WHEN invalid_parameter_value THEN NULL;
   END;
 END $$;
+-- Prepared external parameters are stable only for one execution; values in
+-- table rows are not stable. Duplicates are set membership, not extra matches.
+DO $$
+DECLARE ids blake3[]; actual text[]; expected text[]; attempt integer; matched boolean;
+BEGIN
+  FOREACH ids SLICE 1 IN ARRAY ARRAY[
+    ARRAY[laplace_cp_id(97),laplace_cp_id(97)],
+    ARRAY[laplace_cp_id(104),laplace_cp_id(105)],
+    ARRAY[laplace_cp_id(105),laplace_cp_id(105)]] LOOP
+    SELECT array_agg(name ORDER BY name) INTO expected FROM geometry_cases
+      WHERE laplace_vertex_ids(path) && ids;
+    EXECUTE 'SELECT array_agg(name ORDER BY name) FROM geometry_cases WHERE path && $1'
+      INTO actual USING ids;
+    IF actual IS DISTINCT FROM expected THEN RAISE EXCEPTION 'stable overlap query changed membership'; END IF;
+    SELECT array_agg(name ORDER BY name) INTO expected FROM geometry_cases
+      WHERE laplace_vertex_ids(path) @> ids;
+    EXECUTE 'SELECT array_agg(name ORDER BY name) FROM geometry_cases WHERE path @> $1'
+      INTO actual USING ids;
+    IF actual IS DISTINCT FROM expected THEN RAISE EXCEPTION 'stable containment query changed membership'; END IF;
+  END LOOP;
+  IF EXISTS (SELECT FROM geometry_cases g WHERE (g.path @> g.expected) IS DISTINCT FROM true) THEN
+    RAISE EXCEPTION 'row-varying containment reused another row query';
+  END IF;
+  ids := ARRAY(SELECT laplace_cp_id(i) FROM generate_series(200,120199) i)
+      || ARRAY[laplace_cp_id(97),laplace_cp_id(97)];
+  EXECUTE 'SELECT array_agg(name ORDER BY name) FROM geometry_cases WHERE path && $1'
+    INTO actual USING ids;
+  SELECT array_agg(name ORDER BY name) INTO expected FROM geometry_cases
+    WHERE laplace_vertex_ids(path) && ARRAY[laplace_cp_id(97)];
+  IF actual IS DISTINCT FROM expected THEN RAISE EXCEPTION 'large stable frontier lost membership'; END IF;
+  FOR attempt IN 1..3 LOOP
+    ids := CASE WHEN attempt=2 THEN ARRAY[NULL::blake3] ELSE ARRAY[laplace_cp_id(97)] END;
+    BEGIN
+      matched := (SELECT path FROM geometry_cases WHERE name='point') @> ids;
+      IF attempt=2 OR NOT matched THEN RAISE EXCEPTION 'cached query validation failed' USING ERRCODE='ZX001'; END IF;
+    EXCEPTION WHEN SQLSTATE 'ZX001' THEN RAISE; WHEN OTHERS THEN
+      IF attempt<>2 OR SQLERRM<>'laplace: IDs cannot be null' THEN RAISE; END IF;
+    END;
+  END LOOP;
+END $$;
 SELECT 'geometry: all seven ZM families, 2/3/8 vertices, RLE, empties and EWKB roundtrip passed';

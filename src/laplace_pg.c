@@ -753,51 +753,61 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
 }
 
-/* The operators themselves, for plans that do not use the index. A broad
- * provenance frontier often makes a sequential scan the cheaper plan. Keep
- * a Const or external Param's sorted keys in the expression's query context,
- * rather than deconstructing the entire frontier for each stored path.
- * Standalone PL/pgSQL expressions can retain their FmgrInfo across evaluations
- * with different external Params. Cache those Params only in table scans,
- * whose executor owns the expression for that query's lifetime. */
-typedef struct { lp_id *ids; int n; } PathSearch;
-static PathSearch *path_search(FunctionCallInfo fcinfo){
-    if (!get_fn_expr_arg_stable(fcinfo->flinfo, 1)) return NULL;
+/* A scan can test millions of short paths against one large frontier. Build
+ * its canonical Native ID set once, then search it for each path vertex.
+ * Only Const/external Param arguments are query-stable; row-varying arrays
+ * must be rebuilt. PostgreSQL owns the cache and its complete lifetime. */
+typedef struct { lp_id *ids; size_t count; ArrayType *array; } PathQuery;
+static bool path_query_scan(FunctionCallInfo fcinfo){
     Node *expr = fcinfo->flinfo->fn_expr;
     List *args;
     if (IsA(expr, OpExpr)) args = ((OpExpr *)expr)->args;
     else if (IsA(expr, FuncExpr)) args = ((FuncExpr *)expr)->args;
-    else return NULL;
-    if (!IsA(lsecond(args), Const) && !IsA(linitial(args), Var)) return NULL;
-    PathSearch *search = fcinfo->flinfo->fn_extra;
-    if (!search) {
-        MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
-        search = palloc(sizeof *search);
-        search->ids = ids_of(PG_GETARG_ARRAYTYPE_P(1), &search->n);
-        search->n = (int)lp_ids_unique(search->ids, (size_t)search->n);
-        fcinfo->flinfo->fn_extra = search;
-        MemoryContextSwitchTo(old);
-    }
-    return search;
+    else return false;
+    /* A table scan owns its FmgrInfo for one executor lifetime. Standalone
+     * procedural expressions can reuse theirs with changing external Params;
+     * those still compare the complete original array below. */
+    return IsA(lsecond(args), Const) || IsA(linitial(args), Var);
 }
 static bool path_has(FunctionCallInfo fcinfo, bool all){
-    bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int n, k;
-    lp_id *keys = path_keys(ewkb, &n), *ids;
-    PathSearch *search = path_search(fcinfo);
-    if (search) {
-        ids = search->ids; k = search->n;
-        if (all && k > n) return false;
-        if (!all && n < k) {
-            for (int i = 0; i < n; i++)
-                if (bsearch(&keys[i], ids, (size_t)k, sizeof(lp_id), lp_id_cmp)) return true;
-            return false;
-        }
-    } else ids = ids_of(PG_GETARG_ARRAYTYPE_P(1), &k);
-    for (int i = 0; i < k; i++) {
-        bool found = bsearch(&ids[i], keys, (size_t)n, sizeof(lp_id), lp_id_cmp) != NULL;
-        if (found != all) return !all;
+    bool stable = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
+    bool scan_stable = stable && path_query_scan(fcinfo);
+    PathQuery *query = stable ? fcinfo->flinfo->fn_extra : NULL;
+    ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
+    /* PL/pgSQL can retain FmgrInfo across executions with new parameters.
+     * Compare the original array, not its sorted/deduplicated projection. */
+    if (!query || (!scan_stable && (VARSIZE(array) != VARSIZE(query->array)
+        || memcmp(array, query->array, VARSIZE(array))))) {
+        MemoryContext previous = CurrentMemoryContext;
+        if (stable) MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+        int count;
+        lp_id *ids = ids_of(array, &count);
+        size_t distinct = lp_ids_unique(ids, (size_t)count);
+        ArrayType *copy = stable ? DatumGetArrayTypePCopy(PointerGetDatum(array)) : NULL;
+        /* Publish only a complete validated replacement: a caught null-ID
+         * error must leave an expression's previous cached set usable. */
+        if (!query) query = palloc0(sizeof *query);
+        else { pfree(query->ids); pfree(query->array); }
+        *query = (PathQuery){ .ids=ids,.count=distinct,.array=copy };
+        MemoryContextSwitchTo(previous);
+        if (stable) fcinfo->flinfo->fn_extra = query;
     }
-    return all;
+    PG_FREE_IF_COPY(array, 1);
+    bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0));
+    int count; lp_id *keys = path_keys(ewkb, &count);
+    size_t matched = 0;
+    if (!all || query->count <= (size_t)count) {
+        for (int i = 0; i < count; i++) {
+            if (bsearch(keys + i, query->ids, query->count, sizeof(lp_id), lp_id_cmp)) {
+                matched++;
+                if (!all) break;
+            }
+        }
+    }
+    bool result = all ? matched == query->count : matched != 0;
+    pfree(keys); pfree(ewkb);
+    if (!stable) { pfree(query->ids); pfree(query); }
+    return result;
 }
 PG_FUNCTION_INFO_V1(laplace_path_starts);
 Datum laplace_path_starts(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.first, (const lp_id *)PG_GETARG_POINTER(1))); }
