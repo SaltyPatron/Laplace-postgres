@@ -31,6 +31,29 @@ typedef lp_vec(PgAttrRow) PgAttrRows;
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots, PgAttrRows *out);
 
+/* Parameter construction holds Datum pointers plus the packed ID array;
+ * indexed containment additionally retains one decoded ID array. Account for
+ * the larger live set, and PostgreSQL's actual array allocation boundary.
+ * This only sizes temporary buffers: every frontier ID is still processed. */
+static size_t frontier_window_ids(void)
+{
+    uint64 bytes = (uint64)work_mem * 1024;
+    size_t overhead = ARR_OVERHEAD_NONULLS(1);
+    size_t per_id = Max(sizeof(Datum) + sizeof(lp_id), 2 * sizeof(lp_id));
+    size_t array_ids = (MaxAllocSize - overhead) / sizeof(lp_id);
+    size_t budget_ids = bytes > overhead ? (size_t)((bytes - overhead) / per_id) : 0;
+    return Max((size_t)1, Min(budget_ids, array_ids));
+}
+
+static long frontier_fetch_rows(Portal scan)
+{
+    PlannedStmt *statement = PortalGetPrimaryStmt(scan);
+    size_t tuple_bytes = MAXALIGN(sizeof(HeapTupleData)) + MAXALIGN(SizeofHeapTupleHeader)
+        + sizeof(HeapTuple) + MAXALIGN((size_t)Max(statement->planTree->plan_width, 1));
+    uint64 bytes = (uint64)work_mem * 1024;
+    return Max(1L, (long)Min(bytes / tuple_bytes, (uint64)LONG_MAX));
+}
+
 static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
 {
     bool fresh = false;
@@ -136,9 +159,11 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     lp_vec(lp_vertex) vertices={0};
     for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
     pfree(ids);
+    /* Each frontier ID supplies a range-partition pruning parameter. An array
+     * predicate repeats processing of the complete frontier in every partition. */
     SPIPlanPtr downward=SPI_prepare_cursor(
         "SELECT p.entity,p.path,laplace_mask_has_value(p.mask,'kind','claim') AND laplace_path_length(p.path)>=2"
-        " FROM public.physicality p WHERE p.entity=ANY($1) ORDER BY p.entity",1,&idarr,
+        " FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id ORDER BY p.entity",1,&idarr,
         CURSOR_OPT_CUSTOM_PLAN|CURSOR_OPT_PARALLEL_OK);
     if(!downward)ereport(ERROR,(errmsg("laplace_contained_series: downward plan failed")));
     ParamListInfo params=makeParamList(1);
@@ -151,16 +176,22 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     size_t budget=selected ? lp_idmap_count(selected) : 0;
     if(budget>1024)budget=1024;
     budget*=4;if(budget<64)budget=64;
+    size_t window_ids=frontier_window_ids();
     bool initial=true,reverse=false;
     while(lp_idmap_count(front)){
         if(selected && !initial && d.n.n+d.e.n>budget){reverse=true;break;}
         lp_idmap *next=lp_idmap_new();size_t count=lp_idmap_count(front);
-        for(size_t begin=0;begin<count && !reverse;begin+=65536){
-            size_t amount=count-begin;if(amount>65536)amount=65536;
+        for(size_t begin=0;begin<count && !reverse;begin+=window_ids){
+            size_t amount=count-begin;if(amount>window_ids)amount=window_ids;
             ArrayType *window=id_array_of(idelm,lp_idmap_keys(front)+begin,(int)amount);
             params->params[0].value=PointerGetDatum(window);
-            if(SPI_execute_plan_with_paramlist(downward,params,true,0)!=SPI_OK_SELECT)
+            Portal scan=SPI_cursor_open_with_paramlist(NULL,downward,params,true);
+            if(!scan)
                 ereport(ERROR,(errmsg("laplace_contained_series: downward walk failed")));
+            long fetch_rows=frontier_fetch_rows(scan);
+            while(!reverse){
+            SPI_cursor_fetch(scan,true,fetch_rows);
+            if(!SPI_processed){SPI_freetuptable(SPI_tuptable);break;}
             for(uint64 row=0;row<SPI_processed;row++){
                 if(selected && !initial && d.n.n+d.e.n>budget){reverse=true;break;}
                 bool nl;lp_id id;
@@ -189,7 +220,9 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
                         lp_idmap_put(next,&v->id,NULL);
                 }
             }
-            SPI_freetuptable(SPI_tuptable);pfree(window);
+            SPI_freetuptable(SPI_tuptable);
+            }
+            SPI_cursor_close(scan);pfree(window);
         }
         lp_idmap_free(front);front=next;
         if(initial){
@@ -257,16 +290,17 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     Oid idelm = get_element_type(idarr);
     PgDag d = { lp_idmap_new(), {0}, {0} };
     lp_idmap *front = lp_idmap_new();
+    size_t window_ids = frontier_window_ids();
     if(roots){
         /* The downward API admits assertions by the child's carrier, not
          * solely by an incoming edge. Preserve that boundary in either
          * direction, including callers selecting non-claim content. */
-        for(int begin=0;begin<n;begin+=4096){
-            int count=n-begin;if(count>4096)count=4096;
+        for(size_t begin=0;begin<(size_t)n;begin+=window_ids){
+            size_t count=(size_t)n-begin;if(count>window_ids)count=window_ids;
             ArrayType *window=id_array_of(idelm,claims+begin,count);
             Datum arg=PointerGetDatum(window);
-            if(SPI_execute_with_args("SELECT entity FROM public.physicality WHERE entity=ANY($1)"
-                " AND laplace_mask_has_value(mask,'kind','claim') AND laplace_path_length(path)>=2",
+            if(SPI_execute_with_args("SELECT p.entity FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id"
+                " AND laplace_mask_has_value(p.mask,'kind','claim') AND laplace_path_length(p.path)>=2",
                 1,&idarr,&arg,NULL,true,0)!=SPI_OK_SELECT)
                 ereport(ERROR,(errmsg("laplace_contained_series: claim selection failed")));
             for(uint64 row=0;row<SPI_processed;row++){
@@ -294,14 +328,6 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     frontier_params->params[0].ptype = idarr;
     frontier_params->params[0].isnull = false;
     frontier_params->params[0].pflags = 0;
-    /* The prepared search retains two ID arrays, shared across partition
-     * expressions. Size its working set from PostgreSQL's configured memory
-     * budget; a fixed 4096 IDs repeatedly rescans a large physicality store.
-     * Cover the complete frontier even when it needs several such windows. */
-    uint64 memory_bytes = (uint64)work_mem * 1024;
-    size_t array_ids = (MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(lp_id);
-    size_t window_ids = (size_t)Min(memory_bytes / (2 * sizeof(lp_id)), (uint64)array_ids);
-    if (!window_ids) window_ids = 1;
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         size_t count = lp_idmap_count(front);
         lp_idmap *next = lp_idmap_new();
@@ -316,11 +342,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
             Portal scan = SPI_cursor_open_with_paramlist(NULL, upward, frontier_params, true);
             if (!scan)
                 ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
-            PlannedStmt *statement = PortalGetPrimaryStmt(scan);
-            size_t tuple_bytes = MAXALIGN(sizeof(HeapTupleData)) + MAXALIGN(SizeofHeapTupleHeader)
-                + sizeof(HeapTuple) + MAXALIGN((size_t)Max(statement->planTree->plan_width, 1));
-            long fetch_rows = (long)Min(memory_bytes / tuple_bytes, (uint64)LONG_MAX);
-            if (!fetch_rows) fetch_rows = 1;
+            long fetch_rows = frontier_fetch_rows(scan);
             for (;;) {
                 SPI_cursor_fetch(scan, true, fetch_rows);
                 if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }

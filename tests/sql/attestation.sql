@@ -446,13 +446,16 @@ END $$;
 -- These canonical RLE containers have no witness, so they cannot alter shares.
 CREATE TEMP TABLE cursor_expected AS
 SELECT * FROM laplace_attribution(ARRAY[(SELECT id FROM series_claims WHERE name='a')]);
+CREATE TEMP TABLE cursor_records(id blake3);
+CREATE TEMP TABLE cursor_root(id blake3);
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
         tail blake3 := laplace_id('one'); i integer;
 BEGIN
   FOR i IN 1..2049 LOOP
-    PERFORM pg_temp.series_node(ARRAY[a] || array_fill(tail,ARRAY[i]),'record',ARRAY[1073741824,0]::bigint[]);
+    INSERT INTO cursor_records SELECT pg_temp.series_node(ARRAY[a] || array_fill(tail,ARRAY[i]),'record',ARRAY[1073741824,0]::bigint[]);
   END LOOP;
+  INSERT INTO cursor_root SELECT pg_temp.series_node(ARRAY(SELECT id FROM cursor_records ORDER BY id),'tuple');
 END $$;
 SET LOCAL work_mem='64kB';
 CREATE TEMP TABLE cursor_actual AS
@@ -462,6 +465,26 @@ DO $$ BEGIN
              UNION ALL (TABLE cursor_expected EXCEPT ALL TABLE cursor_actual)) THEN
     RAISE EXCEPTION 'cursor chunks changed registered witness attribution';
   END IF;
+END $$;
+-- The downward frontier exceeds a 64kB parameter window and result fetch.
+-- It must still reconstruct every real assertion, including the final window.
+DO $$
+DECLARE root blake3 := (SELECT id FROM cursor_root);
+        a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        found bigint;
+BEGIN
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[root])
+    WHERE claim=a AND games=2049 AND score=2049;
+  IF found<>1 THEN RAISE EXCEPTION 'downward cursor lost assertions across memory windows'; END IF;
+  IF EXISTS (
+    (SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_contained_series(ARRAY[root])
+     EXCEPT ALL
+     SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_attested_series(ARRAY[a]) WHERE trunk=root)
+    UNION ALL
+    (SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_attested_series(ARRAY[a]) WHERE trunk=root
+     EXCEPT ALL
+     SELECT claim,trunk,games,tokens,score,"position",dependence_root FROM laplace_contained_series(ARRAY[root]))
+  ) THEN RAISE EXCEPTION 'downward memory windows changed Native testimony'; END IF;
 END $$;
 
 -- A large frontier must remain a parameter while a parallel worker plan is
