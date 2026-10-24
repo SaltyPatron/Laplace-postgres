@@ -757,22 +757,27 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
  * its canonical Native ID set once, then search it for each path vertex.
  * Only Const/external Param arguments are query-stable; row-varying arrays
  * must be rebuilt. PostgreSQL owns the cache and its complete lifetime. */
-typedef struct { lp_id *ids; size_t count; } PathQuery;
+typedef struct { lp_id *ids; size_t count; ArrayType *array; } PathQuery;
 static bool path_has(FunctionCallInfo fcinfo, bool all){
     bool stable = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
     PathQuery *query = stable ? fcinfo->flinfo->fn_extra : NULL;
-    if (!query) {
-        ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
+    ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
+    /* PL/pgSQL can retain FmgrInfo across executions with new parameters.
+     * Compare the original array, not its sorted/deduplicated projection. */
+    if (!query || VARSIZE(array) != VARSIZE(query->array)
+        || memcmp(array, query->array, VARSIZE(array))) {
         MemoryContext previous = CurrentMemoryContext;
         if (stable) MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
-        query = palloc(sizeof *query);
+        if (!query) query = palloc0(sizeof *query);
+        else { pfree(query->ids); pfree(query->array); }
         int count;
         query->ids = ids_of(array, &count);
         query->count = lp_ids_unique(query->ids, (size_t)count);
+        if (stable) query->array = DatumGetArrayTypePCopy(PointerGetDatum(array));
         MemoryContextSwitchTo(previous);
-        PG_FREE_IF_COPY(array, 1);
         if (stable) fcinfo->flinfo->fn_extra = query;
     }
+    PG_FREE_IF_COPY(array, 1);
     bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0));
     int count; lp_id *keys = path_keys(ewkb, &count);
     size_t matched = 0;

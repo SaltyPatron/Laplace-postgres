@@ -399,10 +399,11 @@ END $$;
 -- A large frontier must remain a parameter while a parallel worker plan is
 -- serialized. Expanding these IDs into all 256 partition scans exceeds 1 GiB.
 CREATE TEMP TABLE frontier_expected AS
-SELECT * FROM laplace_attribution(ARRAY[laplace_compose(ARRAY[laplace_id('dog'),laplace_id('noun')])]);
+SELECT * FROM laplace_attribution(ARRAY(SELECT id FROM series_claims ORDER BY name));
 CREATE TEMP TABLE frontier_actual (LIKE frontier_expected);
 DO $$ BEGIN
-  IF (SELECT sum(share_bp) FROM frontier_expected) IS DISTINCT FROM 10000 THEN
+  IF (SELECT count(DISTINCT claim) FROM frontier_expected) <> 2
+     OR EXISTS (SELECT FROM frontier_expected GROUP BY claim HAVING sum(share_bp) IS DISTINCT FROM 10000) THEN
     RAISE EXCEPTION 'large-frontier fixture has no complete witness attribution';
   END IF;
 END $$;
@@ -413,8 +414,9 @@ SET LOCAL statement_timeout = '60s';
 -- containment query itself, rather than the entire function, runs in workers.
 INSERT INTO frontier_actual
 SELECT * FROM laplace_attribution(
-  ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(1,120000) i)
-  || ARRAY[laplace_compose(ARRAY[laplace_id('dog'),laplace_id('noun')])]);
+  ARRAY[(SELECT id FROM series_claims WHERE name='a')]
+  || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(1,120000) i)
+  || ARRAY[(SELECT id FROM series_claims WHERE name='b')]);
 DO $$ BEGIN
   IF EXISTS (
     SELECT FROM (
