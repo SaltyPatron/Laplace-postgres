@@ -33,3 +33,39 @@ BEGIN
   END IF;
 END $$;
 SELECT 'gin_path: all-vertex and endpoint GIN postings match sequential scans for every ZM family';
+
+-- A broad frontier can make a sequential scan cheaper than thousands of GIN
+-- probes. Its stable search array must not be rebuilt and scanned for every
+-- stored path. Exercise the same external Param used by Native provenance.
+CREATE TEMP TABLE path_search_cases AS
+SELECT path FROM geometry_cases CROSS JOIN generate_series(1,1000);
+SET statement_timeout = '5s';
+DO $$
+DECLARE frontier blake3[] := ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(1,120000) i);
+        wanted bigint; actual bigint; varying_wanted bigint;
+BEGIN
+  SELECT count(*) INTO wanted FROM path_search_cases WHERE path @> ARRAY[laplace_cp_id(97)];
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path && $1'
+    INTO actual USING frontier || ARRAY[laplace_cp_id(97),laplace_cp_id(97)];
+  IF actual <> wanted THEN RAISE EXCEPTION 'large frontier lost exact membership'; END IF;
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path && $1' INTO actual USING frontier;
+  IF actual <> 0 THEN RAISE EXCEPTION 'absent frontier matched a path'; END IF;
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path @> $1'
+    INTO actual USING ARRAY[laplace_cp_id(97),laplace_cp_id(97)];
+  IF actual <> wanted THEN RAISE EXCEPTION 'duplicate query keys changed containment'; END IF;
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path && $1' INTO actual USING '{}'::blake3[];
+  IF actual <> 0 THEN RAISE EXCEPTION 'empty overlap query matched a path'; END IF;
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path @> $1' INTO actual USING '{}'::blake3[];
+  IF actual <> (SELECT count(*) FROM path_search_cases) THEN RAISE EXCEPTION 'empty containment query lost a path'; END IF;
+
+  -- Row-dependent right operands cannot share a query-wide cache.
+  SELECT 2 * count(*) INTO varying_wanted FROM geometry_cases
+    WHERE path && ARRAY[laplace_cp_id(97)];
+  SELECT varying_wanted + 2 * count(*) INTO varying_wanted FROM geometry_cases
+    WHERE path && ARRAY[laplace_cp_id(105)];
+  SELECT count(*) INTO actual FROM geometry_cases CROSS JOIN generate_series(0,3) i
+    WHERE path && CASE WHEN i % 2 = 0 THEN ARRAY[laplace_cp_id(97)] ELSE ARRAY[laplace_cp_id(105)] END;
+  IF actual <> varying_wanted THEN RAISE EXCEPTION 'varying search arrays reused stale keys'; END IF;
+END $$;
+RESET statement_timeout;
+SELECT 'gin_path: broad stable frontiers and varying arrays preserve exact membership';

@@ -758,14 +758,26 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
  * Only Const/external Param arguments are query-stable; row-varying arrays
  * must be rebuilt. PostgreSQL owns the cache and its complete lifetime. */
 typedef struct { lp_id *ids; size_t count; ArrayType *array; } PathQuery;
+static bool path_query_scan(FunctionCallInfo fcinfo){
+    Node *expr = fcinfo->flinfo->fn_expr;
+    List *args;
+    if (IsA(expr, OpExpr)) args = ((OpExpr *)expr)->args;
+    else if (IsA(expr, FuncExpr)) args = ((FuncExpr *)expr)->args;
+    else return false;
+    /* A table scan owns its FmgrInfo for one executor lifetime. Standalone
+     * procedural expressions can reuse theirs with changing external Params;
+     * those still compare the complete original array below. */
+    return IsA(lsecond(args), Const) || IsA(linitial(args), Var);
+}
 static bool path_has(FunctionCallInfo fcinfo, bool all){
     bool stable = get_fn_expr_arg_stable(fcinfo->flinfo, 1);
+    bool scan_stable = stable && path_query_scan(fcinfo);
     PathQuery *query = stable ? fcinfo->flinfo->fn_extra : NULL;
     ArrayType *array = PG_GETARG_ARRAYTYPE_P(1);
     /* PL/pgSQL can retain FmgrInfo across executions with new parameters.
      * Compare the original array, not its sorted/deduplicated projection. */
-    if (!query || VARSIZE(array) != VARSIZE(query->array)
-        || memcmp(array, query->array, VARSIZE(array))) {
+    if (!query || (!scan_stable && (VARSIZE(array) != VARSIZE(query->array)
+        || memcmp(array, query->array, VARSIZE(array))))) {
         MemoryContext previous = CurrentMemoryContext;
         if (stable) MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
         int count;
