@@ -136,9 +136,11 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     lp_vec(lp_vertex) vertices={0};
     for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
     pfree(ids);
+    /* Each frontier ID supplies a range-partition pruning parameter. An array
+     * predicate repeats processing of the complete frontier in every partition. */
     SPIPlanPtr downward=SPI_prepare_cursor(
         "SELECT p.entity,p.path,laplace_mask_has_value(p.mask,'kind','claim') AND laplace_path_length(p.path)>=2"
-        " FROM public.physicality p WHERE p.entity=ANY($1) ORDER BY p.entity",1,&idarr,
+        " FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id ORDER BY p.entity",1,&idarr,
         CURSOR_OPT_CUSTOM_PLAN|CURSOR_OPT_PARALLEL_OK);
     if(!downward)ereport(ERROR,(errmsg("laplace_contained_series: downward plan failed")));
     ParamListInfo params=makeParamList(1);
