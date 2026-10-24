@@ -3,13 +3,16 @@
 #include "pg_core.h"
 #include "geo.h"
 #include "executor/spi.h"
-#include "miscadmin.h"
+#include "access/htup_details.h"
+#include "nodes/plannodes.h"
 #include "nodes/params.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
 #include <math.h>
+#include <limits.h>
 
 /* ---- provenance by containment and basis-point royalty attribution (laplace_attested, laplace_attribution)
  * Walks up the container index from claims to their trunks and witnesses in one native SPI operator. */
@@ -291,6 +294,14 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     frontier_params->params[0].ptype = idarr;
     frontier_params->params[0].isnull = false;
     frontier_params->params[0].pflags = 0;
+    /* The prepared search retains two ID arrays, shared across partition
+     * expressions. Size its working set from PostgreSQL's configured memory
+     * budget; a fixed 4096 IDs repeatedly rescans a large physicality store.
+     * Cover the complete frontier even when it needs several such windows. */
+    uint64 memory_bytes = (uint64)work_mem * 1024;
+    size_t array_ids = (MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(lp_id);
+    size_t window_ids = (size_t)Min(memory_bytes / (2 * sizeof(lp_id)), (uint64)array_ids);
+    if (!window_ids) window_ids = 1;
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         size_t count = lp_idmap_count(front);
         lp_idmap *next = lp_idmap_new();
@@ -298,44 +309,55 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         /* Bound each GIN search and its parameter/cache memory. A parent can
          * match several windows: decode it once against the WHOLE frontier,
          * retaining all of its edges without counting its testimony twice. */
-        for (size_t begin = 0; begin < count; begin += 4096) {
-            size_t amount = count - begin; if (amount > 4096) amount = 4096;
+        for (size_t begin = 0; begin < count; begin += window_ids) {
+            size_t amount = count - begin; if (amount > window_ids) amount = window_ids;
             ArrayType *window = id_array_of(idelm, lp_idmap_keys(front) + begin, (int)amount);
             frontier_params->params[0].value = PointerGetDatum(window);
-            if (SPI_execute_plan_with_paramlist(upward, frontier_params, true, 0) != SPI_OK_SELECT)
+            Portal scan = SPI_cursor_open_with_paramlist(NULL, upward, frontier_params, true);
+            if (!scan)
                 ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
-            for (uint64 r = 0; r < SPI_processed; r++) {
-                bool nl; lp_id pid;
-                memcpy(pid.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
-                bool first; lp_idmap_put(seen, &pid, &first); if (!first) continue;
-                Geo g = geo_of(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-                int nv = (int)g.p.n; if (nv <= 0) continue;
-                lp_vec_reserve(&vx, (size_t)nv);
-                if (lp_path_decode(g.p, vx.v, (size_t)nv) != (size_t)nv) continue;
-                size_t pi = PG_NONE; int fresh = 0;
-                const lp_trust_class *pending_class=NULL; lp_id pending_id={{0}};
-                for (int k = 0; k < nv; k++) {
-                    if (vx.v[k].said==LP_SAID_DEPENDENCE) {
-                        pending_class=pg_dependence_class(classes,vx.v,nv,k); pending_id=vx.v[k].id; continue;
+            PlannedStmt *statement = PortalGetPrimaryStmt(scan);
+            size_t tuple_bytes = MAXALIGN(sizeof(HeapTupleData)) + MAXALIGN(SizeofHeapTupleHeader)
+                + sizeof(HeapTuple) + MAXALIGN((size_t)Max(statement->planTree->plan_width, 1));
+            long fetch_rows = (long)Min(memory_bytes / tuple_bytes, (uint64)LONG_MAX);
+            if (!fetch_rows) fetch_rows = 1;
+            for (;;) {
+                SPI_cursor_fetch(scan, true, fetch_rows);
+                if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
+                for (uint64 r = 0; r < SPI_processed; r++) {
+                    bool nl; lp_id pid;
+                    memcpy(pid.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
+                    bool first; lp_idmap_put(seen, &pid, &first); if (!first) continue;
+                    Geo g = geo_of(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
+                    int nv = (int)g.p.n; if (nv <= 0) continue;
+                    lp_vec_reserve(&vx, (size_t)nv);
+                    if (lp_path_decode(g.p, vx.v, (size_t)nv) != (size_t)nv) continue;
+                    size_t pi = PG_NONE; int fresh = 0;
+                    const lp_trust_class *pending_class=NULL; lp_id pending_id={{0}};
+                    for (int k = 0; k < nv; k++) {
+                        if (vx.v[k].said==LP_SAID_DEPENDENCE) {
+                            pending_class=pg_dependence_class(classes,vx.v,nv,k); pending_id=vx.v[k].id; continue;
+                        }
+                        const lp_trust_class *scope=pending_class; pending_class=NULL;
+                        if (lp_idmap_find(front, &vx.v[k].id) < 0) continue;
+                        uint32_t sd = vx.v[k].said;
+                        if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
+                        if (lvl > 0 && sd == LP_SAID_METADATA) continue;
+                        if (pi == PG_NONE) {
+                            pi = pg_dag_node(&d, &pid, &fresh);
+                            d.n.v[pi].file = vx.v[0].said == LP_SAID_METADATA;
+                        }
+                        size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
+                        PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
+                        if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD);
+                            if (scope) { e->has_dependence=1; e->dependence=pending_id; e->dependence_trust=scope->prior; }
+                        }
                     }
-                    const lp_trust_class *scope=pending_class; pending_class=NULL;
-                    if (lp_idmap_find(front, &vx.v[k].id) < 0) continue;
-                    uint32_t sd = vx.v[k].said;
-                    if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
-                    if (lvl > 0 && sd == LP_SAID_METADATA) continue;
-                    if (pi == PG_NONE) {
-                        pi = pg_dag_node(&d, &pid, &fresh);
-                        d.n.v[pi].file = vx.v[0].said == LP_SAID_METADATA;
-                    }
-                    size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
-                    PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
-                    if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD);
-                        if (scope) { e->has_dependence=1; e->dependence=pending_id; e->dependence_trust=scope->prior; }
-                    }
+                    if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
                 }
-                if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
+                SPI_freetuptable(SPI_tuptable);
             }
-            SPI_freetuptable(SPI_tuptable);
+            SPI_cursor_close(scan);
             pfree(window);
         }
         lp_idmap_free(seen);

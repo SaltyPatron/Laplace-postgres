@@ -442,6 +442,28 @@ BEGIN
     RAISE EXCEPTION 'a non-claim n-ary tuple acquired a standing';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- More than one cursor fetch must preserve every registered contribution.
+-- These canonical RLE containers have no witness, so they cannot alter shares.
+CREATE TEMP TABLE cursor_expected AS
+SELECT * FROM laplace_attribution(ARRAY[(SELECT id FROM series_claims WHERE name='a')]);
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        tail blake3 := laplace_id('one'); i integer;
+BEGIN
+  FOR i IN 1..2049 LOOP
+    PERFORM pg_temp.series_node(ARRAY[a] || array_fill(tail,ARRAY[i]),'record',ARRAY[1073741824,0]::bigint[]);
+  END LOOP;
+END $$;
+SET LOCAL work_mem='64kB';
+CREATE TEMP TABLE cursor_actual AS
+SELECT * FROM laplace_attribution(ARRAY[(SELECT id FROM series_claims WHERE name='a')]);
+DO $$ BEGIN
+  IF EXISTS ((TABLE cursor_actual EXCEPT ALL TABLE cursor_expected)
+             UNION ALL (TABLE cursor_expected EXCEPT ALL TABLE cursor_actual)) THEN
+    RAISE EXCEPTION 'cursor chunks changed registered witness attribution';
+  END IF;
+END $$;
+
 -- A large frontier must remain a parameter while a parallel worker plan is
 -- serialized. Expanding these IDs into all 256 partition scans exceeds 1 GiB.
 CREATE TEMP TABLE frontier_expected AS

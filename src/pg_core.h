@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -41,7 +42,7 @@ static inline Tuplestorestate *set_begin(FunctionCallInfo fcinfo, const char *na
     if (!rsi || !IsA(rsi, ReturnSetInfo) || !(rsi->allowedModes & SFRM_Materialize)) ereport(ERROR, (errmsg("%s: set-valued function called in a context that cannot accept a set", name)));
     if (get_call_result_type(fcinfo, NULL, td) != TYPEFUNC_COMPOSITE) ereport(ERROR, (errmsg("%s: composite result expected", name)));
     MemoryContext old = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
-    Tuplestorestate *ts = tuplestore_begin_heap(true, false, 65536); *td = CreateTupleDescCopy(*td); MemoryContextSwitchTo(old);
+    Tuplestorestate *ts = tuplestore_begin_heap(true, false, work_mem); *td = CreateTupleDescCopy(*td); MemoryContextSwitchTo(old);
     rsi->returnMode = SFRM_Materialize; rsi->setResult = ts; rsi->setDesc = *td;
     return ts;
 }
