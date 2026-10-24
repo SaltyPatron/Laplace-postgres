@@ -21,6 +21,7 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "nodes/makefuncs.h"
+#include "nodes/params.h"
 #include "parser/parse_func.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -186,6 +187,18 @@ static lp_id *path_keys(bytea *ewkb, int *n){
     if (!lp_ewkb_keys((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), keys, count, &count))
         ereport(ERROR, (errmsg("laplace: cannot read geometry vertices")));
     *n = (int)count; return keys;
+}
+PG_FUNCTION_INFO_V1(laplace_path_enrich_ewkb);
+Datum laplace_path_enrich_ewkb(PG_FUNCTION_ARGS){
+    bytea *a=path_ewkb(PG_GETARG_DATUM(0)), *b=path_ewkb(PG_GETARG_DATUM(1));
+    lp_path recorded=lp_path_of((const uint8 *)VARDATA_ANY(a),VARSIZE_ANY_EXHDR(a));
+    lp_path incoming=lp_path_of((const uint8 *)VARDATA_ANY(b),VARSIZE_ANY_EXHDR(b));
+    size_t size=lp_ewkb_enrich_path(recorded,incoming,NULL,0);
+    if (!size) PG_RETURN_NULL();
+    if (size>MaxAllocSize-VARHDRSZ) ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("laplace: enriched path exceeds the geometry allocation limit")));
+    bytea *out=palloc(VARHDRSZ+size); SET_VARSIZE(out,VARHDRSZ+size);
+    lp_ewkb_enrich_path(recorded,incoming,(uint8 *)VARDATA(out),size);
+    PG_RETURN_BYTEA_P(out);
 }
 typedef struct { lp_id first, last; bool found; } PathEnds;
 static bool path_end_span(void *context, const lp_ewkb_span *span){
@@ -1157,12 +1170,23 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     }
     lp_vec(lp_vertex) vx = {0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
+    /* A custom plan copies the complete frontier into every partition's
+     * scan. Serializing that plan for parallel workers can exceed 1 GiB.
+     * Keep one parameter without PARAM_FLAG_CONST: the planner can estimate
+     * its actual search keys without embedding its value in every scan. */
+    SPIPlanPtr upward = SPI_prepare_cursor(
+        "SELECT p.entity, p.path FROM physicality p "
+        "WHERE p.path && $1 ORDER BY p.entity", 1, &idarr,
+        CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_PARALLEL_OK);
+    if (!upward) ereport(ERROR, (errmsg("laplace_attested: upward plan failed")));
+    ParamListInfo frontier_params = makeParamList(1);
+    frontier_params->params[0].ptype = idarr;
+    frontier_params->params[0].isnull = false;
+    frontier_params->params[0].pflags = 0;
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         int nb = (int)lp_idmap_count(front);
-        Datum a[1] = { PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb)) }; Oid t[1] = { idarr };
-        if (SPI_execute_with_args(
-            "SELECT p.entity, p.path FROM physicality p "
-            "WHERE p.path && $1 ORDER BY p.entity", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
+        frontier_params->params[0].value = PointerGetDatum(id_array_of(idelm, lp_idmap_keys(front), nb));
+        if (SPI_execute_plan_with_paramlist(upward, frontier_params, true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
         lp_idmap *next = lp_idmap_new();
         for (uint64 r = 0; r < SPI_processed; r++) {
@@ -1203,6 +1227,8 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         lp_idmap_free(front);
         front = next;
     }
+    SPI_freeplan(upward);
+    pfree(frontier_params);
     lp_idmap_free(front);
     lp_vec_free(&vx);
     lp_idmap_free(classes);
