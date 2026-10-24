@@ -1,2 +1,3 @@
 \set ECHO none
 gin_path: all-vertex and endpoint GIN postings match sequential scans for every ZM family
+gin_path: broad stable frontiers and varying arrays preserve exact membership

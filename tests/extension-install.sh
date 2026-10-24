@@ -40,7 +40,7 @@ mv "$stage/control" "$share/extension/laplace.control"
 "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
 created=1
 connection=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$db/")
-"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" <<'SQL'
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" -v gin_cases="$source_root/tests/sql/gin_path.sql" <<'SQL'
 SELECT set_config('extension_control_path', :'candidate_share' || ':$system', false);
 CREATE EXTENSION postgis;
 CREATE EXTENSION laplace;
@@ -94,5 +94,6 @@ RESET SESSION AUTHORIZATION;
 \i :attestation_cases
 \i :stage_cases
 \i :annotation_cases
+\i :gin_cases
 SQL
 printf 'PASS candidate extension installed and executed in isolated database %s\n' "$db"

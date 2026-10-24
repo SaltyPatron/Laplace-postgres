@@ -753,9 +753,46 @@ Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
 }
 
-/* The operators themselves, for plans that do not use the index. */
-static bool path_has(Datum path, ArrayType *q, bool all){
-    bytea *ewkb = path_ewkb(path); int n, k; lp_id *keys = path_keys(ewkb, &n), *ids = ids_of(q, &k);
+/* The operators themselves, for plans that do not use the index. A broad
+ * provenance frontier often makes a sequential scan the cheaper plan. Keep
+ * a Const or external Param's sorted keys in the expression's query context,
+ * rather than deconstructing the entire frontier for each stored path.
+ * Standalone PL/pgSQL expressions can retain their FmgrInfo across evaluations
+ * with different external Params. Cache those Params only in table scans,
+ * whose executor owns the expression for that query's lifetime. */
+typedef struct { lp_id *ids; int n; } PathSearch;
+static PathSearch *path_search(FunctionCallInfo fcinfo){
+    if (!get_fn_expr_arg_stable(fcinfo->flinfo, 1)) return NULL;
+    Node *expr = fcinfo->flinfo->fn_expr;
+    List *args;
+    if (IsA(expr, OpExpr)) args = ((OpExpr *)expr)->args;
+    else if (IsA(expr, FuncExpr)) args = ((FuncExpr *)expr)->args;
+    else return NULL;
+    if (!IsA(lsecond(args), Const) && !IsA(linitial(args), Var)) return NULL;
+    PathSearch *search = fcinfo->flinfo->fn_extra;
+    if (!search) {
+        MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+        search = palloc(sizeof *search);
+        search->ids = ids_of(PG_GETARG_ARRAYTYPE_P(1), &search->n);
+        search->n = (int)lp_ids_unique(search->ids, (size_t)search->n);
+        fcinfo->flinfo->fn_extra = search;
+        MemoryContextSwitchTo(old);
+    }
+    return search;
+}
+static bool path_has(FunctionCallInfo fcinfo, bool all){
+    bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int n, k;
+    lp_id *keys = path_keys(ewkb, &n), *ids;
+    PathSearch *search = path_search(fcinfo);
+    if (search) {
+        ids = search->ids; k = search->n;
+        if (all && k > n) return false;
+        if (!all && n < k) {
+            for (int i = 0; i < n; i++)
+                if (bsearch(&keys[i], ids, (size_t)k, sizeof(lp_id), lp_id_cmp)) return true;
+            return false;
+        }
+    } else ids = ids_of(PG_GETARG_ARRAYTYPE_P(1), &k);
     for (int i = 0; i < k; i++) {
         bool found = bsearch(&ids[i], keys, (size_t)n, sizeof(lp_id), lp_id_cmp) != NULL;
         if (found != all) return !all;
@@ -767,9 +804,9 @@ Datum laplace_path_starts(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb
 PG_FUNCTION_INFO_V1(laplace_path_ends);
 Datum laplace_path_ends(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.last, (const lp_id *)PG_GETARG_POINTER(1))); }
 PG_FUNCTION_INFO_V1(laplace_path_contains);
-Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
+Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(fcinfo, true)); }
 PG_FUNCTION_INFO_V1(laplace_path_overlaps);
-Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(PG_GETARG_DATUM(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
+Datum laplace_path_overlaps(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(fcinfo, false)); }
 
 /* How many times a path holds each of the given IDs, runs included: one pass over the path, a binary search per vertex.
  * Returns only the IDs it holds. */
