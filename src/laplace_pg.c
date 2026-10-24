@@ -188,6 +188,18 @@ static lp_id *path_keys(bytea *ewkb, int *n){
         ereport(ERROR, (errmsg("laplace: cannot read geometry vertices")));
     *n = (int)count; return keys;
 }
+PG_FUNCTION_INFO_V1(laplace_path_enrich_ewkb);
+Datum laplace_path_enrich_ewkb(PG_FUNCTION_ARGS){
+    bytea *a=path_ewkb(PG_GETARG_DATUM(0)), *b=path_ewkb(PG_GETARG_DATUM(1));
+    lp_path recorded=lp_path_of((const uint8 *)VARDATA_ANY(a),VARSIZE_ANY_EXHDR(a));
+    lp_path incoming=lp_path_of((const uint8 *)VARDATA_ANY(b),VARSIZE_ANY_EXHDR(b));
+    size_t size=lp_ewkb_enrich_path(recorded,incoming,NULL,0);
+    if (!size) PG_RETURN_NULL();
+    if (size>MaxAllocSize-VARHDRSZ) ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("laplace: enriched path exceeds the geometry allocation limit")));
+    bytea *out=palloc(VARHDRSZ+size); SET_VARSIZE(out,VARHDRSZ+size);
+    lp_ewkb_enrich_path(recorded,incoming,(uint8 *)VARDATA(out),size);
+    PG_RETURN_BYTEA_P(out);
+}
 typedef struct { lp_id first, last; bool found; } PathEnds;
 static bool path_end_span(void *context, const lp_ewkb_span *span){
     PathEnds *ends = context; double vertex[4];
