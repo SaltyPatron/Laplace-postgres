@@ -459,9 +459,14 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, k->name, &td);
     if (k->nargs > KEPT_ARGS || td->natts > KEPT_ARGS) ereport(ERROR, (errmsg("%s: more than %d arguments or columns", k->name, KEPT_ARGS)));
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("%s: SPI_connect", k->name)));
-    Oid t[KEPT_ARGS]; Datum a[KEPT_ARGS];
-    for (int i = 0; i < k->nargs; i++) { t[i] = get_fn_expr_argtype(fcinfo->flinfo, i); a[i] = PG_GETARG_DATUM(i); }
-    kept_run(k, t, a);
+    Oid t[KEPT_ARGS]; Datum a[KEPT_ARGS]; char nulls[KEPT_ARGS];
+    for (int i = 0; i < k->nargs; i++) {
+        t[i] = get_fn_expr_argtype(fcinfo->flinfo, i);
+        nulls[i] = PG_ARGISNULL(i) ? 'n' : ' ';
+        a[i] = PG_ARGISNULL(i) ? (Datum)0 : PG_GETARG_DATUM(i);
+    }
+    if (SPI_execute_plan(kept_plan(k,t),a,nulls,true,0) != SPI_OK_SELECT)
+        ereport(ERROR,(errmsg("%s: %s",k->name,SPI_result_code_string(SPI_result))));
     int nc = SPI_tuptable->tupdesc->natts;
     for (uint64 j = 0; j < SPI_processed; j++) {
         Datum v[KEPT_ARGS]; bool nl[KEPT_ARGS];
@@ -475,48 +480,123 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k){
 /* ---------------------------------------------------------------- recomposition: an entity back to its text
  * The composition is read one DAG level per statement: every entity a level names that is not an atom and not yet
  * read is fetched in one set, from the trunk down, and the text is then written out of memory in path order. */
-typedef struct { uint32 *kid; uint32 nkid; bool have; } TNode;     /* kid: the node's children, by their places in the map, one per occurrence */
-static uint32 tnode(lp_idmap *t, const lp_id *id){
+typedef struct { size_t node; uint32 run; } TChild;
+typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque; uint8 text_state; } TNode;
+static size_t tnode(lp_idmap *t, const lp_id *id){
     bool fresh; size_t i = lp_idmap_put(t, id, &fresh);
-    if (fresh) ((TNode *)lp_idmap_at(t, i))->have = lp_tier0_codepoint(lp_pg_tier0(), id) >= 0;     /* an atom has nothing to read */
-    return (uint32)i;
+    if (fresh) *(TNode *)lp_idmap_at(t,i) = (TNode){ .have=lp_tier0_codepoint(lp_pg_tier0(),id)>=0 };
+    return i;
 }
 static Kept level_kept = { "laplace_text", "SELECT entity, st_asewkb(path) FROM physicality WHERE entity = ANY($1)", 1, NULL };
-static void read_levels(lp_idmap *t, Oid idarr, MemoryContext keep){
-    for (int depth = 0; ; depth++) {
-        if (depth > 64) ereport(ERROR, (errmsg("laplace_text: composition deeper than 64 tiers")));
-        lp_vec(lp_id) want = { 0 };
-        for (size_t i = 0; i < lp_idmap_count(t); i++) if (!((TNode *)lp_idmap_at(t, i))->have) lp_push(&want, *lp_idmap_key(t, i));
-        if (!want.n) return;
-        Datum arg = PointerGetDatum(id_array_of(get_element_type(idarr), want.v, (int)want.n));
-        kept_run(&level_kept, &idarr, &arg);
-        if (SPI_processed < want.n) ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
+static Kept label_level_kept = { "laplace_labels",
+    "SELECT entity,st_asewkb(path),laplace_mask_has_value(mask,'kind','tuple'),"
+    "laplace_mask_has_value(mask,'kind','file') OR laplace_mask_has_value(mask,'kind','record') OR laplace_mask_has_value(mask,'kind','claim') "
+    "FROM physicality WHERE entity=ANY($1)",1,NULL };
+static void read_levels(lp_idmap *t, Oid idarr, MemoryContext keep, bool labels){
+    size_t begin=0,end=lp_idmap_count(t),window=frontier_window_ids();
+    while(begin<end){
+      /* Only newly discovered nodes form the next frontier. Shared descendants
+       * of every requested root are read once in this Native context. */
+      for(size_t at=begin;at<end;){
+        size_t stop=at+Min(window,end-at),nwant=0;
+        lp_id *want=palloc((stop-at)*sizeof(lp_id));
+        for(;at<stop;at++)if(!((TNode *)lp_idmap_at(t,at))->have)want[nwant++]=*lp_idmap_key(t,at);
+        if(!nwant){pfree(want);continue;}
+        ArrayType *ids=id_array_of(get_element_type(idarr),want,(int)nwant);
+        Datum arg = PointerGetDatum(ids);
+        kept_run(labels ? &label_level_kept : &level_kept, &idarr, &arg);
+        if (!labels && SPI_processed != nwant) ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
         for (uint64 j = 0; j < SPI_processed; j++) {
             bool nl; lp_id id; memcpy(&id, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nl)), 16);
+            bool tuple=false,opaque=false;
+            if(labels){
+              tuple=DatumGetBool(SPI_getbinval(SPI_tuptable->vals[j],SPI_tuptable->tupdesc,3,&nl));
+              opaque=!tuple && DatumGetBool(SPI_getbinval(SPI_tuptable->vals[j],SPI_tuptable->tupdesc,4,&nl));
+            }
+            if(opaque){TNode *me=lp_idmap_at(t,tnode(t,&id));me->have=true;me->opaque=true;continue;}
             bytea *e = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nl));
-            lp_path p = lp_path_of((const uint8_t *)VARDATA_ANY(e), VARSIZE_ANY_EXHDR(e)); size_t n = lp_path_len(p);
-            uint32 *kid = MemoryContextAlloc(keep, sizeof(uint32) * (n ? n : 1)), k = 0;
-            for (size_t i = 0; i < p.n; i++) { lp_id cid = lp_path_id(p, i); uint32 c = tnode(t, &cid); for (uint32 r = 0; r < lp_path_run(p, i); r++) kid[k++] = c; }
-            TNode *me = lp_idmap_at(t, tnode(t, &id)); me->kid = kid; me->nkid = (uint32)n; me->have = true;
+            lp_path p = lp_path_of((const uint8_t *)VARDATA_ANY(e), VARSIZE_ANY_EXHDR(e));
+            TChild *kid=MemoryContextAlloc(keep,sizeof(TChild)*(p.n ? p.n : 1));
+            for(size_t i=0;i<p.n;i++){lp_id cid=lp_path_id(p,i);kid[i]=(TChild){tnode(t,&cid),lp_path_run(p,i)};}
+            TNode *me=lp_idmap_at(t,tnode(t,&id));me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;
         }
-        SPI_freetuptable(SPI_tuptable); lp_vec_free(&want);
+        if(labels)for(size_t i=0;i<nwant;i++){
+          TNode *me=lp_idmap_at(t,(size_t)lp_idmap_find(t,want+i));
+          if(!me->have){me->have=true;me->opaque=true;}
+        }
+        SPI_freetuptable(SPI_tuptable);pfree(ids);pfree(want);
+      }
+      begin=end;end=lp_idmap_count(t);
     }
 }
-static void render(lp_idmap *t, uint32 i, StringInfo out){
-    const TNode *x = lp_idmap_at(t, i); int64 cp = x->nkid ? -1 : lp_tier0_codepoint(lp_pg_tier0(), lp_idmap_key(t, i));
+static void render(lp_idmap *t, size_t i, StringInfo out){
+    check_stack_depth();CHECK_FOR_INTERRUPTS();
+    TNode *x = lp_idmap_at(t, i); int64 cp = x->nkid ? -1 : lp_tier0_codepoint(lp_pg_tier0(), lp_idmap_key(t, i));
     if (cp >= 0) { uint8_t u[4]; appendBinaryStringInfo(out, (const char *)u, (int)lp_utf8_put((uint32)cp, u)); return; }
-    for (uint32 k = 0; k < x->nkid; k++) render(t, ((const TNode *)lp_idmap_at(t, i))->kid[k], out);
+    if(x->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_text: cyclic composition")));
+    x->rendering=true;
+    for(size_t k=0;k<x->nkid;k++)for(uint32 r=0;r<x->kid[k].run;r++)render(t,x->kid[k].node,out);
+    x->rendering=false;
+}
+static bool text_surface(lp_idmap *t,size_t i){
+    check_stack_depth();CHECK_FOR_INTERRUPTS();TNode *x=lp_idmap_at(t,i);
+    if(x->opaque || x->tuple)return false;
+    if(x->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
+    if(x->text_state)return x->text_state==1;
+    if(!x->nkid){x->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,i))>=0 ? 1 : 2;return x->text_state==1;}
+    x->text_state=3;
+    for(size_t k=0;k<x->nkid;k++)if(!text_surface(t,x->kid[k].node)){x->text_state=2;return false;}
+    x->text_state=1;return true;
+}
+static void render_label(lp_idmap *t,size_t i,StringInfo out){
+    check_stack_depth();CHECK_FOR_INTERRUPTS();TNode *x=lp_idmap_at(t,i);
+    if(!x->opaque && x->tuple){
+      if(x->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
+      x->rendering=true;appendStringInfoChar(out,'[');
+      for(size_t k=0;k<x->nkid;k++){
+        if(k)appendStringInfoString(out," · ");render_label(t,x->kid[k].node,out);
+        if(x->kid[k].run>1)appendStringInfo(out," × %u",x->kid[k].run);
+      }
+      appendStringInfoChar(out,']');x->rendering=false;
+    }else if(text_surface(t,i))render(t,i,out);
+    else{char hex[33];lp_id_hex(lp_idmap_key(t,i),hex);appendStringInfoString(out,hex);}
 }
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
     StringInfoData out; initStringInfo(&out); MemoryContext keep = CurrentMemoryContext;
-    lp_idmap *t = lp_idmap_sized(sizeof(TNode)); uint32 root = tnode(t, (const lp_id *)PG_GETARG_POINTER(0));
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
-    read_levels(t, get_array_type(get_fn_expr_argtype(fcinfo->flinfo, 0)), keep);
-    SPI_finish();
-    render(t, root, &out); lp_idmap_free(t);
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode)); size_t root = tnode(t, (const lp_id *)PG_GETARG_POINTER(0));
+    PG_TRY();{
+      if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
+      read_levels(t, get_array_type(get_fn_expr_argtype(fcinfo->flinfo, 0)), keep,false);
+      SPI_finish();render(t,root,&out);
+    }PG_FINALLY();{lp_idmap_free(t);}PG_END_TRY();
     PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
+static Datum realize_batch(FunctionCallInfo fcinfo,bool labels){
+    TupleDesc td;Tuplestorestate *ts=set_begin(fcinfo,labels ? "laplace_labels" : "laplace_text_batch",&td);
+    MemoryContext keep=CurrentMemoryContext;
+    int n;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n);
+    lp_idmap *t=lp_idmap_sized(sizeof(TNode));size_t *roots=palloc(Max(n,1)*sizeof(size_t));
+    PG_TRY();{
+      for(int i=0;i<n;i++)roots[i]=tnode(t,ids+i);
+      if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_text_batch: SPI")));
+      read_levels(t,get_fn_expr_argtype(fcinfo->flinfo,0),keep,labels);
+      SPI_finish();
+      for(int i=0;i<n;i++){
+        StringInfoData out;initStringInfo(&out);
+        if(labels)render_label(t,roots[i],&out);else render(t,roots[i],&out);
+        text *content=cstring_to_text_with_len(out.data,out.len);
+        Datum values[]={Int64GetDatum((int64)i+1),PointerGetDatum(ids+i),PointerGetDatum(content)};
+        bool nulls[]={false,false,false};set_put(fcinfo,ts,td,values,nulls);
+        pfree(content);pfree(out.data);
+      }
+    }PG_FINALLY();{lp_idmap_free(t);}PG_END_TRY();
+    pfree(roots);pfree(ids);PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_text_batch);
+Datum laplace_text_batch(PG_FUNCTION_ARGS){return realize_batch(fcinfo,false);}
+PG_FUNCTION_INFO_V1(laplace_labels);
+Datum laplace_labels(PG_FUNCTION_ARGS){return realize_batch(fcinfo,true);}
 
 /* ---------------------------------------------------------------- the web: what tugs back when a strand is pulled
  * A claim is content like any other, hashed over its parts. A tier is a floor: what holds an entity sits above it, at
@@ -528,7 +608,9 @@ Datum laplace_text(PG_FUNCTION_ARGS){
  * the IDs held. */
 static Kept claims_kept = { "laplace_claims",
     "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL };
+    "WHERE p.tier > (SELECT max(COALESCE(e.tier,CASE WHEN laplace_codepoint(u.id) IS NOT NULL THEN 0 END)) "
+    "FROM unnest($1) u(id) LEFT JOIN entity e ON e.id=u.id) "
+    "AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL };
 SET_FN(laplace_claims, claims_kept)
 /* laplace_claims_each(ids, fan, bits, refuse): for each of a set of entities, the claims holding it, none refused: one
  * call for a whole level of a walk. At most fan an entity, whichever the scan meets first: a caller asks for one more
@@ -537,9 +619,10 @@ SET_FN(laplace_claims, claims_kept)
  * claim), so the path alone is the index condition and the bits are a check on the rows found: the kind bit's posting
  * list is every claim. */
 static Kept each_kept = { "laplace_claims_each",
-    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
+    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) LEFT JOIN entity e ON e.id = u.id "
     "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) AND NOT laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL };
+    "WHERE p.tier > COALESCE(e.tier,CASE WHEN laplace_codepoint(u.id) IS NOT NULL THEN 0 END) "
+    "AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) AND NOT laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL };
 SET_FN(laplace_claims_each, each_kept)
 /* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
  * direct constituents, so what holds the parts sits above the highest of them, at no fixed distance: every tier above

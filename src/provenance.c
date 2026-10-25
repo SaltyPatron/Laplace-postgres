@@ -31,20 +31,6 @@ typedef lp_vec(PgAttrRow) PgAttrRows;
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots, PgAttrRows *out);
 
-/* Parameter construction holds Datum pointers plus the packed ID array;
- * indexed containment additionally retains one decoded ID array. Account for
- * the larger live set, and PostgreSQL's actual array allocation boundary.
- * This only sizes temporary buffers: every frontier ID is still processed. */
-static size_t frontier_window_ids(void)
-{
-    uint64 bytes = (uint64)work_mem * 1024;
-    size_t overhead = ARR_OVERHEAD_NONULLS(1);
-    size_t per_id = Max(sizeof(Datum) + sizeof(lp_id), 2 * sizeof(lp_id));
-    size_t array_ids = (MaxAllocSize - overhead) / sizeof(lp_id);
-    size_t budget_ids = bytes > overhead ? (size_t)((bytes - overhead) / per_id) : 0;
-    return Max((size_t)1, Min(budget_ids, array_ids));
-}
-
 static long frontier_fetch_rows(Portal scan)
 {
     PlannedStmt *statement = PortalGetPrimaryStmt(scan);
@@ -76,10 +62,14 @@ static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
     return &d->e.v[k];
 }
 
-static double *pg_down_from(const PgDag *d, size_t top)
+typedef struct { size_t *head, *link, *order, n; } PgDown;
+
+/* Source roots share one containment DAG. Its adjacency and topological order
+ * do not depend on which root is being counted; prepare them once, rather than
+ * rebuilding both over the entire estate for each witness. */
+static PgDown pg_down_prepare(const PgDag *d)
 {
     size_t n = d->n.n;
-    double *cnt = palloc0((n ? n : 1) * sizeof(double));
     int *indeg = palloc0((n ? n : 1) * sizeof(int));
     size_t *head = palloc((n ? n : 1) * sizeof(size_t));
     size_t *link = palloc((d->e.n ? d->e.n : 1) * sizeof(size_t));
@@ -91,18 +81,38 @@ static double *pg_down_from(const PgDag *d, size_t top)
     }
     size_t *q = palloc((n ? n : 1) * sizeof(size_t)), qh = 0, qt = 0;
     for (size_t i = 0; i < n; i++) if (!indeg[i]) q[qt++] = i;
-    cnt[top] = 1.0;
     while (qh < qt) {
         if (!(qh & 4095)) CHECK_FOR_INTERRUPTS();
         size_t p = q[qh++];
         for (size_t k = head[p]; k != PG_NONE; k = link[k]) {
             size_t c = d->e.v[k].c;
-            cnt[c] += cnt[p] * (double)d->e.v[k].times;
             if (!--indeg[c]) q[qt++] = c;
         }
     }
-    pfree(indeg); pfree(head); pfree(link); pfree(q);
+    pfree(indeg);
+    return (PgDown){head,link,q,qt};
+}
+
+static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
+{
+    size_t n = d->n.n;
+    double *cnt = palloc0((n ? n : 1) * sizeof(double));
+    cnt[top] = 1.0;
+    for (size_t i = 0; i < walk->n; i++) {
+        if (!(i & 4095)) CHECK_FOR_INTERRUPTS();
+        size_t p = walk->order[i];
+        /* Topology is already established, so an unreachable parent needs no
+         * edge arithmetic. Reachable additions retain their original order. */
+        if (cnt[p] == 0) continue;
+        for (size_t k = walk->head[p]; k != PG_NONE; k = walk->link[k])
+            cnt[d->e.v[k].c] += cnt[p] * (double)d->e.v[k].times;
+    }
     return cnt;
+}
+
+static void pg_down_free(PgDown *walk)
+{
+    pfree(walk->head); pfree(walk->link); pfree(walk->order);
 }
 
 static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_claim)
@@ -252,10 +262,12 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         }
         lp_vec_free(&rows);
     }
+    PgDown walk={0};
+    if(!reverse)walk=pg_down_prepare(&d);
     for(size_t i=0;!reverse && i<lp_idmap_count(roots);i++){
         const lp_id *root=lp_idmap_keys(roots)+i;
         size_t top=(size_t)lp_idmap_find(d.m,root);
-        double *counts=pg_down_from(&d,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
+        double *counts=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d,counts,per_claim);
         for(size_t j=0;j<lp_strmap_count(per_claim);j++){
             const PgTally *t=lp_strmap_at(per_claim,j);if(t->games<=0)continue;
@@ -269,6 +281,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         }
         lp_strmap_free(per_claim);pfree(counts);
     }
+    if(!reverse)pg_down_free(&walk);
     lp_idmap_free(selected);lp_idmap_free(roots);lp_idmap_free(seen);lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);SPI_finish();
     PG_RETURN_NULL();
 }
@@ -417,6 +430,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         if (roots ? lp_idmap_find(roots,&d.n.v[i].id)>=0
                   : d.n.v[i].nparents == 0 || (include_files && d.n.v[i].file) || lp_idmap_lookup(wmap, &d.n.v[i].id)) lp_push(&rix, i);
 
+    PgDown walk=pg_down_prepare(&d);
     for (size_t r = 0; r < rix.n; r++) {
         size_t top = rix.v[r];
         lp_id tid = d.n.v[top].id;
@@ -424,7 +438,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         int is_w = (wtr != NULL);
         double tr = is_w ? *wtr : 0.0;
         if (witnessed_only && (!is_w || tr <= 0.0)) continue;
-        double *cnt = pg_down_from(&d, top);
+        double *cnt = pg_down_from(&d, &walk, top);
         lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d, cnt, per_claim);
         for (size_t i = 0; i < lp_strmap_count(per_claim); i++) {
@@ -438,6 +452,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         lp_strmap_free(per_claim);
         pfree(cnt);
     }
+    pg_down_free(&walk);
     lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
 
     /* Largest-remainder basis-point attribution per claim across witnessed trunks with positive weight */
