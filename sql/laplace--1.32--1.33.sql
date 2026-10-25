@@ -13,3 +13,9 @@ RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_text_batch'
 LANGUAGE C STABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION laplace_text_batch(blake3[]) IS
   'Realize selected Native identities together, preserving input occurrences and runs while reading shared DAG descendants once. Transfer windows follow work_mem and PostgreSQL array capacity.';
+
+CREATE FUNCTION laplace_labels(ids blake3[],OUT i bigint,OUT entity blake3,OUT content text)
+RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_labels'
+LANGUAGE C STABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION laplace_labels(blake3[]) IS
+  'Native selected-ID labels in one DAG context: Unicode text and ordered tuple/run structure. Other structural roles and missing realizations retain their canonical identity; package bodies are not reconstructed to label them.';

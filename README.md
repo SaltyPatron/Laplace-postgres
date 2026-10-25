@@ -33,6 +33,10 @@ occurrences and compressed runs, and reads shared descendants once. Scalar
 transfer windows follow `work_mem` and PostgreSQL's actual array capacity.
 There is no separate 64-level text rejection. Cyclic carriers are rejected and
 the server's stack/resource checks still apply.
+`laplace_labels` uses that reader for selected-ID display: Unicode text and
+ordered tuples with their runs. It retains canonical IDs for other structural
+roles or missing realizations, and does not reconstruct a package body to label
+the package. Labels remain output; they are never lookup or traversal keys.
 
 Containment provenance prepares a DAG's adjacency and topological order once
 for all requested witness roots. Root-local path counts use that shared plan

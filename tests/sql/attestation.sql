@@ -44,7 +44,8 @@ SAVEPOINT native_batch_realization;
 DO $$
 DECLARE deep blake3:=laplace_id('dog'); bang blake3:=laplace_cp_id(ascii('!'));
         lambda blake3:=laplace_cp_id(ascii('λ')); chinese blake3:=laplace_cp_id(ascii('中'));
-        repeated blake3; expected text:='dog'||repeat('!',70); actual text[];
+        repeated blake3; tuple blake3; tuple_run blake3; nested_tuple blake3; package blake3;
+        expected text:='dog'||repeat('!',70); actual text[];
 BEGIN
   -- Linear-size content with more than the former 64-level rejection: every
   -- identity, coordinate and packed path is made by the Native operators.
@@ -55,6 +56,16 @@ BEGIN
      OR laplace_text(deep)<>expected
      OR EXISTS(SELECT FROM laplace_text_batch(ARRAY[]::blake3[])) THEN
     RAISE EXCEPTION 'batch realization changed Unicode, runs, occurrences or deep Native content';
+  END IF;
+  tuple:=pg_temp.series_node(ARRAY[laplace_id('dog'),lambda,chinese],'tuple');
+  tuple_run:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[2]),'tuple');
+  nested_tuple:=pg_temp.series_node(ARRAY[tuple,tuple_run],'tuple');
+  package:=pg_temp.series_node(ARRAY[laplace_id('file'),deep],'file');
+  SELECT array_agg(content ORDER BY i) INTO actual
+  FROM laplace_labels(ARRAY[tuple,tuple_run,nested_tuple,package,'00000000000000000000000000000000'::blake3,deep]);
+  IF actual IS DISTINCT FROM ARRAY['[dog · λ · 中]','[dog × 2]','[[dog · λ · 中] · [dog × 2]]',
+                                  package::text,'00000000000000000000000000000000',expected] THEN
+    RAISE EXCEPTION 'Native labels changed tuple structure, runs or selected identities';
   END IF;
   BEGIN
     UPDATE physicality SET path=laplace_path(ARRAY[deep,bang]) WHERE entity=deep;
