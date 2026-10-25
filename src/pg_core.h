@@ -14,6 +14,18 @@
 const lp_tier0_record *lp_pg_tier0(void);
 lp_text *lp_pg_text_context(void);
 
+/* The live parameter buffers and the actual PostgreSQL array boundary size
+ * every indexed frontier transfer. This is a window, never an input limit. */
+static inline size_t frontier_window_ids(void)
+{
+    uint64 bytes = (uint64)work_mem * 1024;
+    size_t overhead = ARR_OVERHEAD_NONULLS(1);
+    size_t per_id = Max(sizeof(Datum) + sizeof(lp_id), 2 * sizeof(lp_id));
+    size_t array_ids = (MaxAllocSize - overhead) / sizeof(lp_id);
+    size_t budget_ids = bytes > overhead ? (size_t)((bytes - overhead) / per_id) : 0;
+    return Max((size_t)1, Min(budget_ids, array_ids));
+}
+
 static inline Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
 
 static inline ArrayType *id_array_of(Oid el, const lp_id *ids, int n){

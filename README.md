@@ -24,6 +24,21 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 Provenance is containment (`LP_SAID_RECORD`, `LP_SAID_CLAIM` vertices under each file's trunk in `physicality`), walked natively in C by `laplace_attested(claims blake3[], scope blake3[] DEFAULT '{}')` and aggregated into Glicko-2 Fisher-information basis-point shares (`share_bp` summing to `10000`) by `laplace_attribution(claims blake3[], scope blake3[] DEFAULT '{}')`.
 
+Native set reads own claim acquisition and realization. `laplace_claims` and
+`laplace_claims_each` accept the caller's fan, or SQL `NULL` for all responders;
+virtual Tier-0 selectors do not require stored entity rows. `laplace_text_batch`
+realizes an ordered set of selected IDs in one context, preserves duplicate input
+occurrences and compressed runs, and reads shared descendants once. Scalar
+`laplace_text` uses the same reader. Newly discovered nodes form each frontier;
+transfer windows follow `work_mem` and PostgreSQL's actual array capacity.
+There is no separate 64-level text rejection. Cyclic carriers are rejected and
+the server's stack/resource checks still apply.
+
+Containment provenance prepares a DAG's adjacency and topological order once
+for all requested witness roots. Root-local path counts use that shared plan
+and skip unreachable branches; games, signed outcomes, dependence roots and
+attribution retain their existing Native meanings.
+
 ## CI installation boundary
 
 Pull-request CI builds a candidate and runs `tests/extension-install.sh` against a private `DESTDIR` package and a newly created test database. PostgreSQL 18's `extension_control_path` selects that package. Only its private control file is rewritten to reference the candidate module; an assertion checks every extension C function's module binding. The test executes `laplace_isa()` and removes its database and package. Failed database cleanup preserves the package and fails the job.

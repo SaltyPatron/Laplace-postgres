@@ -23,8 +23,10 @@ LANGUAGE plpgsql AS $$
 DECLARE composed blake3 := laplace_compose(parts); point geometry; path geometry := laplace_path(parts);
         coord geometry; altitude smallint; hilbert bigint; carrier bit(64) := B'0'::bit(64); i integer;
 BEGIN
-  SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(e.coord)), (max(e.tier) + 1)::smallint
-    INTO coord, altitude FROM unnest(parts) p JOIN entity e ON e.id = p;
+  SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(
+           coalesce(e.coord,ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(p)))))),
+         (max(coalesce(e.tier,0)) + 1)::smallint
+    INTO coord, altitude FROM unnest(parts) p LEFT JOIN entity e ON e.id = p;
   hilbert := laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
   IF kind IS NOT NULL THEN carrier := laplace_mask_slot('kind', kind); END IF;
   IF metadata IS NOT NULL THEN
@@ -38,6 +40,31 @@ BEGIN
   INSERT INTO physicality (entity, tier, hilbert, path, mask) VALUES (composed, altitude, hilbert, path, carrier) ON CONFLICT DO NOTHING;
   RETURN composed;
 END $$;
+SAVEPOINT native_batch_realization;
+DO $$
+DECLARE deep blake3:=laplace_id('dog'); bang blake3:=laplace_cp_id(ascii('!'));
+        lambda blake3:=laplace_cp_id(ascii('λ')); chinese blake3:=laplace_cp_id(ascii('中'));
+        repeated blake3; expected text:='dog'||repeat('!',70); actual text[];
+BEGIN
+  -- Linear-size content with more than the former 64-level rejection: every
+  -- identity, coordinate and packed path is made by the Native operators.
+  FOR i IN 1..70 LOOP deep:=pg_temp.series_node(ARRAY[deep,bang]); END LOOP;
+  repeated:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[3]));
+  SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_text_batch(ARRAY[lambda,deep,chinese,deep,repeated]);
+  IF actual IS DISTINCT FROM ARRAY['λ',expected,'中',expected,'dogdogdog']
+     OR laplace_text(deep)<>expected
+     OR EXISTS(SELECT FROM laplace_text_batch(ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'batch realization changed Unicode, runs, occurrences or deep Native content';
+  END IF;
+  BEGIN
+    UPDATE physicality SET path=laplace_path(ARRAY[deep,bang]) WHERE entity=deep;
+    PERFORM laplace_text_batch(ARRAY[deep]);
+    RAISE EXCEPTION 'cyclic Native carrier accepted';
+  EXCEPTION WHEN data_exception THEN NULL; END;
+  IF laplace_text(deep)<>expected THEN RAISE EXCEPTION 'failed realization poisoned the next Native read'; END IF;
+END $$;
+ROLLBACK TO native_batch_realization;
+RELEASE native_batch_realization;
 CREATE TEMP TABLE series_claims (name text PRIMARY KEY, id blake3);
 INSERT INTO series_claims VALUES
   ('a', pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')], 'claim')),
@@ -58,6 +85,41 @@ BEGIN
     INSERT INTO series_sources VALUES (source_name, pg_temp.series_node(ARRAY[source_meta,file_trunk], 'file', ARRAY[4294967296,5368709120]::bigint[]));
   END LOOP;
 END $$;
+-- The same prepared topology serves independent roots and a root containing
+-- another requested root. Zero-count branches must not affect the latter's
+-- own series, and batching/reordering roots cannot change any testimony field.
+SAVEPOINT shared_downward_topology;
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        one_root blake3 := (SELECT id FROM series_sources WHERE name='one');
+        two_root blake3 := (SELECT id FROM series_sources WHERE name='two');
+        only_a blake3; nested blake3; roots blake3[];
+BEGIN
+  only_a := pg_temp.series_node(array_fill(a,ARRAY[7]) || ARRAY[laplace_id('three')],
+      'record',ARRAY[2147483648,0]::bigint[]);
+  nested := pg_temp.series_node(ARRAY[one_root,only_a],
+      'file',ARRAY[5368709120,5368709120]::bigint[]);
+  roots := ARRAY[two_root,nested,only_a,one_root,two_root];
+  IF EXISTS (
+    (SELECT * FROM laplace_contained_series(roots)
+     EXCEPT ALL
+     SELECT s.* FROM unnest(ARRAY[one_root,two_root,nested,only_a]) r
+       CROSS JOIN LATERAL laplace_contained_series(ARRAY[r]) s)
+    UNION ALL
+    (SELECT s.* FROM unnest(ARRAY[one_root,two_root,nested,only_a]) r
+       CROSS JOIN LATERAL laplace_contained_series(ARRAY[r]) s
+     EXCEPT ALL
+     SELECT * FROM laplace_contained_series(roots))
+  ) THEN RAISE EXCEPTION 'shared downward topology changed root-local testimony'; END IF;
+  IF (SELECT games FROM laplace_contained_series(roots) WHERE trunk=nested AND claim=a)<>1007
+     OR (SELECT games FROM laplace_contained_series(roots) WHERE trunk=one_root AND claim=a)<>1000
+     OR (SELECT games FROM laplace_contained_series(roots) WHERE trunk=only_a AND claim=a)<>7
+     OR (SELECT count(*) FROM laplace_contained_series(roots))<>7 THEN
+    RAISE EXCEPTION 'nested or disjoint root counts changed';
+  END IF;
+END $$;
+ROLLBACK TO shared_downward_topology;
+RELEASE shared_downward_topology;
 INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
   FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'one';
 DO $$
@@ -186,6 +248,36 @@ INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 3, 1, 0.85
   FROM series_claims c, series_sources w WHERE c.name = 'b' AND w.name = 'one';
 SELECT laplace_attest_series('stage.attestation_test', ARRAY[(SELECT id FROM series_claims WHERE name = 'b')]) = 1;
 CREATE TEMP TABLE series_untouched AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'b');
+SAVEPOINT native_claim_set_reader;
+DO $$
+DECLARE floor_claim blake3; root blake3; dog blake3:=laplace_id('dog');
+        floor_id blake3:=laplace_cp_id(ascii('!')); first_id blake3;
+BEGIN
+  floor_claim:=pg_temp.series_node(ARRAY[floor_id,laplace_id('is'),laplace_id('noun')],'claim');
+  root:=pg_temp.series_node(ARRAY[floor_claim,laplace_id('three')],'record',ARRAY[2147483648,0]::bigint[]);
+  INSERT INTO witness VALUES(root,NULL,0.85);
+  INSERT INTO stage.attestation_test VALUES(floor_claim,root,NULL,1,1,0.85);
+  PERFORM laplace_attest_series('stage.attestation_test',ARRAY[floor_claim]);
+  IF EXISTS(SELECT FROM entity WHERE id=floor_id)
+     OR (SELECT count(*) FROM laplace_claims_each(ARRAY[floor_id],NULL,'{}','{}'))<>1
+     OR (SELECT count(*) FROM laplace_claims(ARRAY[floor_id],NULL,'{}','{}'))<>1 THEN
+    RAISE EXCEPTION 'Native claim reader lost the virtual floor or materialized it';
+  END IF;
+  IF (SELECT count(*) FROM laplace_claims_each(ARRAY[dog,dog],NULL,'{}','{}'))<>4
+     OR (SELECT count(DISTINCT i) FROM laplace_claims_each(ARRAY[dog,dog],NULL,'{}','{}'))<>2
+     OR (SELECT count(*) FROM laplace_claims_each(ARRAY[dog],1,'{}','{}'))<>1
+     OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[dog],0,'{}','{}'))
+     OR EXISTS(SELECT FROM laplace_claims_each(NULL,NULL,'{}','{}'))
+     OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[dog],NULL,'{}',ARRAY[laplace_id('is')])) THEN
+    RAISE EXCEPTION 'Native occurrence, caller fan, NULL or refusal contract changed';
+  END IF;
+  SELECT entity INTO first_id FROM laplace_claims(ARRAY[dog],NULL,'{}','{}') ORDER BY entity LIMIT 1;
+  IF first_id IS DISTINCT FROM (SELECT entity FROM laplace_claims(ARRAY[dog],1,'{}','{}')) THEN
+    RAISE EXCEPTION 'bounded Native claim selection changed its declared ID order';
+  END IF;
+END $$;
+ROLLBACK TO native_claim_set_reader;
+RELEASE native_claim_set_reader;
 INSERT INTO stage.attestation_test SELECT c.id, w.id, NULL, 1000, 1, 0.85
   FROM series_claims c, series_sources w WHERE c.name = 'a' AND w.name = 'two';
 DO $$
