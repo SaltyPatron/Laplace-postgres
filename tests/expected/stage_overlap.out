@@ -1,0 +1,38 @@
+Parsed test spec with 3 sessions
+
+starting permutation: begin_first publish_first publish_second overlap_wait commit_first verify_complete
+step begin_first: BEGIN;
+step publish_first: SELECT * FROM laplace_merge_stage('stage.overlap_a_entities','stage.overlap_a_paths');
+entity_rows|physicality_rows|updated_rows
+-----------+----------------+------------
+          1|               1|           0
+(1 row)
+
+step publish_second: SELECT * FROM laplace_merge_stage('stage.overlap_b_entities','stage.overlap_b_paths'); <waiting ...>
+step overlap_wait: 
+  SELECT wait_event_type,wait_event FROM pg_stat_activity
+  WHERE datname=current_database() AND application_name='laplace_stage_overlap';
+
+wait_event_type|wait_event   
+---------------+-------------
+Lock           |transactionid
+(1 row)
+
+step commit_first: COMMIT;
+step publish_second: <... completed>
+entity_rows|physicality_rows|updated_rows
+-----------+----------------+------------
+          0|               0|           0
+(1 row)
+
+step verify_complete: 
+  SELECT (SELECT count(*) FROM public.entity WHERE id=laplace_id('overlap')) AS entities,
+         (SELECT count(*) FROM public.physicality WHERE entity=laplace_id('overlap')) AS paths,
+         (SELECT count(*) FROM stage.overlap_b_entities) AS pending_entities,
+         (SELECT count(*) FROM stage.overlap_b_paths) AS pending_paths;
+
+entities|paths|pending_entities|pending_paths
+--------+-----+----------------+-------------
+       1|    1|               0|            0
+(1 row)
+

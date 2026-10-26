@@ -115,4 +115,56 @@ DO $$ DECLARE remaining bigint; cleaned bigint; untouched bigint; BEGIN
     RAISE EXCEPTION 'maintenance accepted public input';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- A client's positive classifications survive staging. Only claimed-new keys
+-- participate in the final flat overlap check, including ordinary replay.
+TRUNCATE stage.merge_entities,stage.merge_paths;
+ALTER TABLE stage.merge_entities ADD COLUMN present boolean NOT NULL DEFAULT true;
+ALTER TABLE stage.merge_paths ADD COLUMN present boolean NOT NULL DEFAULT true;
+SELECT pg_temp.fill_stage();
+DO $$ DECLARE result record; BEGIN
+  IF EXISTS(SELECT FROM laplace_present_stage('stage.merge_entities','public.entity','id','present'))
+     OR EXISTS(SELECT FROM laplace_present_stage('stage.merge_paths','public.physicality','entity','present')) THEN
+    RAISE EXCEPTION 'positive client classifications were probed again';
+  END IF;
+  SELECT * INTO result FROM laplace_merge_stage('stage.merge_entities','stage.merge_paths');
+  IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>0 THEN
+    RAISE EXCEPTION 'classified replay changed canonical rows';
+  END IF;
+  IF EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory'
+            AND classid=1279348803::oid AND objid=4294967294::oid) THEN
+    RAISE EXCEPTION 'structural merge retained a global apply lock';
+  END IF;
+END $$;
+SELECT pg_temp.fill_stage();
+UPDATE stage.merge_entities SET present=false;
+UPDATE stage.merge_paths SET present=false;
+DO $$ DECLARE result record; BEGIN
+  IF (SELECT count(*) FROM laplace_present_stage('stage.merge_entities','public.entity','id','present'))<>3
+     OR (SELECT count(*) FROM laplace_present_stage('stage.merge_paths','public.physicality','entity','present'))<>3 THEN
+    RAISE EXCEPTION 'flat verification lost an overlapping canonical ID';
+  END IF;
+  SELECT * INTO result FROM laplace_merge_stage('stage.merge_entities','stage.merge_paths');
+  IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>0 THEN
+    RAISE EXCEPTION 'overlap verification inserted duplicate canonical rows';
+  END IF;
+  IF to_regclass(format('stage.lp_plan_%s_%s','stage.merge_entities'::regclass::oid,'stage.merge_paths'::regclass::oid)) IS NOT NULL THEN
+    RAISE EXCEPTION 'merge retained its private classification plan';
+  END IF;
+END $$;
+-- Existing content needs no coordinate/Hilbert retransmission. A metadata-only
+-- update keeps the recorded path while adding a genuinely new carrier role.
+ALTER TABLE stage.merge_entities ALTER coord DROP NOT NULL,ALTER hilbert DROP NOT NULL;
+ALTER TABLE stage.merge_paths ALTER path DROP NOT NULL,ALTER hilbert DROP NOT NULL;
+SELECT pg_temp.fill_stage();
+UPDATE stage.merge_entities SET coord=NULL,hilbert=NULL;
+UPDATE stage.merge_paths SET path=NULL,hilbert=NULL,mask=laplace_mask_slot('kind','record');
+DO $$ DECLARE result record; BEGIN
+  SELECT * INTO result FROM laplace_merge_stage('stage.merge_entities','stage.merge_paths');
+  IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>3
+     OR EXISTS(SELECT FROM unnest(ARRAY['dog','cat','ant']) t JOIN public.physicality p ON p.entity=laplace_id(t)
+       WHERE NOT laplace_mask_has_value(p.mask,'kind','record')
+          OR laplace_text(p.entity)<>t) THEN
+    RAISE EXCEPTION 'metadata-only update changed content or lost its new role';
+  END IF;
+END $$;
 ROLLBACK;
