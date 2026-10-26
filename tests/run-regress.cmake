@@ -10,6 +10,9 @@ set(package "${build_root}/regress-package")
 set(output "${build_root}/regress-output")
 set(instance "${build_root}/regress-instance")
 file(MAKE_DIRECTORY "${package}/extension" "${output}")
+# pg_regress feeds scripts on stdin, so psql's relative include has no script
+# directory. Keep the shared geometry fixture beside the driver's working dir.
+configure_file("${SOURCE}/tests/sql/geometry_cases.sql" "${build_root}/geometry_cases.sql" COPYONLY)
 file(GLOB scripts "${SOURCE}/sql/laplace--*.sql")
 file(COPY ${scripts} DESTINATION "${package}/extension")
 file(READ "${SOURCE}/laplace.control" control)
@@ -29,7 +32,10 @@ set(config "${build_root}/regress-postgresql.conf")
 file(WRITE "${config}"
   "extension_control_path = '${package}${separator}$system'\n"
   "laplace.tier0 = '${tier0}'\n"
-  "max_prepared_transactions = 0\n")
+  "max_prepared_transactions = 0\n"
+  # Cold install/upgrade cases retain multiple generations of the partitioned
+  # schema in one transaction; the default lock pool cannot hold those objects.
+  "max_locks_per_transaction = 256\n")
 # pg_regress owns only this instance path, all of which is inside this build.
 # Its temporary-instance mode stops the server and cleans its cluster on success.
 if(WIN32)
