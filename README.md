@@ -43,6 +43,29 @@ for all requested witness roots. Root-local path counts use that shared plan
 and skip unreachable branches; games, signed outcomes, dependence roots and
 attribution retain their existing Native meanings.
 
+`laplace_present_ids` accepts a complete client ID frontier. Native routes the
+IDs through the canonical range partitions and probes sorted arrays in their
+primary-key indexes, returning stored IDs and their original ordinals,
+including duplicate input occurrences. It checks parent-column SELECT
+permissions and rejects active row-level security. Virtual Tier-0 membership
+remains the client's perf-cache responsibility.
+
+`laplace_series_snapshot` and `laplace_stage_snapshot` share one Native batch
+calculation: carrier validation, witness registry, transitive lineage,
+containment testimony and the existing series solver. The stage API keeps the
+changed claim set in PostgreSQL. Explicit claim selections traverse upward
+directly; unselected source-trunk enumeration traverses downward. No speculative
+size threshold selects between them.
+
+`laplace_apply_series` accumulates the client's known new/previously staged
+series, publishes the stage-selected snapshot and consumes the delta in the
+caller's transaction. `laplace_attest_stage` and the array adapter
+`laplace_attest_series` use the same Native calculation and set-based
+UPDATE/INSERT/DELETE publication. They preserve cumulative replay, signed trust,
+dependence and removal of claims without evidence, without fixed claim slices
+or conflict-driven accumulation. Source registration retains its transaction
+boundary; these APIs do not independently commit it.
+
 `laplace_merge_stage` drains GIN pending entries for copied path partitions
 before consuming the staging tables and returning to provenance/series reads.
 `laplace_clean_stage` routes the copied IDs through the same Native partition

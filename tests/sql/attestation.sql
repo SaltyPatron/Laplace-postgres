@@ -235,6 +235,31 @@ BEGIN
     RAISE EXCEPTION 'snapshot accepted a non-claim';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- The stage-resident batch and the array adapter must share one Native
+-- calculation, including duplicate selections and evidence-free removals.
+CREATE UNLOGGED TABLE stage.attestation_selected (claim blake3);
+INSERT INTO stage.attestation_selected SELECT id FROM series_claims;
+INSERT INTO stage.attestation_selected SELECT id FROM series_claims WHERE name='a';
+CREATE TEMP TABLE series_selected AS TABLE stage.attestation_selected;
+DO $$
+DECLARE wanted blake3[] := ARRAY(SELECT claim FROM stage.attestation_selected);
+BEGIN
+  IF EXISTS (
+    (SELECT * FROM laplace_stage_snapshot('stage.attestation_test','stage.attestation_selected')
+     EXCEPT ALL SELECT * FROM laplace_series_snapshot('stage.attestation_test',wanted))
+    UNION ALL
+    (SELECT * FROM laplace_series_snapshot('stage.attestation_test',wanted)
+     EXCEPT ALL SELECT * FROM laplace_stage_snapshot('stage.attestation_test','series_selected'))
+  ) THEN RAISE EXCEPTION 'stage and array selections disagree'; END IF;
+  IF laplace_attest_stage('stage.attestation_test','stage.attestation_selected') <> 1
+     OR laplace_attest_stage('stage.attestation_test','series_selected') <> 1 THEN
+    RAISE EXCEPTION 'stage publication lost cumulative replay or selection deduplication';
+  END IF;
+  BEGIN
+    PERFORM laplace_stage_snapshot('stage.attestation_test','public.consensus');
+    RAISE EXCEPTION 'public changed-claim table accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); first consensus%ROWTYPE; expected record; result record;
 BEGIN
