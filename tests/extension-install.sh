@@ -121,6 +121,7 @@ SQL
 isolation="$LAPLACE_PG_DIR/lib/pgxs/src/test/isolation/isolationtester"
 [[ -x "$isolation" ]] || { echo "PostgreSQL isolation tester required: $isolation" >&2; exit 1; }
 "$isolation" "$connection" < "$source_root/tests/specs/stage_overlap.spec" > "$stage/stage-overlap.out"
+sed -i 's/[[:blank:]]*$//' "$stage/stage-overlap.out"
 cat "$stage/stage-overlap.out"
 diff -u "$source_root/tests/expected/stage_overlap.out" "$stage/stage-overlap.out"
 printf 'PASS candidate extension installed and executed in isolated database %s\n' "$db"

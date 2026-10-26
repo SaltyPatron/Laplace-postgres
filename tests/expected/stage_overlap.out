@@ -9,11 +9,11 @@ entity_rows|physicality_rows|updated_rows
 (1 row)
 
 step publish_second: SELECT * FROM laplace_merge_stage('stage.overlap_b_entities','stage.overlap_b_paths'); <waiting ...>
-step overlap_wait: 
+step overlap_wait:
   SELECT wait_event_type,wait_event FROM pg_stat_activity
   WHERE datname=current_database() AND application_name='laplace_stage_overlap';
 
-wait_event_type|wait_event   
+wait_event_type|wait_event
 ---------------+-------------
 Lock           |transactionid
 (1 row)
@@ -25,7 +25,7 @@ entity_rows|physicality_rows|updated_rows
           0|               0|           0
 (1 row)
 
-step verify_complete: 
+step verify_complete:
   SELECT (SELECT count(*) FROM public.entity WHERE id=laplace_id('overlap')) AS entities,
          (SELECT count(*) FROM public.physicality WHERE entity=laplace_id('overlap')) AS paths,
          (SELECT count(*) FROM stage.overlap_b_entities) AS pending_entities,

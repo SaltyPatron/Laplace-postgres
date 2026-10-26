@@ -120,7 +120,7 @@ END $$;
 TRUNCATE stage.merge_entities,stage.merge_paths;
 ALTER TABLE stage.merge_entities ADD COLUMN present boolean NOT NULL DEFAULT true;
 ALTER TABLE stage.merge_paths ADD COLUMN present boolean NOT NULL DEFAULT true;
-SELECT pg_temp.fill_stage();
+DO $ BEGIN PERFORM pg_temp.fill_stage(); END $;
 DO $$ DECLARE result record; BEGIN
   IF EXISTS(SELECT FROM laplace_present_stage('stage.merge_entities','public.entity','id','present'))
      OR EXISTS(SELECT FROM laplace_present_stage('stage.merge_paths','public.physicality','entity','present')) THEN
@@ -135,7 +135,7 @@ DO $$ DECLARE result record; BEGIN
     RAISE EXCEPTION 'structural merge retained a global apply lock';
   END IF;
 END $$;
-SELECT pg_temp.fill_stage();
+DO $ BEGIN PERFORM pg_temp.fill_stage(); END $;
 UPDATE stage.merge_entities SET present=false;
 UPDATE stage.merge_paths SET present=false;
 DO $$ DECLARE result record; BEGIN
@@ -155,7 +155,7 @@ END $$;
 -- update keeps the recorded path while adding a genuinely new carrier role.
 ALTER TABLE stage.merge_entities ALTER coord DROP NOT NULL,ALTER hilbert DROP NOT NULL;
 ALTER TABLE stage.merge_paths ALTER path DROP NOT NULL,ALTER hilbert DROP NOT NULL;
-SELECT pg_temp.fill_stage();
+DO $ BEGIN PERFORM pg_temp.fill_stage(); END $;
 UPDATE stage.merge_entities SET coord=NULL,hilbert=NULL;
 UPDATE stage.merge_paths SET path=NULL,hilbert=NULL,mask=laplace_mask_slot('kind','record');
 DO $$ DECLARE result record; BEGIN
