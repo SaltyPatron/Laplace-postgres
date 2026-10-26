@@ -5,6 +5,7 @@
 #include "access/table.h"
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_type_d.h"
@@ -13,12 +14,26 @@
 #include "utils/builtins.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/hsearch.h"
 #include "utils/partcache.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partbounds.h"
 #include <limits.h>
 
 typedef struct { Oid partition; lp_id id; ItemPointerData source; } EnrichmentKey;
+
+static Oid enrichment_partition(Oid target, PartitionKey key, PartitionDesc partitions, Datum value)
+{
+    if (partitions) {
+        bool equal;
+        int bound = partition_range_datum_bsearch(key->partsupfunc,
+            key->partcollation, partitions->boundinfo, 1, &value, &equal);
+        int index = partitions->boundinfo->indexes[bound + 1];
+        if (index < 0) index = partitions->boundinfo->default_index;
+        if (index >= 0) return partitions->oids[index];
+    }
+    return target;
+}
 
 static long enrichment_fetch_rows(void)
 {
@@ -166,16 +181,8 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
             Datum location = SPI_getbinval(tuples->vals[i], tuples->tupdesc, 2, &missing);
             if (missing) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_enrich_stage: null input location")));
             memcpy(&keys[i].source, DatumGetPointer(location), sizeof(ItemPointerData));
-            keys[i].partition = target;
-            if (range) {
-                Datum value = PointerGetDatum(&keys[i].id);
-                bool equal;
-                int bound = partition_range_datum_bsearch(partition_key->partsupfunc,
-                    partition_key->partcollation, partitions->boundinfo, 1, &value, &equal);
-                int index = partitions->boundinfo->indexes[bound + 1];
-                if (index < 0) index = partitions->boundinfo->default_index;
-                if (index >= 0) keys[i].partition = partitions->oids[index];
-            }
+            keys[i].partition = enrichment_partition(target, partition_key, partitions,
+                PointerGetDatum(&keys[i].id));
         }
         /* Nested SPI execution replaces SPI_tuptable. Copy routing keys and
          * release the fetched tuples before applying any destination set. */
@@ -201,4 +208,79 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
     table_close(parent, NoLock);
     pfree(source); pfree(destination); pfree(select); pfree(update);
     PG_RETURN_INT64((int64)updated);
+}
+
+/* Complete bulk index maintenance before repeated containment reads.
+ * Route copied IDs through the same Native partition bounds as enrichment;
+ * neither scan public paths again nor sweep unrelated destination indexes. */
+PG_FUNCTION_INFO_V1(laplace_clean_stage);
+Datum laplace_clean_stage(PG_FUNCTION_ARGS)
+{
+    Oid input = PG_GETARG_OID(0);
+    Relation stage = table_open(input, AccessShareLock);
+    Oid target = get_relname_relid("physicality", get_namespace_oid("public", false));
+    Relation parent = table_open(target, AccessShareLock);
+    Oid idtype = get_atttype(target, get_attnum(target, "entity"));
+    if (RelationGetNamespace(stage) != get_namespace_oid("stage", false)
+        || stage->rd_rel->relpersistence != RELPERSISTENCE_UNLOGGED
+        || stage->rd_rel->relkind != RELKIND_RELATION
+        || get_atttype(input, get_attnum(input, "entity")) != idtype)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                       errmsg("laplace_clean_stage requires an UNLOGGED stage table with Native entity IDs")));
+    List *inputs = find_all_inheritors(input, ShareLock, NULL);
+    list_free(inputs);
+    PartitionKey key = RelationGetPartitionKey(parent);
+    if (!key || key->strategy != PARTITION_STRATEGY_RANGE || key->partnatts != 1
+        || key->partattrs[0] != get_attnum(target, "entity"))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                       errmsg("laplace_clean_stage requires Native physicality range partitions")));
+    char *source = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)), RelationGetRelationName(stage));
+    char *selection = psprintf("SELECT entity FROM %s", source);
+    if (SPI_connect() != SPI_OK_CONNECT)
+        ereport(ERROR, (errmsg("laplace_clean_stage: SPI_connect")));
+    HASHCTL control = {.keysize=sizeof(Oid), .entrysize=sizeof(Oid)};
+    HTAB *touched = hash_create("Native copied path partitions",
+        Max(RelationGetPartitionDesc(parent, true)->nparts, 1), &control, HASH_ELEM | HASH_BLOBS);
+    SPIPlanPtr plan = SPI_prepare_cursor(selection, 0, NULL, CURSOR_OPT_NO_SCROLL);
+    if (!plan) ereport(ERROR, (errmsg("laplace_clean_stage: selection plan failed")));
+    Portal scan = SPI_cursor_open(NULL, plan, NULL, NULL, true);
+    if (!scan) ereport(ERROR, (errmsg("laplace_clean_stage: selection failed")));
+    for (;;) {
+        SPI_cursor_fetch(scan, true, enrichment_fetch_rows());
+        if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
+        key = RelationGetPartitionKey(parent);
+        PartitionDesc partitions = RelationGetPartitionDesc(parent, true);
+        for (uint64 row = 0; row < SPI_processed; row++) {
+            CHECK_FOR_INTERRUPTS();
+            bool missing;
+            Datum id = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
+            if (missing)
+                ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_clean_stage: null Native ID")));
+            Oid partition = enrichment_partition(target, key, partitions, id);
+            hash_search(touched, &partition, HASH_ENTER, NULL);
+        }
+        SPI_freetuptable(SPI_tuptable);
+    }
+    SPI_cursor_close(scan); SPI_freeplan(plan);
+    int count = hash_get_num_entries(touched), at = 0;
+    Datum *values = palloc(sizeof(Datum) * Max(count, 1));
+    HASH_SEQ_STATUS entries; hash_seq_init(&entries, touched); Oid *partition;
+    while ((partition = hash_seq_search(&entries))) values[at++] = ObjectIdGetDatum(*partition);
+    ArrayType *ids = construct_array(values, count, OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+    Oid type = OIDARRAYOID; Datum parameter = PointerGetDatum(ids);
+    if (SPI_execute_with_args("SELECT public.laplace_clean_pending_list(i.indexrelid)"
+        " FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid"
+        " WHERE i.indrelid=ANY($1) AND c.relam=" CppAsString2(GIN_AM_OID)
+        " ORDER BY i.indexrelid", 1, &type, &parameter, NULL, false, 0) != SPI_OK_SELECT)
+        ereport(ERROR, (errmsg("laplace_clean_stage: index maintenance failed")));
+    int64 cleaned = 0;
+    for (uint64 row = 0; row < SPI_processed; row++) {
+        bool missing;
+        Datum pages = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
+        if (!missing) cleaned += DatumGetInt64(pages);
+    }
+    SPI_freetuptable(SPI_tuptable); pfree(ids); pfree(values); hash_destroy(touched);
+    SPI_finish(); table_close(stage, NoLock); table_close(parent, NoLock);
+    pfree(source); pfree(selection);
+    PG_RETURN_INT64(cleaned);
 }

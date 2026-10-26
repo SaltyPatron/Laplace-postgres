@@ -43,6 +43,13 @@ for all requested witness roots. Root-local path counts use that shared plan
 and skip unreachable branches; games, signed outcomes, dependence roots and
 attribution retain their existing Native meanings.
 
+`laplace_merge_stage` drains GIN pending entries for copied path partitions
+before consuming the staging tables and returning to provenance/series reads.
+`laplace_clean_stage` routes the copied IDs through the same Native partition
+bounds as enrichment and uses the existing restricted index-maintenance
+authority. It leaves unrelated partitions alone. Search results are unchanged;
+subsequent containment reads avoid repeatedly scanning the bulk insert lists.
+
 ## CI installation boundary
 
 Pull-request CI builds a candidate and runs `tests/extension-install.sh` against a private `DESTDIR` package and a newly created test database. PostgreSQL 18's `extension_control_path` selects that package. Only its private control file is rewritten to reference the candidate module; an assertion checks every extension C function's module binding. The test executes `laplace_isa()` and removes its database and package. Failed database cleanup preserves the package and fails the job.

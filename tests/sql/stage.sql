@@ -77,4 +77,42 @@ DO $$ BEGIN
     RAISE EXCEPTION 'public input table accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- Every successfully merged batch must be ready for indexed containment
+-- reads, without paying a pending-list scan at every provenance frontier.
+DO $$ DECLARE remaining bigint; cleaned bigint; untouched bigint; BEGIN
+  SELECT coalesce(sum(pg_catalog.gin_clean_pending_list(i.indexrelid)),0) INTO remaining
+  FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
+  WHERE a.amname='gin' AND i.indrelid IN
+    (SELECT tableoid FROM public.physicality
+     WHERE entity=ANY(ARRAY[laplace_id('dog'),laplace_id('cat'),laplace_id('ant')]));
+  IF remaining<>0 THEN RAISE EXCEPTION 'stage merge left pending GIN entries'; END IF;
+  INSERT INTO public.entity (id,tier,coord,hilbert)
+    SELECT laplace_id(t),laplace_tier(t),laplace_coord(t),laplace_hilbert(t)
+    FROM unnest(ARRAY['touched','unrelated']) t;
+  INSERT INTO public.physicality (entity,tier,hilbert,path)
+    SELECT laplace_id(t),laplace_tier(t),laplace_hilbert(t),
+      laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(t,'') c))
+    FROM unnest(ARRAY['touched','unrelated']) t;
+  IF left(laplace_id('touched')::text,2)=left(laplace_id('unrelated')::text,2) THEN
+    RAISE EXCEPTION 'maintenance fixture requires distinct destination partitions';
+  END IF;
+  CREATE UNLOGGED TABLE stage.maintenance_paths (LIKE stage.physicality INCLUDING DEFAULTS);
+  INSERT INTO stage.maintenance_paths SELECT * FROM public.physicality WHERE entity=laplace_id('touched');
+  cleaned := laplace_clean_stage('stage.maintenance_paths');
+  SELECT coalesce(sum(pg_catalog.gin_clean_pending_list(i.indexrelid)),0) INTO untouched
+  FROM pg_index i JOIN public.physicality p ON p.tableoid=i.indrelid
+    JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
+  WHERE a.amname='gin' AND p.entity=laplace_id('unrelated');
+  IF cleaned<=0 OR untouched<=0 OR laplace_clean_stage('stage.maintenance_paths')<>0 THEN
+    RAISE EXCEPTION 'maintenance failed to drain copied partitions or swept unrelated indexes';
+  END IF;
+  TRUNCATE stage.maintenance_paths;
+  IF laplace_clean_stage('stage.maintenance_paths')<>0 THEN
+    RAISE EXCEPTION 'empty copied paths caused index maintenance';
+  END IF;
+  BEGIN
+    PERFORM laplace_clean_stage('public.physicality');
+    RAISE EXCEPTION 'maintenance accepted public input';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 ROLLBACK;

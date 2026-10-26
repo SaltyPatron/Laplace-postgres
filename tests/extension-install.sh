@@ -63,6 +63,13 @@ CREATE ROLE :"writer";
 GRANT USAGE ON SCHEMA public TO :"writer";
 GRANT INSERT,TRUNCATE ON public.physicality_00 TO :"writer";
 GRANT EXECUTE ON FUNCTION public.laplace_clean_pending_list(regclass) TO :"writer";
+SELECT public.laplace_ensure_stage();
+CREATE UNLOGGED TABLE stage.candidate_maintenance_keys (entity blake3);
+CREATE UNLOGGED TABLE stage.candidate_unwritable_keys (entity blake3);
+INSERT INTO stage.candidate_maintenance_keys VALUES ('00000000000000000000000000000000');
+INSERT INTO stage.candidate_unwritable_keys VALUES ('01000000000000000000000000000000');
+GRANT USAGE ON SCHEMA stage TO :"writer";
+GRANT SELECT ON stage.candidate_maintenance_keys,stage.candidate_unwritable_keys TO :"writer";
 CREATE TABLE public.candidate_unrelated(values int[]);
 CREATE INDEX candidate_unrelated_gin ON public.candidate_unrelated USING gin(values);
 GRANT INSERT,TRUNCATE ON public.candidate_unrelated TO :"writer";
@@ -76,6 +83,11 @@ DO $$ DECLARE selected regclass; BEGIN
     RAISE EXCEPTION 'runtime unexpectedly owns the index';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   PERFORM public.laplace_clean_pending_list(selected);
+  PERFORM public.laplace_clean_stage('stage.candidate_maintenance_keys');
+  BEGIN
+    PERFORM public.laplace_clean_stage('stage.candidate_unwritable_keys');
+    RAISE EXCEPTION 'stage routing bypassed index maintenance privileges';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   SELECT i.indexrelid INTO STRICT selected FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
     WHERE i.indrelid='public.physicality_01'::regclass AND a.amname='gin';
