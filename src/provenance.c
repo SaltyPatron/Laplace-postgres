@@ -10,6 +10,10 @@
 #include "catalog/pg_type_d.h"
 #include "nodes/plannodes.h"
 #include "nodes/params.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
+#include "catalog/pg_proc.h"
+#include "utils/acl.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -152,6 +156,81 @@ static const lp_trust_class *pg_dependence_class(lp_idmap *classes, const lp_ver
     return *c;
 }
 
+typedef struct { FmgrInfo function; text *kind,*claim;MemoryContext context; } PgClaimBinding;
+static void pg_claim_bind(PgClaimBinding *binding)
+{
+    Oid arguments[3]={BITOID,TEXTOID,TEXTOID};
+    Oid function=LookupFuncName(list_make2(makeString("public"),makeString("laplace_mask_has_value")),3,arguments,false);
+    AclResult permission=object_aclcheck(ProcedureRelationId,function,GetUserId(),ACL_EXECUTE);
+    if(permission!=ACLCHECK_OK)aclcheck_error(permission,OBJECT_FUNCTION,get_func_name(function));
+    binding->context=AllocSetContextCreate(CurrentMemoryContext,"Native claim binding",ALLOCSET_DEFAULT_SIZES);
+    fmgr_info_cxt(function,&binding->function,binding->context);
+    MemoryContext previous=MemoryContextSwitchTo(binding->context);
+    binding->kind=cstring_to_text("kind");binding->claim=cstring_to_text("claim");
+    MemoryContextSwitchTo(previous);
+}
+static bool pg_claim_carrier(PgClaimBinding *binding,Datum path,Datum mask,const Geo *decoded)
+{
+    if(!DatumGetBool(FunctionCall3Coll(&binding->function,InvalidOid,mask,
+        PointerGetDatum(binding->kind),PointerGetDatum(binding->claim))))return false;
+    Geo geometry;if(!decoded){geometry=geo_of(path);decoded=&geometry;}
+    size_t length=lp_path_len(decoded->p);
+    if(length>PG_INT64_MAX)
+        ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("laplace_path_length: run count exceeds bigint")));
+    return length>=2;
+}
+typedef struct { PgClaimBinding binding;lp_idmap *front;PgDag *dag;size_t found; } PgClaimFrontier;
+static void pg_claim_frontier_row(const lp_id *id,Datum path,Datum mask,void *context)
+{
+    PgClaimFrontier *front=context;
+    if(!pg_claim_carrier(&front->binding,path,mask,NULL))return;
+    front->found++;
+    if(front->front)lp_idmap_put(front->front,id,NULL);
+    if(front->dag)pg_dag_node(front->dag,id,NULL);
+}
+
+typedef lp_vec(lp_vertex) PgVertices;
+typedef struct {
+    PgDag *dag;lp_idmap *seen,*front,*next,*classes;PgVertices *vertices;
+    const lp_tier0_record *floor;PgClaimBinding binding;
+} PgDownFrontier;
+static void pg_down_frontier_row(const lp_id *id,Datum path,Datum mask,void *context)
+{
+    PgDownFrontier *front=context;PgDag *d=front->dag;
+    size_t pi=pg_dag_node(d,id,NULL);lp_idmap_put(front->seen,id,NULL);
+    Geo geometry=geo_of(path);
+    d->n.v[pi].claim=pg_claim_carrier(&front->binding,path,mask,&geometry);
+    int nv=(int)geometry.p.n;if(nv<=0)return;
+    PgVertices *vertices=front->vertices;lp_vec_reserve(vertices,(size_t)nv);
+    if(lp_path_decode(geometry.p,vertices->v,(size_t)nv)!=(size_t)nv)
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_contained_series: invalid stored path")));
+    d->n.v[pi].file=vertices->v[0].said==LP_SAID_METADATA;
+    const lp_trust_class *pending=NULL;lp_id pending_id={{0}};
+    for(int k=0;k<nv;k++){
+        const lp_vertex *v=vertices->v+k;
+        if(v->said==LP_SAID_DEPENDENCE){pending=pg_dependence_class(front->classes,vertices->v,nv,k);pending_id=v->id;continue;}
+        const lp_trust_class *scope=pending;pending=NULL;
+        if(v->said==LP_SAID_METADATA)continue;
+        size_t ci=pg_dag_node(d,&v->id,NULL);PgEdge *edge=pg_dag_edge(d,pi,ci,v);
+        if(v->said==LP_SAID_CLAIM || v->said==LP_SAID_RECORD){
+            edge->claim=1;edge->rec=v->said==LP_SAID_RECORD;
+            if(scope){edge->has_dependence=1;edge->dependence=pending_id;edge->dependence_trust=scope->prior;}
+        }
+        if(!lp_tier0_contains(front->floor,&v->id) && lp_idmap_find(front->seen,&v->id)<0 && lp_idmap_find(front->front,&v->id)<0)
+            lp_idmap_put(front->next,&v->id,NULL);
+    }
+}
+
+typedef struct { PgVertices *vertices;size_t found; } PgRootFrontier;
+static void pg_root_frontier_row(const lp_id *id,Datum path,Datum mask,void *context)
+{
+    PgRootFrontier *front=context;Geo geometry=geo_of(path);
+    lp_vec_reserve(front->vertices,geometry.p.n);
+    if(lp_path_decode(geometry.p,front->vertices->v,geometry.p.n)!=geometry.p.n)
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_contained_series: invalid stored path")));
+    front->found++;
+}
+
 /* Restore testimony from persisted trunks without opening their source bytes.
  * Every SPI request is a bounded frontier set, not a command per vertex. */
 PG_FUNCTION_INFO_V1(laplace_contained_series);
@@ -167,31 +246,22 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         if(!count){pfree(ids);lp_idmap_free(selected);PG_RETURN_NULL();}
     }
     if(!n){pfree(ids);lp_idmap_free(selected);PG_RETURN_NULL();}
-    Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0),idelm=get_element_type(idarr);
+    Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
     if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_contained_series: SPI_connect")));
     PgDag d={lp_idmap_new(),{0},{0}};
     lp_idmap *roots=lp_idmap_new(),*front=lp_idmap_new(),*seen=lp_idmap_new();
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
-    lp_vec(lp_vertex) vertices={0};
+    PgVertices vertices={0};
     for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
     pfree(ids);
     if(selected){
         /* An explicit claim set starts from those claims. Prove the supplied
          * roots once, then use the shared upward kernel directly; there is no
          * speculative downward graph or cardinality-based fallback. */
-        ArrayType *root_ids=id_array_of(idelm,lp_idmap_keys(roots),(int)lp_idmap_count(roots));
-        Datum argument=PointerGetDatum(root_ids);
-        if(SPI_execute_with_args("SELECT p.path FROM unnest($1) wanted(id)"
-            " JOIN public.physicality p ON p.entity=wanted.id",1,&idarr,&argument,NULL,true,0)!=SPI_OK_SELECT
-            || SPI_processed!=lp_idmap_count(roots))
+        PgRootFrontier probe={&vertices,0};
+        lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),pg_root_frontier_row,&probe);
+        if(probe.found!=lp_idmap_count(roots))
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_contained_series: root has no stored path")));
-        for(uint64 row=0;row<SPI_processed;row++){
-            bool missing;Geo geometry=geo_of(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,1,&missing));
-            lp_vec_reserve(&vertices,geometry.p.n);
-            if(lp_path_decode(geometry.p,vertices.v,geometry.p.n)!=geometry.p.n)
-                ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_contained_series: invalid stored path")));
-        }
-        SPI_freetuptable(SPI_tuptable);pfree(root_ids);
         PgAttrRows rows={0};
         compute_attested_rows(lp_idmap_keys(selected),(int)lp_idmap_count(selected),idarr,0,0,roots,NULL,&rows);
         for(size_t i=0;i<rows.n;i++){
@@ -208,62 +278,15 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);SPI_finish();
         PG_RETURN_NULL();
     }
-    /* Each frontier ID supplies a range-partition pruning parameter. An array
-     * predicate repeats processing of the complete frontier in every partition. */
-    SPIPlanPtr downward=SPI_prepare_cursor(
-        "SELECT p.entity,p.path,laplace_mask_has_value(p.mask,'kind','claim') AND laplace_path_length(p.path)>=2"
-        " FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id ORDER BY p.entity",1,&idarr,
-        CURSOR_OPT_CUSTOM_PLAN|CURSOR_OPT_PARALLEL_OK);
-    if(!downward)ereport(ERROR,(errmsg("laplace_contained_series: downward plan failed")));
-    ParamListInfo params=makeParamList(1);
-    params->params[0].ptype=idarr;params->params[0].isnull=false;params->params[0].pflags=0;
-    const lp_tier0_record *floor=lp_pg_tier0();
-    size_t window_ids=frontier_window_ids();
+    /* The caller supplies exact IDs. Route and read their primary indexes
+     * directly; a cardinality-dependent SQL join may scan and externally sort
+     * the entire physicality relation for every large frontier. */
+    PgDownFrontier down={.dag=&d,.seen=seen,.classes=classes,.vertices=&vertices,.floor=lp_pg_tier0()};
+    pg_claim_bind(&down.binding);
     bool initial=true;
     while(lp_idmap_count(front)){
-        lp_idmap *next=lp_idmap_new();size_t count=lp_idmap_count(front);
-        for(size_t begin=0;begin<count;begin+=window_ids){
-            size_t amount=count-begin;if(amount>window_ids)amount=window_ids;
-            ArrayType *window=id_array_of(idelm,lp_idmap_keys(front)+begin,(int)amount);
-            params->params[0].value=PointerGetDatum(window);
-            Portal scan=SPI_cursor_open_with_paramlist(NULL,downward,params,true);
-            if(!scan)
-                ereport(ERROR,(errmsg("laplace_contained_series: downward walk failed")));
-            long fetch_rows=frontier_fetch_rows(scan);
-            for(;;){
-            SPI_cursor_fetch(scan,true,fetch_rows);
-            if(!SPI_processed){SPI_freetuptable(SPI_tuptable);break;}
-            for(uint64 row=0;row<SPI_processed;row++){
-                bool nl;lp_id id;
-                memcpy(id.b,DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,1,&nl)),16);
-                size_t pi=pg_dag_node(&d,&id,NULL);lp_idmap_put(seen,&id,NULL);
-                d.n.v[pi].claim=DatumGetBool(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,3,&nl));
-                Geo geometry=geo_of(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,2,&nl));
-                int nv=(int)geometry.p.n;if(nv<=0)continue;
-                lp_vec_reserve(&vertices,(size_t)nv);
-                if(lp_path_decode(geometry.p,vertices.v,(size_t)nv)!=(size_t)nv)
-                    ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_contained_series: invalid stored path")));
-                d.n.v[pi].file=vertices.v[0].said==LP_SAID_METADATA;
-                const lp_trust_class *pending=NULL;lp_id pending_id={{0}};
-                for(int k=0;k<nv;k++){
-                    const lp_vertex *v=vertices.v+k;
-                    if(v->said==LP_SAID_DEPENDENCE){pending=pg_dependence_class(classes,vertices.v,nv,k);pending_id=v->id;continue;}
-                    const lp_trust_class *scope=pending;pending=NULL;
-                    if(v->said==LP_SAID_METADATA)continue;
-                    size_t ci=pg_dag_node(&d,&v->id,NULL);
-                    PgEdge *edge=pg_dag_edge(&d,pi,ci,v);
-                    if(v->said==LP_SAID_CLAIM || v->said==LP_SAID_RECORD){
-                        edge->claim=1;edge->rec=v->said==LP_SAID_RECORD;
-                        if(scope){edge->has_dependence=1;edge->dependence=pending_id;edge->dependence_trust=scope->prior;}
-                    }
-                    if(!lp_tier0_contains(floor,&v->id) && lp_idmap_find(seen,&v->id)<0 && lp_idmap_find(front,&v->id)<0)
-                        lp_idmap_put(next,&v->id,NULL);
-                }
-            }
-            SPI_freetuptable(SPI_tuptable);
-            }
-            SPI_cursor_close(scan);pfree(window);
-        }
+        lp_idmap *next=lp_idmap_new();down.front=front;down.next=next;
+        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),pg_down_frontier_row,&down);
         lp_idmap_free(front);front=next;
         if(initial){
             for(size_t i=0;i<lp_idmap_count(roots);i++)
@@ -272,7 +295,8 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
             initial=false;
         }
     }
-    SPI_freeplan(downward);pfree(params);lp_idmap_free(front);lp_vec_free(&vertices);lp_idmap_free(classes);
+    MemoryContextDelete(down.binding.context);
+    lp_idmap_free(front);lp_vec_free(&vertices);lp_idmap_free(classes);
     /* Assertion metadata names a claim only when the child's carrier does too.
      * This is the same admission boundary used by laplace_series_snapshot. */
     for(size_t i=0;i<d.e.n;i++)if(!d.n.v[d.e.v[i].c].claim)d.e.v[i].claim=0;
@@ -321,20 +345,10 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         /* The downward API admits assertions by the child's carrier, not
          * solely by an incoming edge. Preserve that boundary in either
          * direction, including callers selecting non-claim content. */
-        for(size_t begin=0;begin<(size_t)n;begin+=window_ids){
-            size_t count=(size_t)n-begin;if(count>window_ids)count=window_ids;
-            ArrayType *window=id_array_of(idelm,claims+begin,count);
-            Datum arg=PointerGetDatum(window);
-            if(SPI_execute_with_args("SELECT p.entity FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id"
-                " AND laplace_mask_has_value(p.mask,'kind','claim') AND laplace_path_length(p.path)>=2",
-                1,&idarr,&arg,NULL,true,0)!=SPI_OK_SELECT)
-                ereport(ERROR,(errmsg("laplace_contained_series: claim selection failed")));
-            for(uint64 row=0;row<SPI_processed;row++){
-                bool nl;lp_id id;
-                memcpy(id.b,DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,1,&nl)),16);
-                lp_idmap_put(front,&id,NULL);pg_dag_node(&d,&id,NULL);
-            }
-            SPI_freetuptable(SPI_tuptable);pfree(window);
+        if(n){
+            PgClaimFrontier selected={.front=front,.dag=&d};pg_claim_bind(&selected.binding);
+            lp_pg_lookup_paths(claims,(size_t)n,pg_claim_frontier_row,&selected);
+            MemoryContextDelete(selected.binding.context);
         }
     }else for (int i = 0; i < n; i++) {
         lp_idmap_put(front, &claims[i], NULL);pg_dag_node(&d, &claims[i], NULL);
@@ -723,16 +737,10 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
     if (count) {
         /* Validate the requested carrier set once. The provenance kernel below
          * reuses this proof and the witness registry instead of querying both again. */
-        size_t window = frontier_window_ids();
-        for (size_t start = 0; start < count; start += window) {
-            size_t n = Min(window, count-start);
-            ArrayType *ids = id_array_of(native_id, lp_idmap_keys(batch->claims)+start, (int)n);
-            Datum argument = PointerGetDatum(ids);
-            if (SPI_execute_with_args("SELECT p.entity FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id"
-                " WHERE public.laplace_mask_has_value(p.mask,'kind','claim') AND public.laplace_path_length(p.path)>=2",
-                1, &idarray, &argument, NULL, true, 0) != SPI_OK_SELECT || SPI_processed != n) pg_series_invalid();
-            SPI_freetuptable(SPI_tuptable); pfree(ids);
-        }
+        PgClaimFrontier verified={0};pg_claim_bind(&verified.binding);
+        lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,pg_claim_frontier_row,&verified);
+        MemoryContextDelete(verified.binding.context);
+        if(verified.found!=count)pg_series_invalid();
         if (SPI_execute("SELECT id,lineage,trust FROM public.witness ORDER BY id", true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_series_snapshot: witness registry failed")));
         for (uint64 row = 0; row < SPI_processed; row++) {
