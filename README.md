@@ -73,6 +73,21 @@ bounds as enrichment and uses the existing restricted index-maintenance
 authority. It leaves unrelated partitions alone. Search results are unchanged;
 subsequent containment reads avoid repeatedly scanning the bulk insert lists.
 
+The merge consumes paired entity/path inputs from one formed batch. Native
+clients carry a boolean `present` classification with each staged row. Positive
+classifications are retained; only claimed-new IDs receive the flat concurrent
+overlap verification, through the same Native indexed membership kernel used by
+tier descent. Plain inserts consume the absent set, and the Native updater
+consumes existing metadata. There is no global structural apply lock or
+destination anti-join. A genuine canonical primary-key race rolls back the
+attempt and re-verifies a strictly smaller remaining set; other failures surface.
+
+Existing IDs may omit coordinates, Hilbert keys and unchanged paths. A supplied
+path carries incoming annotations for Native enrichment; omitted fields preserve
+the recorded content. Clients without classifications use an ID-only write plan
+through the same verifier and publication statements. That lower-level import
+interface does not replace the ingest spine's client-side novelty descent.
+
 ## CI installation boundary
 
 Pull-request CI builds a candidate and runs `tests/extension-install.sh` against a private `DESTDIR` package and a newly created test database. PostgreSQL 18's `extension_control_path` selects that package. Only its private control file is rewritten to reference the candidate module; an assertion checks every extension C function's module binding. The test executes `laplace_isa()` and removes its database and package. Failed database cleanup preserves the package and fails the job.
