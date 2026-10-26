@@ -55,9 +55,23 @@ GRANT SELECT(id,tier,mask),UPDATE(tier,mask) ON public.entity TO :"writer";
 UPDATE stage.routing_entities SET mask=mask|laplace_mask_slot('kind','tuple');
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
+  IF (SELECT array_agg(ordinal ORDER BY ordinal) FROM laplace_present_ids(
+      ARRAY[(SELECT id FROM public.entity ORDER BY id LIMIT 1),laplace_id('not in this routing fixture'),
+            (SELECT id FROM public.entity ORDER BY id LIMIT 1)])) IS DISTINCT FROM ARRAY[1,3]::bigint[] THEN
+    RAISE EXCEPTION 'Native presence lost duplicate ordinals, admitted an absent ID or required child grants';
+  END IF;
   IF laplace_enrich_stage('stage.routing_entities','public.entity')<>2049 THEN
     RAISE EXCEPTION 'parent column grants were not preserved';
   END IF;
+END $$;
+RESET SESSION AUTHORIZATION;
+REVOKE SELECT(id,tier,mask) ON public.entity FROM :"writer";
+SET SESSION AUTHORIZATION :"writer";
+DO $$ BEGIN
+  BEGIN
+    PERFORM laplace_present_ids(ARRAY[laplace_id('not in this routing fixture')]);
+    RAISE EXCEPTION 'Native presence bypassed parent SELECT privileges';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
 END $$;
 RESET SESSION AUTHORIZATION;
 REVOKE UPDATE(tier,mask) ON public.entity FROM :"writer";

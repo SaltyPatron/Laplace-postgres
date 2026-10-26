@@ -3,11 +3,16 @@
 #include "pg_core.h"
 #include "geo.h"
 #include "executor/spi.h"
+#include "access/table.h"
 #include "access/htup_details.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_type_d.h"
 #include "nodes/plannodes.h"
 #include "nodes/params.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/rel.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
@@ -29,7 +34,8 @@ typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t posit
 typedef lp_vec(PgAttrRow) PgAttrRows;
 
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
-                                 int include_files, const lp_idmap *roots, PgAttrRows *out);
+                                 int include_files, const lp_idmap *roots,
+                                 const lp_idmap *known_witnesses, PgAttrRows *out);
 
 static long frontier_fetch_rows(Portal scan)
 {
@@ -169,6 +175,39 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     lp_vec(lp_vertex) vertices={0};
     for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
     pfree(ids);
+    if(selected){
+        /* An explicit claim set starts from those claims. Prove the supplied
+         * roots once, then use the shared upward kernel directly; there is no
+         * speculative downward graph or cardinality-based fallback. */
+        ArrayType *root_ids=id_array_of(idelm,lp_idmap_keys(roots),(int)lp_idmap_count(roots));
+        Datum argument=PointerGetDatum(root_ids);
+        if(SPI_execute_with_args("SELECT p.path FROM unnest($1) wanted(id)"
+            " JOIN public.physicality p ON p.entity=wanted.id",1,&idarr,&argument,NULL,true,0)!=SPI_OK_SELECT
+            || SPI_processed!=lp_idmap_count(roots))
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_contained_series: root has no stored path")));
+        for(uint64 row=0;row<SPI_processed;row++){
+            bool missing;Geo geometry=geo_of(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,1,&missing));
+            lp_vec_reserve(&vertices,geometry.p.n);
+            if(lp_path_decode(geometry.p,vertices.v,geometry.p.n)!=geometry.p.n)
+                ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_contained_series: invalid stored path")));
+        }
+        SPI_freetuptable(SPI_tuptable);pfree(root_ids);
+        PgAttrRows rows={0};
+        compute_attested_rows(lp_idmap_keys(selected),(int)lp_idmap_count(selected),idarr,0,0,roots,NULL,&rows);
+        for(size_t i=0;i<rows.n;i++){
+            const PgAttrRow *r=rows.v+i;
+            Datum values[8]={id_datum(&r->trunk),id_datum(&r->claim),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
+                Float8GetDatum(r->score),Int32GetDatum((int32)r->position),
+                r->has_dependence?id_datum(&r->dependence):(Datum)0,
+                r->has_dependence?Float8GetDatum(r->trust):(Datum)0};
+            bool nulls[8]={false,false,false,false,false,false,!r->has_dependence,!r->has_dependence};
+            set_put(fcinfo,ts,td,values,nulls);
+        }
+        lp_vec_free(&rows);lp_vec_free(&vertices);lp_idmap_free(classes);
+        lp_idmap_free(selected);lp_idmap_free(roots);lp_idmap_free(front);lp_idmap_free(seen);
+        lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);SPI_finish();
+        PG_RETURN_NULL();
+    }
     /* Each frontier ID supplies a range-partition pruning parameter. An array
      * predicate repeats processing of the complete frontier in every partition. */
     SPIPlanPtr downward=SPI_prepare_cursor(
@@ -179,19 +218,11 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     ParamListInfo params=makeParamList(1);
     params->params[0].ptype=idarr;params->params[0].isnull=false;params->params[0].pflags=0;
     const lp_tier0_record *floor=lp_pg_tier0();
-    /* Sparse selections in an established estate are cheaper from the claim
-     * side. Bound the speculative root-side graph before using the same
-     * upward kernel, restricted to the requested trunks. No testimony is
-     * inferred from the presence or absence of a cached consensus row. */
-    size_t budget=selected ? lp_idmap_count(selected) : 0;
-    if(budget>1024)budget=1024;
-    budget*=4;if(budget<64)budget=64;
     size_t window_ids=frontier_window_ids();
-    bool initial=true,reverse=false;
+    bool initial=true;
     while(lp_idmap_count(front)){
-        if(selected && !initial && d.n.n+d.e.n>budget){reverse=true;break;}
         lp_idmap *next=lp_idmap_new();size_t count=lp_idmap_count(front);
-        for(size_t begin=0;begin<count && !reverse;begin+=window_ids){
+        for(size_t begin=0;begin<count;begin+=window_ids){
             size_t amount=count-begin;if(amount>window_ids)amount=window_ids;
             ArrayType *window=id_array_of(idelm,lp_idmap_keys(front)+begin,(int)amount);
             params->params[0].value=PointerGetDatum(window);
@@ -199,11 +230,10 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
             if(!scan)
                 ereport(ERROR,(errmsg("laplace_contained_series: downward walk failed")));
             long fetch_rows=frontier_fetch_rows(scan);
-            while(!reverse){
+            for(;;){
             SPI_cursor_fetch(scan,true,fetch_rows);
             if(!SPI_processed){SPI_freetuptable(SPI_tuptable);break;}
             for(uint64 row=0;row<SPI_processed;row++){
-                if(selected && !initial && d.n.n+d.e.n>budget){reverse=true;break;}
                 bool nl;lp_id id;
                 memcpy(id.b,DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[row],SPI_tuptable->tupdesc,1,&nl)),16);
                 size_t pi=pg_dag_node(&d,&id,NULL);lp_idmap_put(seen,&id,NULL);
@@ -246,32 +276,14 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     /* Assertion metadata names a claim only when the child's carrier does too.
      * This is the same admission boundary used by laplace_series_snapshot. */
     for(size_t i=0;i<d.e.n;i++)if(!d.n.v[d.e.v[i].c].claim)d.e.v[i].claim=0;
-    if(reverse){
-        lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);
-        d=(PgDag){0};
-        PgAttrRows rows={0};
-        compute_attested_rows(lp_idmap_keys(selected),(int)lp_idmap_count(selected),idarr,0,0,roots,&rows);
-        for(size_t i=0;i<rows.n;i++){
-            const PgAttrRow *r=rows.v+i;
-            Datum values[8]={id_datum(&r->trunk),id_datum(&r->claim),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
-                Float8GetDatum(r->score),Int32GetDatum((int32)r->position),
-                r->has_dependence?id_datum(&r->dependence):(Datum)0,
-                r->has_dependence?Float8GetDatum(r->trust):(Datum)0};
-            bool nulls[8]={false,false,false,false,false,false,!r->has_dependence,!r->has_dependence};
-            set_put(fcinfo,ts,td,values,nulls);
-        }
-        lp_vec_free(&rows);
-    }
-    PgDown walk={0};
-    if(!reverse)walk=pg_down_prepare(&d);
-    for(size_t i=0;!reverse && i<lp_idmap_count(roots);i++){
+    PgDown walk=pg_down_prepare(&d);
+    for(size_t i=0;i<lp_idmap_count(roots);i++){
         const lp_id *root=lp_idmap_keys(roots)+i;
         size_t top=(size_t)lp_idmap_find(d.m,root);
         double *counts=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d,counts,per_claim);
         for(size_t j=0;j<lp_strmap_count(per_claim);j++){
             const PgTally *t=lp_strmap_at(per_claim,j);if(t->games<=0)continue;
-            if(selected && lp_idmap_find(selected,&t->claim)<0)continue;
             Datum values[8]={id_datum(root),id_datum(&t->claim),Float8GetDatum(t->games),Float8GetDatum(t->tokens),
                 Float8GetDatum(t->score),Int32GetDatum((int32)t->position),
                 t->has_dependence?id_datum(&t->dependence):(Datum)0,
@@ -281,7 +293,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         }
         lp_strmap_free(per_claim);pfree(counts);
     }
-    if(!reverse)pg_down_free(&walk);
+    pg_down_free(&walk);
     lp_idmap_free(selected);lp_idmap_free(roots);lp_idmap_free(seen);lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);SPI_finish();
     PG_RETURN_NULL();
 }
@@ -298,13 +310,14 @@ static int by_attr_row(const void *a, const void *b)
 }
 
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
-                                 int include_files, const lp_idmap *roots, PgAttrRows *out)
+                                 int include_files, const lp_idmap *roots,
+                                 const lp_idmap *known_witnesses, PgAttrRows *out)
 {
     Oid idelm = get_element_type(idarr);
     PgDag d = { lp_idmap_new(), {0}, {0} };
     lp_idmap *front = lp_idmap_new();
     size_t window_ids = frontier_window_ids();
-    if(roots){
+    if(roots && !known_witnesses){
         /* The downward API admits assertions by the child's carrier, not
          * solely by an incoming edge. Preserve that boundary in either
          * direction, including callers selecting non-claim content. */
@@ -413,8 +426,8 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     for (size_t i = 0; i < d.n.n; i++) {
         lp_push(&rids, d.n.v[i].id);
     }
-    lp_idmap *wmap = lp_idmap_sized(sizeof(double));
-    if (rids.n > 0) {
+    lp_idmap *wmap = known_witnesses ? (lp_idmap *)known_witnesses : lp_idmap_sized(sizeof(double));
+    if (!known_witnesses && rids.n > 0) {
         Datum a[1] = { PointerGetDatum(id_array_of(idelm, rids.v, (int)rids.n)) }; Oid t[1] = { idarr };
         if (SPI_execute_with_args("SELECT id, trust FROM witness WHERE id = ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_attested: witness lookup failed")));
@@ -490,7 +503,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         i = j;
     }
 
-    lp_idmap_free(wmap);
+    if (!known_witnesses) lp_idmap_free(wmap);
     lp_vec_free(&rix); lp_vec_free(&rids);
     lp_idmap_free(d.m); lp_vec_free(&d.n); lp_vec_free(&d.e);
 }
@@ -518,7 +531,7 @@ Datum laplace_attested_series(PG_FUNCTION_ARGS){
     Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
     if (SPI_connect()!=SPI_OK_CONNECT) ereport(ERROR,(errmsg("laplace_attested_series: SPI_connect")));
     PgAttrRows rows={0};
-    compute_attested_rows(claims,n,idarr,0,0,NULL,&rows);
+    compute_attested_rows(claims,n,idarr,0,0,NULL,NULL,&rows);
     for (size_t i=0; i<rows.n; i++) {
         const PgAttrRow *r=rows.v+i;
         Datum v[9]={id_datum(&r->claim),id_datum(&r->trunk),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
@@ -540,7 +553,7 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attested: SPI_connect")));
     PgAttrRows rows = {0};
     int include_files = PG_NARGS() > 1 && !PG_ARGISNULL(1) && PG_GETARG_BOOL(1);
-    compute_attested_rows(claims, n, idarr, 0, include_files, NULL, &rows);
+    compute_attested_rows(claims, n, idarr, 0, include_files, NULL, NULL, &rows);
     pg_rollup_sources(&rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
@@ -566,7 +579,7 @@ Datum laplace_attribution(PG_FUNCTION_ARGS)
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_attribution: SPI_connect")));
     PgAttrRows rows = {0};
-    compute_attested_rows(claims, n, idarr, 1, 0, NULL, &rows);
+    compute_attested_rows(claims, n, idarr, 1, 0, NULL, NULL, &rows);
     pg_rollup_sources(&rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];
@@ -580,5 +593,238 @@ Datum laplace_attribution(PG_FUNCTION_ARGS)
     }
     lp_vec_free(&rows);
     SPI_finish();
+    PG_RETURN_NULL();
+}
+
+/* A formed batch owns one Native evidence context. SQL supplies indexed sets;
+ * it does not recursively resolve witness ancestry or rebuild four arrays for
+ * every claim. The same context also serves stage-resident changed claim sets. */
+typedef struct {
+    double trust;                 /* first member: shared provenance lookup */
+    lp_id lineage, root;
+    uint8_t has_lineage, state;
+} PgSeriesWitness;
+typedef struct { lp_id claim, witness, lineage; uint64_t games; double score, trust; uint8_t has_lineage; } PgSeriesObservation;
+typedef struct {
+    lp_idmap *claims, *witnesses;
+    lp_strmap *pending, *pairs, *trusts;
+    lp_vec(PgSeriesObservation) observations;
+    lp_vec(lp_series_entry) entries;
+    lp_vec(size_t) ancestry;
+    PgAttrRows historical;
+} PgSeriesBatch;
+
+static void pg_series_batch_free(void *arg)
+{
+    PgSeriesBatch *batch = arg;
+    lp_idmap_free(batch->claims); lp_idmap_free(batch->witnesses);
+    lp_strmap_free(batch->pending); lp_strmap_free(batch->pairs); lp_strmap_free(batch->trusts);
+    lp_vec_free(&batch->observations); lp_vec_free(&batch->entries);
+    lp_vec_free(&batch->ancestry); lp_vec_free(&batch->historical);
+}
+
+static char *pg_series_stage(Oid id, const char *column, Oid native_id, bool local_selection)
+{
+    Relation stage = table_open(id, AccessShareLock);
+    bool stage_input = RelationGetNamespace(stage) == get_namespace_oid("stage", false)
+        && stage->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED;
+    bool local_input = local_selection && isTempNamespace(RelationGetNamespace(stage))
+        && stage->rd_rel->relpersistence == RELPERSISTENCE_TEMP;
+    if ((!stage_input && !local_input)
+        || stage->rd_rel->relkind != RELKIND_RELATION
+        || get_atttype(id, get_attnum(id, column)) != native_id)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("laplace_series_snapshot requires an UNLOGGED stage table with Native %s IDs", column)));
+    List *inputs = find_all_inheritors(id, ShareLock, NULL); list_free(inputs);
+    char *name = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)), RelationGetRelationName(stage));
+    table_close(stage, NoLock);
+    return name;
+}
+
+static void pg_series_invalid(void)
+{
+    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+        errmsg("laplace_series_snapshot: invalid cumulative series, witness metadata or claim path")));
+}
+
+static lp_id pg_series_root(PgSeriesBatch *batch, lp_id root)
+{
+    batch->ancestry.n = 0;
+    for (;;) {
+        int64_t at = lp_idmap_find(batch->witnesses, &root);
+        if (at < 0) break;
+        PgSeriesWitness *witness = lp_idmap_at(batch->witnesses, (size_t)at);
+        if (witness->state == 2) { root = witness->root; break; }
+        if (witness->state == 1)
+            ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_series: cyclic witness lineage")));
+        witness->state = 1; lp_push(&batch->ancestry, (size_t)at);
+        if (!witness->has_lineage || lp_id_eq(&root, &witness->lineage)) break;
+        root = witness->lineage;
+        CHECK_FOR_INTERRUPTS();
+    }
+    for (size_t i = 0; i < batch->ancestry.n; i++) {
+        PgSeriesWitness *witness = lp_idmap_at(batch->witnesses, batch->ancestry.v[i]);
+        witness->root = root; witness->state = 2;
+    }
+    return root;
+}
+
+static int pg_series_by_claim(const void *a, const void *b)
+{
+    return memcmp(((const PgSeriesObservation *)a)->claim.b, ((const PgSeriesObservation *)b)->claim.b, sizeof(lp_id));
+}
+
+PG_FUNCTION_INFO_V1(laplace_series_snapshot);
+Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
+{
+    TupleDesc td; Tuplestorestate *result = set_begin(fcinfo, "laplace_series_snapshot", &td);
+    if (PG_ARGISNULL(0)) pg_series_invalid();
+    MemoryContext caller = CurrentMemoryContext;
+    MemoryContext context = AllocSetContextCreate(caller, "Native series batch", ALLOCSET_DEFAULT_SIZES);
+    MemoryContextSwitchTo(context);
+    PgSeriesBatch *batch = palloc0(sizeof *batch);
+    MemoryContextCallback *cleanup = palloc(sizeof *cleanup);
+    *cleanup = (MemoryContextCallback){.func=pg_series_batch_free, .arg=batch};
+    MemoryContextRegisterResetCallback(context, cleanup);
+    batch->claims = lp_idmap_new(); batch->witnesses = lp_idmap_sized(sizeof(PgSeriesWitness));
+    batch->pending = lp_strmap_sized(1); batch->pairs = lp_strmap_sized(1); batch->trusts = lp_strmap_sized(sizeof(double));
+    Oid native_id = get_atttype(get_relname_relid("physicality", get_namespace_oid("public", false)),
+        get_attnum(get_relname_relid("physicality", get_namespace_oid("public", false)), "entity"));
+    Oid idarray = get_array_type(native_id);
+    char *pending = pg_series_stage(PG_GETARG_OID(0), "claim", native_id, false);
+    char *changed = NULL;
+    bool stage_selection = get_fn_expr_argtype(fcinfo->flinfo, 1) == REGCLASSOID;
+    if (stage_selection && PG_ARGISNULL(1)) pg_series_invalid();
+    if (stage_selection) changed = pg_series_stage(PG_GETARG_OID(1), "claim", native_id, true);
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_series_snapshot: SPI_connect")));
+    if (!stage_selection && !PG_ARGISNULL(1)) {
+        int count; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(1), &count);
+        for (int i = 0; i < count; i++) lp_idmap_put(batch->claims, ids+i, NULL);
+        pfree(ids);
+    } else {
+        char *sql = psprintf("SELECT claim FROM %s", changed ? changed : pending);
+        SPIPlanPtr plan = SPI_prepare_cursor(sql, 0, NULL, CURSOR_OPT_NO_SCROLL);
+        Portal scan = plan ? SPI_cursor_open(NULL, plan, NULL, NULL, true) : NULL;
+        if (!scan) ereport(ERROR, (errmsg("laplace_series_snapshot: claim selection failed")));
+        long fetch = frontier_fetch_rows(scan);
+        for (;;) {
+            SPI_cursor_fetch(scan, true, fetch);
+            if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
+            for (uint64 row = 0; row < SPI_processed; row++) {
+                bool missing; Datum value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
+                if (missing) pg_series_invalid();
+                lp_idmap_put(batch->claims, (const lp_id *)DatumGetPointer(value), NULL);
+            }
+            SPI_freetuptable(SPI_tuptable);
+        }
+        SPI_cursor_close(scan); SPI_freeplan(plan); pfree(sql);
+    }
+    size_t count = lp_idmap_count(batch->claims);
+    if (count) {
+        /* Validate the requested carrier set once. The provenance kernel below
+         * reuses this proof and the witness registry instead of querying both again. */
+        size_t window = frontier_window_ids();
+        for (size_t start = 0; start < count; start += window) {
+            size_t n = Min(window, count-start);
+            ArrayType *ids = id_array_of(native_id, lp_idmap_keys(batch->claims)+start, (int)n);
+            Datum argument = PointerGetDatum(ids);
+            if (SPI_execute_with_args("SELECT p.entity FROM unnest($1) wanted(id) JOIN public.physicality p ON p.entity=wanted.id"
+                " WHERE public.laplace_mask_has_value(p.mask,'kind','claim') AND public.laplace_path_length(p.path)>=2",
+                1, &idarray, &argument, NULL, true, 0) != SPI_OK_SELECT || SPI_processed != n) pg_series_invalid();
+            SPI_freetuptable(SPI_tuptable); pfree(ids);
+        }
+        if (SPI_execute("SELECT id,lineage,trust FROM public.witness ORDER BY id", true, 0) != SPI_OK_SELECT)
+            ereport(ERROR, (errmsg("laplace_series_snapshot: witness registry failed")));
+        for (uint64 row = 0; row < SPI_processed; row++) {
+            bool missing; lp_id id;
+            memcpy(id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing)), sizeof id);
+            PgSeriesWitness *w = lp_idmap_get(batch->witnesses, &id, NULL);
+            Datum lineage = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 2, &missing);
+            w->has_lineage = !missing; if (!missing) memcpy(w->lineage.b, DatumGetPointer(lineage), sizeof(lp_id));
+            w->trust = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 3, &missing));
+        }
+        SPI_freetuptable(SPI_tuptable);
+        /* A stage-resident selection stays a set in PostgreSQL; no client-side
+         * array export or fixed-count keyset loop is needed. */
+        char *sql = changed ? psprintf("SELECT s.claim,s.witness,s.lineage,s.games::bigint,s.score::float8,s.trust::float8"
+            " FROM %s s WHERE EXISTS(SELECT FROM %s c WHERE c.claim=s.claim)", pending, changed)
+            : psprintf("SELECT s.claim,s.witness,s.lineage,s.games::bigint,s.score::float8,s.trust::float8"
+                " FROM %s s WHERE s.claim=ANY($1)", pending);
+        ArrayType *selected = changed ? NULL : id_array_of(native_id, lp_idmap_keys(batch->claims), (int)count);
+        Datum argument = selected ? PointerGetDatum(selected) : (Datum)0;
+        SPIPlanPtr plan = SPI_prepare_cursor(sql, changed ? 0 : 1, changed ? NULL : &idarray, CURSOR_OPT_NO_SCROLL);
+        Portal scan = plan ? SPI_cursor_open(NULL, plan, changed ? NULL : &argument, NULL, true) : NULL;
+        if (!scan) ereport(ERROR, (errmsg("laplace_series_snapshot: pending selection failed")));
+        long fetch = frontier_fetch_rows(scan);
+        for (;;) {
+            SPI_cursor_fetch(scan, true, fetch);
+            if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
+            for (uint64 row = 0; row < SPI_processed; row++) {
+                CHECK_FOR_INTERRUPTS(); bool missing; Datum value; PgSeriesObservation o = {0};
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
+                if (missing) pg_series_invalid(); memcpy(o.claim.b, DatumGetPointer(value), sizeof(lp_id));
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 2, &missing);
+                if (missing) pg_series_invalid(); memcpy(o.witness.b, DatumGetPointer(value), sizeof(lp_id));
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 3, &missing);
+                o.has_lineage = !missing; if (!missing) memcpy(o.lineage.b, DatumGetPointer(value), sizeof(lp_id));
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 4, &missing);
+                if (missing) pg_series_invalid(); int64 games = DatumGetInt64(value);
+                if (games<=0 || games>INT64CONST(9007199254740992)) pg_series_invalid(); o.games=(uint64_t)games;
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 5, &missing);
+                if (missing) pg_series_invalid(); o.score=DatumGetFloat8(value);
+                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 6, &missing);
+                if (missing) pg_series_invalid(); o.trust=DatumGetFloat8(value);
+                if (!isfinite(o.score) || o.score<0 || o.score>1 || !isfinite(o.trust) || o.trust < -1 || o.trust>1) pg_series_invalid();
+                uint8_t key[49]={0}; memcpy(key,o.claim.b,16); memcpy(key+16,o.witness.b,16); memcpy(key+32,o.lineage.b,16); key[48]=o.has_lineage;
+                bool fresh; lp_strmap_put(batch->pending,key,sizeof key,&fresh); if (!fresh) pg_series_invalid();
+                lp_strmap_put(batch->pairs,key,32,NULL);
+                double *trust = lp_strmap_get(batch->trusts,key+16,33,&fresh);
+                if (!fresh && *trust != o.trust) pg_series_invalid(); *trust=o.trust;
+                lp_push(&batch->observations,o);
+            }
+            SPI_freetuptable(SPI_tuptable);
+        }
+        SPI_cursor_close(scan); SPI_freeplan(plan); pfree(sql); if (selected) pfree(selected);
+        if (lp_idmap_count(batch->witnesses)) {
+            compute_attested_rows(lp_idmap_keys(batch->claims), (int)count, idarray, 0, 0,
+                batch->witnesses, batch->witnesses, &batch->historical);
+            for (size_t i=0; i<batch->historical.n; i++) {
+                const PgAttrRow *r=batch->historical.v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
+                if (lp_strmap_find(batch->pairs,key,sizeof key)>=0 || r->games<=0) continue;
+                PgSeriesWitness *w=lp_idmap_lookup(batch->witnesses,&r->trunk);
+                if (!w || r->games>9007199254740992.0 || !isfinite(r->games)) pg_series_invalid();
+                PgSeriesObservation o={.claim=r->claim,.witness=r->trunk,.games=(uint64_t)r->games,
+                    .score=r->score/r->games,.trust=r->has_dependence?r->trust:w->trust,
+                    .has_lineage=r->has_dependence || w->has_lineage,
+                    .lineage=r->has_dependence?r->dependence:w->lineage};
+                lp_push(&batch->observations,o);
+            }
+        }
+        lp_sort(batch->observations.v,batch->observations.n,sizeof(PgSeriesObservation),pg_series_by_claim);
+        lp_id *ordered=palloc(count*sizeof(lp_id)); memcpy(ordered,lp_idmap_keys(batch->claims),count*sizeof(lp_id));
+        lp_sort(ordered,count,sizeof(lp_id),lp_id_cmp);
+        size_t at=0;
+        for (size_t i=0; i<count; i++) {
+            CHECK_FOR_INTERRUPTS(); batch->entries.n=0;
+            while (at<batch->observations.n && lp_id_eq(&batch->observations.v[at].claim,ordered+i)) {
+                const PgSeriesObservation *o=batch->observations.v+at++;
+                lp_id root=pg_series_root(batch,o->has_lineage?o->lineage:o->witness);
+                double score=o->trust<0?1-o->score:o->score;
+                lp_series_entry entry=lp_series_observation(root,o->games,(double)o->games*score,fabs(o->trust));
+                lp_push(&batch->entries,entry);
+            }
+            Datum values[5]={id_datum(ordered+i),0,0,0,0}; bool missing[5]={false,true,true,true,true};
+            if (batch->entries.n) {
+                lp_standing standing;
+                if (!lp_series(batch->entries.v,batch->entries.n,&standing) || standing.matches>PG_INT64_MAX)
+                    ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("laplace_series: invalid or non-convergent rooted series")));
+                values[1]=Float8GetDatum(standing.rating); values[2]=Float8GetDatum(standing.deviation);
+                values[3]=Float8GetDatum(standing.volatility); values[4]=Int64GetDatum((int64)standing.matches);
+                memset(missing,0,sizeof missing);
+            }
+            set_put(fcinfo,result,td,values,missing); pfree(DatumGetPointer(values[0]));
+        }
+    }
+    SPI_finish(); MemoryContextSwitchTo(caller); MemoryContextDelete(context);
     PG_RETURN_NULL();
 }

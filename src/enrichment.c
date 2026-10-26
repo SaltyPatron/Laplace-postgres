@@ -4,6 +4,8 @@
 #include "pg_core.h"
 #include "access/table.h"
 #include "access/htup_details.h"
+#include "access/genam.h"
+#include "access/nbtree.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
@@ -15,10 +17,21 @@
 #include "utils/plancache.h"
 #include "utils/rel.h"
 #include "utils/hsearch.h"
+#include "utils/rls.h"
+#include "utils/snapmgr.h"
 #include "utils/partcache.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partbounds.h"
 #include <limits.h>
+
+typedef struct { Oid partition; lp_id id; int ordinal; } PresenceKey;
+static int presence_order(const void *a,const void *b)
+{
+    const PresenceKey *x=a,*y=b;
+    if(x->partition!=y->partition)return x->partition<y->partition?-1:1;
+    int compare=memcmp(x->id.b,y->id.b,sizeof(lp_id));
+    return compare?compare:(x->ordinal>y->ordinal)-(x->ordinal<y->ordinal);
+}
 
 typedef struct { Oid partition; lp_id id; ItemPointerData source; } EnrichmentKey;
 
@@ -33,6 +46,72 @@ static Oid enrichment_partition(Oid target, PartitionKey key, PartitionDesc part
         if (index >= 0) return partitions->oids[index];
     }
     return target;
+}
+
+/* One request for a complete client frontier. Native routes its keys once,
+ * then each destination btree walks a sorted array rather than restarting
+ * partition pruning and root lookup for every scalar ID. */
+PG_FUNCTION_INFO_V1(laplace_present_ids);
+Datum laplace_present_ids(PG_FUNCTION_ARGS)
+{
+    TupleDesc descriptor; Tuplestorestate *output=set_begin(fcinfo,"laplace_present_ids",&descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    if(!count){pfree(ids);PG_RETURN_NULL();}
+    Oid target=get_relname_relid("entity",get_namespace_oid("public",false));
+    Relation parent=table_open(target,AccessShareLock);
+    if(check_enable_rls(target,InvalidOid,false)==RLS_ENABLED)
+        ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("laplace_present_ids requires the canonical shared entity relation")));
+    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_present_ids: SPI_connect")));
+    /* Check parent/column SELECT privileges through PostgreSQL's executor;
+     * direct child access must not require additional child grants. */
+    if(SPI_execute("SELECT id FROM public.entity WHERE false",true,0)!=SPI_OK_SELECT)
+        ereport(ERROR,(errmsg("laplace_present_ids: permission proof failed")));
+    SPI_freetuptable(SPI_tuptable);SPI_finish();
+    List *children=find_all_inheritors(target,AccessShareLock,NULL);list_free(children);
+    PartitionKey key=RelationGetPartitionKey(parent);
+    if(!key || key->strategy!=PARTITION_STRATEGY_RANGE || key->partnatts!=1
+        || key->partattrs[0]!=get_attnum(target,"id"))
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_present_ids requires Native entity range partitions")));
+    PartitionDesc partitions=RelationGetPartitionDesc(parent,true);
+    PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
+    for(int i=0;i<count;i++)keys[i]=(PresenceKey){
+        .partition=enrichment_partition(target,key,partitions,PointerGetDatum(ids+i)),.id=ids[i],.ordinal=i+1};
+    pfree(ids);lp_sort(keys,(size_t)count,sizeof(*keys),presence_order);
+    Oid native_id=get_atttype(target,get_attnum(target,"id"));
+    for(int begin=0;begin<count;){
+        CHECK_FOR_INTERRUPTS();int end=begin+1;
+        while(end<count && keys[end].partition==keys[begin].partition)end++;
+        Relation table=table_open(keys[begin].partition,AccessShareLock);
+        Oid primary=RelationGetPrimaryKeyIndex(table,false);
+        if(!OidIsValid(primary))ereport(ERROR,(errmsg("laplace_present_ids: Native partition has no primary index")));
+        Relation index=index_open(primary,AccessShareLock);
+        Datum *values=palloc((Size)(end-begin)*sizeof(Datum));
+        for(int i=begin;i<end;i++)values[i-begin]=PointerGetDatum(&keys[i].id);
+        ArrayType *wanted=construct_array(values,end-begin,native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
+        pfree(values);
+        Oid equality=get_opfamily_member(index->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
+        ScanKeyData scan_key;
+        ScanKeyEntryInitialize(&scan_key,SK_SEARCHARRAY,1,BTEqualStrategyNumber,native_id,
+            index->rd_indcollation[0],get_opcode(equality),PointerGetDatum(wanted));
+        IndexScanDesc scan=index_beginscan(table,index,GetActiveSnapshot(),NULL,1,0);
+        index_rescan(scan,&scan_key,1,NULL,0);
+        TupleTableSlot *slot=table_slot_create(table,NULL);int at=begin;
+        while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+            CHECK_FOR_INTERRUPTS();bool missing;
+            Datum found=slot_getattr(slot,get_attnum(target,"id"),&missing);
+            if(missing)ereport(ERROR,(errmsg("laplace_present_ids: null primary ID")));
+            const lp_id *id=(const lp_id *)DatumGetPointer(found);
+            while(at<end && memcmp(keys[at].id.b,id->b,sizeof(lp_id))<0)at++;
+            while(at<end && lp_id_eq(&keys[at].id,id)){
+                Datum row[2]={id_datum(id),Int64GetDatum(keys[at++].ordinal)};bool nulls[2]={false,false};
+                set_put(fcinfo,output,descriptor,row,nulls);pfree(DatumGetPointer(row[0]));
+            }
+            ExecClearTuple(slot);
+        }
+        ExecDropSingleTupleTableSlot(slot);index_endscan(scan);pfree(wanted);
+        index_close(index,NoLock);table_close(table,NoLock);begin=end;
+    }
+    pfree(keys);table_close(parent,NoLock);PG_RETURN_NULL();
 }
 
 static long enrichment_fetch_rows(void)
