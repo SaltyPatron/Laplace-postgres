@@ -1,6 +1,6 @@
-/* Route copied stage keys through the ordinary parent-table UPDATE. Each
- * parameter contains keys from one destination partition, so PostgreSQL can
- * prune the other targets without changing parent-table permissions. */
+/* Shared Native primary-key set reads and partition-directed metadata updates.
+ * Exact IDs route to their canonical ranges; parent-table privileges remain
+ * authoritative for both membership and path retrieval. */
 #include "pg_core.h"
 #include "access/table.h"
 #include "access/htup_details.h"
@@ -30,7 +30,7 @@ static long enrichment_fetch_rows(void);
 static int presence_order(const void *a,const void *b)
 {
     const PresenceKey *x=a,*y=b;
-    if(x->partition!=y->partition)return x->partition<y->partition?-1:1;
+    /* ID order groups nonoverlapping ranges independently of relation OIDs. */
     int compare=memcmp(x->id.b,y->id.b,sizeof(lp_id));
     return compare?compare:(x->ordinal>y->ordinal)-(x->ordinal<y->ordinal);
 }
@@ -52,8 +52,9 @@ static Oid enrichment_partition(Oid target, PartitionKey key, PartitionDesc part
 
 /* Shared indexed membership kernel for client frontiers and the final flat
  * overlap verification. Neither path reads coordinates to establish identity. */
-static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleDesc descriptor,
-                          Relation parent,const char *column,PresenceKey *keys,int count)
+typedef void (*NativeKeyVisit)(TupleTableSlot *slot,const PresenceKey *key,void *context);
+static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,size_t count,
+                         NativeKeyVisit visit,void *context)
 {
     Oid target=RelationGetRelid(parent);
     AttrNumber attribute=get_attnum(target,column);
@@ -62,19 +63,23 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
         || key->partattrs[0]!=attribute)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native presence requires canonical ID range partitions")));
     PartitionDesc partitions=RelationGetPartitionDesc(parent,true);
-    for(int i=0;i<count;i++)keys[i].partition=enrichment_partition(target,key,partitions,PointerGetDatum(&keys[i].id));
+    for(size_t i=0;i<count;i++)keys[i].partition=enrichment_partition(target,key,partitions,PointerGetDatum(&keys[i].id));
     lp_sort(keys,(size_t)count,sizeof(*keys),presence_order);
     Oid native_id=get_atttype(target,attribute);
-    for(int begin=0;begin<count;){
-        CHECK_FOR_INTERRUPTS();int end=begin+1;
+    for(size_t begin=0;begin<count;){
+        CHECK_FOR_INTERRUPTS();size_t end=begin+1;
         while(end<count && keys[end].partition==keys[begin].partition)end++;
+        /* The PostgreSQL array representation bounds one index search, not
+         * the admitted frontier. Continue with the remaining IDs if needed. */
+        size_t array_ids=(MaxAllocSize-ARR_OVERHEAD_NONULLS(1))/sizeof(lp_id);
+        if(end-begin>array_ids)end=begin+array_ids;
         Relation table=table_open(keys[begin].partition,AccessShareLock);
         Oid primary=RelationGetPrimaryKeyIndex(table,false);
         if(!OidIsValid(primary))ereport(ERROR,(errmsg("laplace_present_ids: Native partition has no primary index")));
         Relation index=index_open(primary,AccessShareLock);
         Datum *values=palloc((Size)(end-begin)*sizeof(Datum));
-        for(int i=begin;i<end;i++)values[i-begin]=PointerGetDatum(&keys[i].id);
-        ArrayType *wanted=construct_array(values,end-begin,native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
+        for(size_t i=begin;i<end;i++)values[i-begin]=PointerGetDatum(&keys[i].id);
+        ArrayType *wanted=construct_array(values,(int)(end-begin),native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
         pfree(values);
         Oid equality=get_opfamily_member(index->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
         ScanKeyData scan_key;
@@ -82,7 +87,7 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
             index->rd_indcollation[0],get_opcode(equality),PointerGetDatum(wanted));
         IndexScanDesc scan=index_beginscan(table,index,GetActiveSnapshot(),NULL,1,0);
         index_rescan(scan,&scan_key,1,NULL,0);
-        TupleTableSlot *slot=table_slot_create(table,NULL);int at=begin;
+        TupleTableSlot *slot=table_slot_create(table,NULL);size_t at=begin;
         while(index_getnext_slot(scan,ForwardScanDirection,slot)){
             CHECK_FOR_INTERRUPTS();bool missing;
             Datum found=slot_getattr(slot,attribute,&missing);
@@ -90,8 +95,7 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
             const lp_id *id=(const lp_id *)DatumGetPointer(found);
             while(at<end && memcmp(keys[at].id.b,id->b,sizeof(lp_id))<0)at++;
             while(at<end && lp_id_eq(&keys[at].id,id)){
-                Datum row[2]={id_datum(id),Int64GetDatum(keys[at++].ordinal)};bool nulls[2]={false,false};
-                set_put(fcinfo,output,descriptor,row,nulls);pfree(DatumGetPointer(row[0]));
+                visit(slot,&keys[at++],context);
             }
             ExecClearTuple(slot);
         }
@@ -100,7 +104,21 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
     }
 }
 
-static Relation presence_parent(Oid target,const char **column)
+typedef struct { FunctionCallInfo fcinfo; Tuplestorestate *output; TupleDesc descriptor; } PresenceOutput;
+static void presence_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    PresenceOutput *out=context;
+    Datum row[2]={id_datum(&key->id),Int64GetDatum(key->ordinal)};bool nulls[2]={false,false};
+    set_put(out->fcinfo,out->output,out->descriptor,row,nulls);pfree(DatumGetPointer(row[0]));
+}
+static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleDesc descriptor,
+                          Relation parent,const char *column,PresenceKey *keys,int count)
+{
+    PresenceOutput out={fcinfo,output,descriptor};
+    indexed_keys(parent,column,keys,(size_t)count,presence_visit,&out);
+}
+
+static Relation presence_parent(Oid target,const char **column,const char *columns)
 {
     Oid schema=get_namespace_oid("public",false);
     bool paths=target==get_relname_relid("physicality",schema);
@@ -110,12 +128,39 @@ static Relation presence_parent(Oid target,const char **column)
     Relation parent=table_open(target,AccessShareLock);
     if(check_enable_rls(target,InvalidOid,false)==RLS_ENABLED)
         ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native presence requires a canonical shared relation without active RLS")));
-    char *permission=psprintf("SELECT %s FROM public.%s WHERE false",*column,paths?"physicality":"entity");
+    char *permission=psprintf("SELECT %s FROM public.%s WHERE false",columns?columns:*column,paths?"physicality":"entity");
     if(SPI_execute(permission,true,0)!=SPI_OK_SELECT)
         ereport(ERROR,(errmsg("Native presence: permission proof failed")));
     SPI_freetuptable(SPI_tuptable);pfree(permission);
     List *children=find_all_inheritors(target,AccessShareLock,NULL);list_free(children);
     return parent;
+}
+
+typedef struct {
+    lp_pg_path_visit visit;void *context;AttrNumber path,mask;MemoryContext tuple_context;
+} PathFrontier;
+static void path_frontier_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    PathFrontier *front=context;bool path_null,mask_null;
+    Datum path=slot_getattr(slot,front->path,&path_null),mask=slot_getattr(slot,front->mask,&mask_null);
+    if(path_null||mask_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native path frontier: null carrier")));
+    MemoryContext previous=MemoryContextSwitchTo(front->tuple_context);
+    front->visit(&key->id,path,mask,front->context);
+    MemoryContextSwitchTo(previous);MemoryContextReset(front->tuple_context);
+}
+void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context)
+{
+    if(!count)return;
+    const char *column;Oid target=get_relname_relid("physicality",get_namespace_oid("public",false));
+    Relation parent=presence_parent(target,&column,"entity,path,mask");
+    if(count>MaxAllocHugeSize/sizeof(PresenceKey))
+        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native path frontier exceeds addressable memory")));
+    PresenceKey *keys=palloc_extended(count*sizeof(*keys),MCXT_ALLOC_HUGE);
+    for(size_t i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
+    PathFrontier front={visit,context,get_attnum(target,"path"),get_attnum(target,"mask"),
+        AllocSetContextCreate(CurrentMemoryContext,"Native path frontier tuple",ALLOCSET_DEFAULT_SIZES)};
+    indexed_keys(parent,column,keys,count,path_frontier_visit,&front);
+    MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
 }
 
 PG_FUNCTION_INFO_V1(laplace_present_ids);
@@ -126,7 +171,7 @@ Datum laplace_present_ids(PG_FUNCTION_ARGS)
     if(!count){pfree(ids);PG_RETURN_NULL();}
     if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_present_ids: SPI_connect")));
     const char *column;
-    Relation parent=presence_parent(get_relname_relid("entity",get_namespace_oid("public",false)),&column);
+    Relation parent=presence_parent(get_relname_relid("entity",get_namespace_oid("public",false)),&column,NULL);
     PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
     for(int i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=i+1};
     presence_keys(fcinfo,output,descriptor,parent,column,keys,count);
@@ -147,7 +192,7 @@ Datum laplace_present_stage(PG_FUNCTION_ARGS)
         || get_atttype(input,get_attnum(input,present_column))!=BOOLOID)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_present_stage requires a private stage ID set and boolean presence column")));
     if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_present_stage: SPI_connect")));
-    const char *column;Relation parent=presence_parent(target,&column);
+    const char *column;Relation parent=presence_parent(target,&column,NULL);
     if(get_atttype(input,get_attnum(input,id_column))!=get_atttype(target,get_attnum(target,column)))
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_present_stage requires Native content IDs")));
     char *source=quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)),RelationGetRelationName(stage));

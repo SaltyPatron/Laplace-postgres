@@ -50,6 +50,22 @@ including duplicate input occurrences. It checks parent-column SELECT
 permissions and rejects active row-level security. Virtual Tier-0 membership
 remains the client's perf-cache responsibility.
 
+Containment frontiers, explicit root/claim selections and series-carrier
+validation reuse that primary-key kernel. Only compact ID keys are sorted;
+Native visits their range indexes in ID order and consumes paths directly.
+This avoids a cardinality-dependent SQL join choosing full physicality scans
+and a multi-gigabyte external sort. Path/mask column privileges and the shared
+relation's RLS boundary are checked before direct access. Tuple detoasting is
+released as each carrier is consumed; graph state remains transaction-owned.
+
+A real ISO witness read on 2026-10-26 returned 93,441 series in 1.55 seconds
+with the candidate, versus 70.91 seconds through the previous containment path.
+A complete comparison of all returned columns found zero differences. The
+profile attributed 68.94 seconds of the old path to database frontier fetches;
+large frontiers scanned all 256 physicality partitions and externally sorted
+3.49 GiB. These are populated-database containment measurements, not parsing,
+COPY, publication or whole-source ingest throughput.
+
 `laplace_series_snapshot` and `laplace_stage_snapshot` share one Native batch
 calculation: carrier validation, witness registry, transitive lineage,
 containment testimony and the existing series solver. The stage API keeps the

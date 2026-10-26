@@ -645,6 +645,43 @@ DO $$ BEGIN
     ) differences
   ) THEN RAISE EXCEPTION 'large frontier changed witness attribution'; END IF;
 END $$;
+-- Direct Native primary-index reads retain parent-column privileges. A
+-- reader of IDs/masks cannot acquire paths through the containment function.
+DO $$
+DECLARE reader text := 'laplace_frontier_reader_' || pg_backend_pid();
+        owner_name text := current_user;
+        root blake3 := (SELECT id FROM cursor_root);
+        a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        denied boolean := false;found bigint;
+BEGIN
+  EXECUTE format('CREATE ROLE %I',reader);
+  EXECUTE format('GRANT USAGE ON SCHEMA public TO %I',reader);
+  EXECUTE format('GRANT SELECT(entity,mask) ON public.physicality TO %I',reader);
+  EXECUTE format('SET LOCAL ROLE %I',reader);
+  BEGIN
+    PERFORM count(*) FROM laplace_contained_series(ARRAY[root]);
+  EXCEPTION WHEN insufficient_privilege THEN denied := true;
+  END;
+  EXECUTE format('SET LOCAL ROLE %I',owner_name);
+  IF NOT denied THEN RAISE EXCEPTION 'Native frontier bypassed path-column privileges'; END IF;
+  EXECUTE format('GRANT SELECT(path) ON public.physicality TO %I',reader);
+  EXECUTE format('SET LOCAL ROLE %I',reader);
+  SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[root])
+    WHERE claim=a AND games=2049 AND score=2049;
+  EXECUTE format('SET LOCAL ROLE %I',owner_name);
+  IF found<>1 THEN RAISE EXCEPTION 'column-scoped Native frontier lost testimony'; END IF;
+  ALTER TABLE public.physicality ENABLE ROW LEVEL SECURITY;
+  denied := false;
+  EXECUTE format('SET LOCAL ROLE %I',reader);
+  BEGIN
+    PERFORM count(*) FROM laplace_contained_series(ARRAY[root]);
+  EXCEPTION WHEN feature_not_supported THEN denied := true;
+  END;
+  EXECUTE format('SET LOCAL ROLE %I',owner_name);
+  ALTER TABLE public.physicality DISABLE ROW LEVEL SECURITY;
+  IF NOT denied THEN RAISE EXCEPTION 'Native frontier bypassed active row-level security'; END IF;
+END $$;
+
 SELECT 'attestation: large frontier preserves exact witness attribution';
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
