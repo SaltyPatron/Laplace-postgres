@@ -61,8 +61,7 @@ DO $$ BEGIN
 END $$;
 CREATE ROLE :"writer";
 GRANT USAGE ON SCHEMA public TO :"writer";
-GRANT INSERT,TRUNCATE ON public.physicality_00 TO :"writer";
-GRANT EXECUTE ON FUNCTION public.laplace_clean_pending_list(regclass) TO :"writer";
+GRANT INSERT,UPDATE ON public.physicality_00 TO :"writer";
 SELECT public.laplace_ensure_stage();
 CREATE UNLOGGED TABLE stage.candidate_maintenance_keys (entity blake3);
 CREATE UNLOGGED TABLE stage.candidate_unwritable_keys (entity blake3);
@@ -75,6 +74,10 @@ CREATE INDEX candidate_unrelated_gin ON public.candidate_unrelated USING gin(val
 GRANT INSERT,TRUNCATE ON public.candidate_unrelated TO :"writer";
 SET SESSION AUTHORIZATION :"writer";
 DO $$ DECLARE selected regclass; BEGIN
+  BEGIN
+    TRUNCATE public.physicality_00;
+    RAISE EXCEPTION 'ingestion unexpectedly has canonical-table TRUNCATE';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   SELECT i.indexrelid INTO STRICT selected FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
     WHERE i.indrelid='public.physicality_00'::regclass AND a.amname='gin';
