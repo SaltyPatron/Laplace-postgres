@@ -268,7 +268,6 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
     char *source = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)), RelationGetRelationName(stage));
     char *destination = quote_qualified_identifier("public", paths ? "physicality" : "entity");
     char *proof_name=NULL,*restriction=pstrdup("");
-    double selected_rows=stage->rd_rel->reltuples;
     if(PG_NARGS()>2){
         Oid selected=PG_GETARG_OID(2);Relation proof=table_open(selected,ShareLock);
         bool private=(isTempNamespace(RelationGetNamespace(proof)) && proof->rd_rel->relpersistence==RELPERSISTENCE_TEMP)
@@ -282,7 +281,7 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
         proof_name=quote_qualified_identifier(get_namespace_name(RelationGetNamespace(proof)),RelationGetRelationName(proof));
         pfree(restriction);restriction=direct?pstrdup(" AND s.present"):
             psprintf(" AND EXISTS (SELECT FROM %s classified WHERE classified.id=s.%s AND classified.%s)",proof_name,key,flag);
-        selected_rows=(double)PG_GETARG_INT64(3);table_close(proof,NoLock);
+        table_close(proof,NoLock);
     }
     const char *changed = paths
         ? "(d.tier>s.tier OR (d.mask|s.mask)<>d.mask OR CASE WHEN s.path IS NULL THEN false ELSE (ST_AsEWKB(d.path)<>ST_AsEWKB(s.path)"
@@ -301,33 +300,6 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
                            source, key, key, key, needed,restriction);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errmsg("laplace_enrich_stage: SPI_connect")));
-    /* A set covering the destination should use the original full set join,
-     * rather than many indexed destination groups. Compare analyzed row
-     * cardinalities, not a fixed batch size or a configurable cutoff. Unknown
-     * destination statistics leave routing in effect. */
-    Oid relation_type = REGCLASSOID; Datum relation = ObjectIdGetDatum(target);
-    if (SPI_execute_with_args("SELECT CASE WHEN min(c.reltuples)<0 THEN NULL ELSE sum(c.reltuples::float8) END"
-            " FROM pg_partition_tree($1) p JOIN pg_class c ON c.oid=p.relid WHERE p.isleaf",
-            1, &relation_type, &relation, NULL, true, 1) != SPI_OK_SELECT)
-        ereport(ERROR, (errmsg("laplace_enrich_stage: destination statistics failed")));
-    bool unknown;
-    Datum destination_rows = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &unknown);
-    bool complete_set = !unknown && selected_rows >= 0
-        && selected_rows >= DatumGetFloat8(destination_rows);
-    SPI_freetuptable(SPI_tuptable);
-    if (complete_set) {
-        char *whole = psprintf("UPDATE %s d SET tier=CASE WHEN %s THEN least(d.tier,s.tier) ELSE d.tier END,mask=laplace_mask_merge(d.mask,s.mask)%s"
-                              " FROM %s s WHERE d.%s=s.%s AND %s%s", destination,compatible,
-                              paths ? ",path=CASE WHEN s.path IS NULL THEN d.path WHEN ST_AsEWKB(d.path)<>ST_AsEWKB(s.path)"
-                              " THEN laplace_path_enrich(d.path,s.path) ELSE d.path END" : "",
-                              source, key, key, needed,restriction);
-        if (SPI_execute(whole, false, 0) != SPI_OK_UPDATE)
-            ereport(ERROR, (errmsg("laplace_enrich_stage: complete-set update failed")));
-        uint64 updated = SPI_processed;
-        SPI_finish(); table_close(stage, NoLock); table_close(parent, NoLock);
-        pfree(whole); pfree(source); pfree(destination); pfree(select); pfree(update);
-        PG_RETURN_INT64((int64)updated);
-    }
     /* A custom UPDATE sees the actual partition-local ID array. It has the
      * same parent permissions and latest-tuple enrichment guard as before. */
     Oid types[2] = {idarray, TIDARRAYOID};

@@ -90,6 +90,19 @@ interface does not replace the ingest spine's client-side novelty descent.
 
 ## CI installation boundary
 
+Native owns function binding contracts in `manifest/function_bindings.tsv`.
+The compiler call-graph check verifies that registry against all exported C
+entry points. `laplace_restore_function_bindings()` restores it on existing
+installations: ROM/geometry/index intrinsics run directly, SQL/SPI entry points
+retain their namespace scope, and thin SQL adapters use parsed `BEGIN ATOMIC`
+bodies whose references bind at definition time. Consumers call this owner
+instead of assigning settings to every extension function.
+
+Frozen bank and value names bind once per expression; varying arguments are
+checked before reusing that binding. Existing-carrier updates always use the
+partition-routed copied ID set. There is no statistics-selected whole-table
+update alternative.
+
 Pull-request CI builds a candidate and runs `tests/extension-install.sh` against a private `DESTDIR` package and a newly created test database. PostgreSQL 18's `extension_control_path` selects that package. Only its private control file is rewritten to reference the candidate module; an assertion checks every extension C function's module binding. The test executes `laplace_isa()` and removes its database and package. Failed database cleanup preserves the package and fails the job.
 
 PR CI does not install into shared PostgreSQL directories or migrate the declared application database. Shared installation and extension upgrades belong to Operations deployment after merge. This boundary uses PostgreSQL's documented [extension search paths](https://www.postgresql.org/docs/18/runtime-config-client.html); the Windows installation path has not been qualified by this Linux test.

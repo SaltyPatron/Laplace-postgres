@@ -1004,24 +1004,62 @@ static int64 mask_slot(const lp_bank *bank, text *value){
     return lp_highway_slot(highway(), bank->list, &ref.id);
 }
 
+/* Frozen names are execution bindings, not per-row text to decompose. Keep
+ * one binding per expression and compare the actual arguments so prepared
+ * executions and row-varying names cannot reuse another argument's slot. */
+typedef struct {
+    const lp_bank *bank;
+    char *bank_name, *value_name;
+    size_t bank_bytes, value_bytes;
+    int64 slot;
+    bool has_value;
+} MaskBinding;
+static MaskBinding *mask_binding(FunctionCallInfo fcinfo, int bank_arg, int value_arg){
+    MaskBinding *binding=fcinfo->flinfo->fn_extra;
+    if(!binding){
+        binding=MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt,sizeof *binding);
+        fcinfo->flinfo->fn_extra=binding;
+    }
+    text *name=PG_GETARG_TEXT_PP(bank_arg); size_t bytes=VARSIZE_ANY_EXHDR(name);
+    if(!binding->bank || binding->bank_bytes!=bytes || memcmp(binding->bank_name,VARDATA_ANY(name),bytes)){
+        const lp_bank *bank=mask_bank(name);
+        char *saved=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
+        memcpy(saved,VARDATA_ANY(name),bytes);
+        if(binding->bank_name)pfree(binding->bank_name);
+        binding->bank_name=saved;binding->bank_bytes=bytes;
+        binding->bank=bank;binding->has_value=false;
+    }
+    if(value_arg>=0){
+        text *value=PG_GETARG_TEXT_PP(value_arg); bytes=VARSIZE_ANY_EXHDR(value);
+        if(!binding->has_value || binding->value_bytes!=bytes || memcmp(binding->value_name,VARDATA_ANY(value),bytes)){
+            int64 slot=mask_slot(binding->bank,value);
+            char *saved=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
+            memcpy(saved,VARDATA_ANY(value),bytes);
+            if(binding->value_name)pfree(binding->value_name);
+            binding->value_name=saved;binding->value_bytes=bytes;
+            binding->slot=slot;binding->has_value=true;
+        }
+    }
+    return binding;
+}
+
 PG_FUNCTION_INFO_V1(laplace_mask_slot);
 Datum laplace_mask_slot(PG_FUNCTION_ARGS){
-    const lp_bank *bank = mask_bank(PG_GETARG_TEXT_PP(0));
-    int64 slot = mask_slot(bank, PG_GETARG_TEXT_PP(1)); lp_mask value = 0;
-    if (slot < 0 || !lp_mask_put(&value, bank, (uint32)slot)) PG_RETURN_NULL();
+    MaskBinding *binding=mask_binding(fcinfo,0,1); lp_mask value = 0;
+    if (binding->slot < 0 || !lp_mask_put(&value, binding->bank, (uint32)binding->slot)) PG_RETURN_NULL();
     PG_RETURN_VARBIT_P(mask_sql(value));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_field);
-Datum laplace_mask_field(PG_FUNCTION_ARGS){ PG_RETURN_VARBIT_P(mask_sql(lp_mask_field(mask_bank(PG_GETARG_TEXT_PP(0))))); }
+Datum laplace_mask_field(PG_FUNCTION_ARGS){ PG_RETURN_VARBIT_P(mask_sql(lp_mask_field(mask_binding(fcinfo,0,-1)->bank))); }
 PG_FUNCTION_INFO_V1(laplace_mask_value);
 Datum laplace_mask_value(PG_FUNCTION_ARGS){
-    PG_RETURN_INT16((int16)lp_mask_get(mask_native(PG_GETARG_VARBIT_P(0)), mask_bank(PG_GETARG_TEXT_PP(1))));
+    PG_RETURN_INT16((int16)lp_mask_get(mask_native(PG_GETARG_VARBIT_P(0)), mask_binding(fcinfo,1,-1)->bank));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_has_value);
 Datum laplace_mask_has_value(PG_FUNCTION_ARGS){
     lp_mask value = mask_native(PG_GETARG_VARBIT_P(0));
-    const lp_bank *bank = mask_bank(PG_GETARG_TEXT_PP(1)); int64 slot = mask_slot(bank, PG_GETARG_TEXT_PP(2));
-    PG_RETURN_BOOL(slot >= 0 && lp_mask_has(value, bank, (uint32)slot));
+    MaskBinding *binding=mask_binding(fcinfo,1,2);
+    PG_RETURN_BOOL(binding->slot >= 0 && lp_mask_has(value, binding->bank, (uint32)binding->slot));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_valid);
 Datum laplace_mask_valid(PG_FUNCTION_ARGS){

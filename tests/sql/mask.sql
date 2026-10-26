@@ -29,6 +29,15 @@ BEGIN
      OR (number & laplace_mask_field('upos')) = noun THEN
     RAISE EXCEPTION 'NUM must not match the NOUN enum field';
   END IF;
+  IF EXISTS (
+    SELECT FROM (VALUES
+      (claim,'kind','claim',true), (claim,'kind','record',false),
+      (noun,'upos','NOUN',true), (noun,'upos','NUM',false),
+      (claim,'kind','not_a_kind',false), (claim,'kind','claim',true),
+      (noun,'upos','NOUN',true), (noun,'upos','',false)
+    ) AS rows(mask,bank,value,expected)
+    WHERE laplace_mask_has_value(mask,bank,value) IS DISTINCT FROM expected
+  ) THEN RAISE EXCEPTION 'a cached mask binding escaped its bank/value arguments'; END IF;
   IF (combined & laplace_mask_field('upos')) <> noun
      OR (combined & claim) <> claim
      OR laplace_mask_merge(noun, animal) <> (noun | animal)
