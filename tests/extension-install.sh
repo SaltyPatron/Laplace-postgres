@@ -3,6 +3,7 @@
 # newly created test database. Shared extension files and application DBs stay untouched.
 set -euo pipefail
 build=${1:?usage: extension-install.sh /path/to/cmake-build}
+node "$(dirname "$0")/../tools/check-function-bindings.mjs" "$build"
 source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${LAPLACE_PG_DIR:?PostgreSQL installation required}"
 : "${LAPLACE_CONNINFO:?declared PostgreSQL connection required}"
@@ -118,6 +119,7 @@ DROP TABLE geometry_cases;
 \i :geometry_suite
 \i :frontier_cases
 SQL
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -f "$source_root/tests/sql/function_bindings.sql"
 isolation="$LAPLACE_PG_DIR/lib/pgxs/src/test/isolation/isolationtester"
 [[ -x "$isolation" ]] || { echo "PostgreSQL isolation tester required: $isolation" >&2; exit 1; }
 "$isolation" "$connection" < "$source_root/tests/specs/stage_overlap.spec" > "$stage/stage-overlap.out"
