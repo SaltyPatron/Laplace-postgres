@@ -1023,18 +1023,20 @@ static MaskBinding *mask_binding(FunctionCallInfo fcinfo, int bank_arg, int valu
     text *name=PG_GETARG_TEXT_PP(bank_arg); size_t bytes=VARSIZE_ANY_EXHDR(name);
     if(!binding->bank || binding->bank_bytes!=bytes || memcmp(binding->bank_name,VARDATA_ANY(name),bytes)){
         const lp_bank *bank=mask_bank(name);
+        char *saved=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
+        memcpy(saved,VARDATA_ANY(name),bytes);
         if(binding->bank_name)pfree(binding->bank_name);
-        binding->bank_name=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
-        memcpy(binding->bank_name,VARDATA_ANY(name),bytes);binding->bank_bytes=bytes;
+        binding->bank_name=saved;binding->bank_bytes=bytes;
         binding->bank=bank;binding->has_value=false;
     }
     if(value_arg>=0){
         text *value=PG_GETARG_TEXT_PP(value_arg); bytes=VARSIZE_ANY_EXHDR(value);
         if(!binding->has_value || binding->value_bytes!=bytes || memcmp(binding->value_name,VARDATA_ANY(value),bytes)){
             int64 slot=mask_slot(binding->bank,value);
+            char *saved=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
+            memcpy(saved,VARDATA_ANY(value),bytes);
             if(binding->value_name)pfree(binding->value_name);
-            binding->value_name=MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,Max(bytes,(size_t)1));
-            memcpy(binding->value_name,VARDATA_ANY(value),bytes);binding->value_bytes=bytes;
+            binding->value_name=saved;binding->value_bytes=bytes;
             binding->slot=slot;binding->has_value=true;
         }
     }
