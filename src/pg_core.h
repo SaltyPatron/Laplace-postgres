@@ -16,6 +16,7 @@
 
 const lp_tier0_record *lp_pg_tier0(void);
 lp_text *lp_pg_text_context(void);
+const lp_layout *lp_pg_flags(void);
 lp_mask lp_pg_mask_native(Datum mask);
 lp_mask lp_pg_kind_mask(const char *role);
 
@@ -35,6 +36,9 @@ void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit
  * indexes retain ascending ID order without sorting geometry in SQL. */
 typedef void (*lp_pg_path_visit)(const lp_id *id,Datum path,Datum mask,void *context);
 void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context);
+/* Registered witness roots, or an explicit subset; visit each stored path once. */
+typedef void (*lp_pg_stored_path_visit)(const lp_id *id,lp_path path,Datum mask,void *context);
+void lp_pg_walk_witnesses(ArrayType *roots,lp_pg_stored_path_visit visit,void *context);
 /* Positive classifications (for example mapped Tier-0 IDs) are retained.
  * Only false entries are probed; missing stored IDs stay false. */
 void lp_pg_present(const lp_id *ids,size_t count,bool *present);

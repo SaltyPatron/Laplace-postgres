@@ -43,6 +43,11 @@ BEGIN
     OR (SELECT count(*) FROM "native tenant".laplace_present_ids(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed set binding failed';
  END IF;
+ INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
+ IF (SELECT count(*) FROM "native tenant".laplace_ordered_pair_counts(NULL,1,1,ARRAY[id]))<>1
+    OR pg_catalog.cardinality("native tenant".laplace_separator_ids())<>85 THEN
+  RAISE EXCEPTION 'installed ordered structure binding failed';
+ END IF;
  IF EXISTS(SELECT FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
   JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
   WHERE e.extname='laplace' AND d.deptype='e' AND NOT p.prosecdef AND p.proconfig IS NOT NULL) THEN

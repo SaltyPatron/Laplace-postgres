@@ -22,8 +22,8 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38-to-1.39 development
-transition. The two installable scripts are generated under the build's
+CMake includes it in both the baseline and the in-place 1.38/1.39-to-1.40 development
+transitions from one update template. The three installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
 `CREATE EXTENSION laplace SCHEMA chosen_schema` binds the native substrate to
@@ -174,3 +174,17 @@ update alternative.
 Pull-request CI builds a candidate and runs `tests/extension-install.sh` against a private `DESTDIR` package and a newly created test database. PostgreSQL 18's `extension_control_path` selects that package. Only its private control file is rewritten to reference the candidate module; an assertion checks every extension C function's module binding. The test executes `laplace_isa()` and removes its database and package. Failed database cleanup preserves the package and fails the job.
 
 PR CI does not install into shared PostgreSQL directories or migrate the declared application database. Shared installation and extension upgrades belong to Operations deployment after merge. This boundary uses PostgreSQL's documented [extension search paths](https://www.postgresql.org/docs/18/runtime-config-client.html); the Windows installation path has not been qualified by this Linux test.
+
+`laplace_ordered_pair_counts(vocab,lo,hi,roots,separators)` projects immediate
+ordered child occurrences from the canonical registered DAG at every tier.
+`roots=NULL` selects all registered witnesses; an explicit array selects a subset.
+Shared containers are visited once, even beneath repeated or multiple roots;
+unregistered branches are excluded. Native run arithmetic retains exact RLE
+multiplicities without expansion. `vocab` selects subjects, retaining all objects
+for the caller's normalization denominator. Empty vocabulary or roots select no
+rows; NULL vocabulary admits every subject. This API describes stored structure,
+not flattened document tokens or additional testimony. Consumers aggregate the
+returned `(container,gap,subject,object,occurrences)` with PostgreSQL spillable
+operators. `laplace_separator_ids()` reads Unicode Zs/Zl/Zp/Cc and CRLF from the
+mapped floor, independent of corpus admission. Passing NULL separators disables
+filtering. No API changes caller planner or search-path settings.

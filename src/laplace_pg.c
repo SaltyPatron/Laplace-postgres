@@ -37,7 +37,9 @@
 #include "laplace/consensus.h"
 #include "pg_core.h"
 
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = "1.18");
+#define LP_STRING_(value) #value
+#define LP_STRING(value) LP_STRING_(value)
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = LP_STRING(LP_PG_VERSION_MAJOR) "." LP_STRING(LP_PG_VERSION_MINOR));
 
 /* ---------------------------------------------------------------- PostGIS serialized geometry (version 2) */
 #include "geo.h"
@@ -95,7 +97,7 @@ lp_text *lp_pg_text_context(void){
     }
     return context;
 }
-static const lp_layout *flags(void){
+const lp_layout *lp_pg_flags(void){
     const lp_layout *l = lp_flags_map(flags_path);
     if (!l) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", flags_path ? flags_path : lp_flags_path())));
     return l;
@@ -348,26 +350,26 @@ Datum laplace_cp_coord_ewkb(PG_FUNCTION_ARGS){
  * What the Unicode Standard says of a codepoint, from the memory-mapped flags: by the property's name and the value's
  * name as the standard writes them, short or as they are said. Nothing is read from a table. */
 static const lp_field *field_of(text *t){
-    char *n = text_to_cstring(t); const lp_field *f = lp_flags_field(flags(), n);
+    char *n = text_to_cstring(t); const lp_field *f = lp_flags_field(lp_pg_flags(), n);
     if (!f) ereport(ERROR, (errmsg("laplace: the standard lists no property \"%s\"", n)));
     return f;
 }
 static int64 cp_of_id(const uint8 *u){ return lp_tier0_codepoint(lp_pg_tier0(), (const lp_id *)u); }
 static Datum said(int64 cp, text *property){
     if (cp < 0 || cp >= LP_NCP) return (Datum)0;
-    const lp_layout *l = flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
+    const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
     return PointerGetDatum(cstring_to_text(f->nvalues ? l->value[f->first + v].say : v ? "Yes" : "No"));
 }
 static int is(int64 cp, text *property, text *value){
     if (cp < 0 || cp >= LP_NCP) return -1;
-    const lp_layout *l = flags(); const lp_field *f = field_of(property); char *vn = text_to_cstring(value); int32 want = lp_flags_value(l, f, vn);
+    const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(property); char *vn = text_to_cstring(value); int32 want = lp_flags_value(l, f, vn);
     if (want < 0) ereport(ERROR, (errmsg("laplace: the standard lists no value \"%s\" for %s", vn, f->say)));
     return lp_flags_get(l, (uint32)cp, f) == (uint32)want;
 }
 PG_FUNCTION_INFO_V1(laplace_cp_flags);
 Datum laplace_cp_flags(PG_FUNCTION_ARGS){
     int32 cp = PG_GETARG_INT32(0); if (cp < 0 || (uint32)cp >= LP_NCP) PG_RETURN_NULL();
-    PG_RETURN_BYTEA_P(bytes_datum(flags()->flags[cp].b, 32));
+    PG_RETURN_BYTEA_P(bytes_datum(lp_pg_flags()->flags[cp].b, 32));
 }
 PG_FUNCTION_INFO_V1(laplace_cp_said);
 Datum laplace_cp_said(PG_FUNCTION_ARGS){ Datum d = said(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1)); if (!d) PG_RETURN_NULL(); return d; }

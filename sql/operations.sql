@@ -343,3 +343,11 @@ AS 'MODULE_PATHNAME','laplace_resolve_ref' LANGUAGE C STABLE STRICT PARALLEL SAF
 CREATE OR REPLACE FUNCTION @extschema@.laplace_claim_preview(ids @extschema@.blake3[],OUT i bigint,OUT entity @extschema@.blake3,
  OUT predicate @extschema@.blake3,OUT object @extschema@.blake3,OUT type_label text,OUT fact text)
 RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_claim_preview' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
+-- Ordered structure is projected from the canonical registered DAG at every tier.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_separator_ids() RETURNS @extschema@.blake3[]
+AS 'MODULE_PATHNAME','laplace_separator_ids' LANGUAGE C IMMUTABLE PARALLEL SAFE;
+CREATE OR REPLACE FUNCTION @extschema@.laplace_ordered_pair_counts(vocab @extschema@.blake3[],lo integer,hi integer,
+ roots @extschema@.blake3[] DEFAULT NULL,separators @extschema@.blake3[] DEFAULT @extschema@.laplace_separator_ids(),
+ OUT container @extschema@.blake3,OUT gap integer,OUT subject @extschema@.blake3,OUT object @extschema@.blake3,OUT occurrences bigint)
+RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_ordered_pair_counts' LANGUAGE C STABLE PARALLEL RESTRICTED;
