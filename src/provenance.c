@@ -259,7 +259,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
          * roots once, then use the shared upward kernel directly; there is no
          * speculative downward graph or cardinality-based fallback. */
         PgRootFrontier probe={&vertices,0};
-        lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),pg_root_frontier_row,&probe);
+        lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),pg_root_frontier_row,&probe,true);
         if(probe.found!=lp_idmap_count(roots))
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_contained_series: root has no stored path")));
         PgAttrRows rows={0};
@@ -286,7 +286,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     bool initial=true;
     while(lp_idmap_count(front)){
         lp_idmap *next=lp_idmap_new();down.front=front;down.next=next;
-        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),pg_down_frontier_row,&down);
+        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),pg_down_frontier_row,&down,true);
         lp_idmap_free(front);front=next;
         if(initial){
             for(size_t i=0;i<lp_idmap_count(roots);i++)
@@ -347,7 +347,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
          * direction, including callers selecting non-claim content. */
         if(n){
             PgClaimFrontier selected={.front=front,.dag=&d};pg_claim_bind(&selected.binding);
-            lp_pg_lookup_paths(claims,(size_t)n,pg_claim_frontier_row,&selected);
+            lp_pg_lookup_paths(claims,(size_t)n,pg_claim_frontier_row,&selected,true);
             MemoryContextDelete(selected.binding.context);
         }
     }else for (int i = 0; i < n; i++) {
@@ -738,7 +738,7 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
         /* Validate the requested carrier set once. The provenance kernel below
          * reuses this proof and the witness registry instead of querying both again. */
         PgClaimFrontier verified={0};pg_claim_bind(&verified.binding);
-        lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,pg_claim_frontier_row,&verified);
+        lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,pg_claim_frontier_row,&verified,true);
         MemoryContextDelete(verified.binding.context);
         if(verified.found!=count)pg_series_invalid();
         if (SPI_execute("SELECT id,lineage,trust FROM public.witness ORDER BY id", true, 0) != SPI_OK_SELECT)

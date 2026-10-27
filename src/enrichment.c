@@ -141,23 +141,24 @@ typedef struct {
 } PathFrontier;
 static void path_frontier_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
-    PathFrontier *front=context;bool path_null,mask_null;
-    Datum path=slot_getattr(slot,front->path,&path_null),mask=slot_getattr(slot,front->mask,&mask_null);
+    PathFrontier *front=context;bool path_null,mask_null=false;
+    Datum path=slot_getattr(slot,front->path,&path_null),mask=(Datum)0;
+    if(front->mask>0)mask=slot_getattr(slot,front->mask,&mask_null);
     if(path_null||mask_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native path frontier: null carrier")));
     MemoryContext previous=MemoryContextSwitchTo(front->tuple_context);
     front->visit(&key->id,path,mask,front->context);
     MemoryContextSwitchTo(previous);MemoryContextReset(front->tuple_context);
 }
-void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context)
+void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context,bool with_mask)
 {
     if(!count)return;
     const char *column;Oid target=get_relname_relid("physicality",get_namespace_oid("public",false));
-    Relation parent=presence_parent(target,&column,"entity,path,mask");
+    Relation parent=presence_parent(target,&column,with_mask?"entity,path,mask":"entity,path");
     if(count>MaxAllocHugeSize/sizeof(PresenceKey))
         ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native path frontier exceeds addressable memory")));
     PresenceKey *keys=palloc_extended(count*sizeof(*keys),MCXT_ALLOC_HUGE);
     for(size_t i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
-    PathFrontier front={visit,context,get_attnum(target,"path"),get_attnum(target,"mask"),
+    PathFrontier front={visit,context,get_attnum(target,"path"),with_mask?get_attnum(target,"mask"):InvalidAttrNumber,
         AllocSetContextCreate(CurrentMemoryContext,"Native path frontier tuple",ALLOCSET_DEFAULT_SIZES)};
     indexed_keys(parent,column,keys,count,path_frontier_visit,&front);
     MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);

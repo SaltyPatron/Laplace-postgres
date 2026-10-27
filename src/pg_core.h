@@ -15,9 +15,10 @@ const lp_tier0_record *lp_pg_tier0(void);
 lp_text *lp_pg_text_context(void);
 
 /* Complete ID-addressed path frontier. Native range routing and primary
- * indexes retain ascending ID order without sorting geometry in SQL. */
+ * indexes retain ascending ID order without sorting geometry in SQL. A path-only
+ * caller requests no mask privilege and receives a zero mask Datum. */
 typedef void (*lp_pg_path_visit)(const lp_id *id,Datum path,Datum mask,void *context);
-void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context);
+void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context,bool with_mask);
 
 /* The live parameter buffers and the actual PostgreSQL array boundary size
  * every indexed frontier transfer. This is a window, never an input limit. */

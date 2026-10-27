@@ -1,0 +1,67 @@
+{
+  "date": "2026-10-27",
+  "host": "hart-server",
+  "database": "laplace",
+  "source_base": {
+    "engine": "75867c251d7f4f49950301c6fab0e6b24c24b25e",
+    "postgres": "d1d6f3a2857921a838e29241fdc072a649a6aa5c",
+    "native": "1a3500b63647d2ca32da4b08d5609eee8aa5bb81"
+  },
+  "recorded_file": "ae84d1822e3fcc4a87f9588253a48ebd",
+  "recorded_metadata": "3f4798087f00367f0cbf18c98ea7282c",
+  "recorded_context_entry": "a877ec4644e45515a5dd5a8a3b957464",
+  "recorded_reading": "927c01436c7dbe7271b71190ae14cba2",
+  "large_metadata_validation": [
+    {
+      "case": "matching recorded reading",
+      "invalid_file_rows": 0.0,
+      "execution_ms": 12.62,
+      "shared_hits": 1403,
+      "temp_written_blocks": 0
+    },
+    {
+      "case": "changed requested reading",
+      "invalid_file_rows": 1.0,
+      "execution_ms": 1.083,
+      "shared_hits": 141,
+      "temp_written_blocks": 0
+    }
+  ],
+  "execution": "Exact SQL extracted from validate_file_contexts in the candidate Engine source. Candidate ICX-built PostgreSQL module and helper definitions were bound inside a rollback transaction on the actual laplace database. The writer places the context at its ordered metadata tail. Neither active module nor cache was replaced.",
+  "windows_real_database": {
+    "host": "HART-DESKTOP",
+    "database": "laplace",
+    "compiler": "IntelLLVM 2026.1.1",
+    "raw_path_rows_reference": 3,
+    "raw_path_rows_native": 3,
+    "byte_exact_paths": true,
+    "cases": [
+      "duplicate IDs",
+      "null array members",
+      "missing IDs",
+      "empty array",
+      "POINT atom",
+      "LINESTRING cat",
+      "POINT with a two-occurrence ss run"
+    ],
+    "path_only_column_acl": "Passed with entity/path SELECT and no mask SELECT using a transaction-local role; all definitions, grants and role creation rolled back."
+  },
+  "actual_code": {
+    "host": "hart-server",
+    "compiler": "IntelLLVM 2026.1.1",
+    "engine_base": "75867c2",
+    "source": "/repos/src/Laplace-Native/src",
+    "files": 39,
+    "mismatched": 0,
+    "compositions": 20552,
+    "reused": 16075,
+    "decompose_seconds": 0.03,
+    "scope": "Actual source decomposition and byte recomposition with candidate Engine; no load. Latest complete Engine ingest is not claimed against the installed 1.38 API."
+  },
+  "limits": "Execution times are server EXPLAIN ANALYZE measurements; buffers were not evicted. This validates the existing database with candidate functions in rollback transactions, not installed deployment. PostgreSQL 1.39 and the Engine consumer must be integrated together. Tier-0 population restoration is a separate draft Native PR.",
+  "windows_module_regression": {
+    "result": "passed",
+    "seconds": 139.15,
+    "scope": "Fresh private PostgreSQL install and upgrade, masks, geometry, GIN, GiST, text IDs, attestation and staged ingestion; active cluster untouched."
+  }
+}

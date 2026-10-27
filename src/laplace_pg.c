@@ -645,9 +645,33 @@ static Kept fills_kept = { "laplace_fills",
     "SELECT p.entity, t.id, t.times, p.tier FROM physicality p, laplace_path_times(p.path, $1) t "
     "WHERE p.tier > (SELECT min(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path && $1", 1, NULL };
 SET_FN(laplace_fills, fills_kept)
-/* laplace_paths(ids): the paths of a set of entities: one DAG level per call. */
-static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicality WHERE entity = ANY($1)", 1, NULL };
-SET_FN(laplace_paths, paths_kept)
+/* laplace_paths(ids): the same partition-directed Native frontier used by
+ * presence and provenance. A SQL ANY plan probes unrelated partitions during
+ * recursive metadata walks, even though the complete IDs are already known. */
+typedef struct { FunctionCallInfo fcinfo; Tuplestorestate *rows; TupleDesc descriptor; } PathRows;
+static void path_row(const lp_id *id,Datum path,Datum mask,void *context){
+    PathRows *out=context;
+    Datum values[]={id_datum(id),path};bool nulls[]={false,false};
+    set_put(out->fcinfo,out->rows,out->descriptor,values,nulls);
+    pfree(DatumGetPointer(values[0]));
+}
+PG_FUNCTION_INFO_V1(laplace_paths);
+Datum laplace_paths(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_paths",&descriptor);
+    ArrayType *input=PG_GETARG_ARRAYTYPE_P(0);Datum *values;bool *nulls;int count;
+    deconstruct_array(input,ARR_ELEMTYPE(input),16,false,TYPALIGN_CHAR,&values,&nulls,&count);
+    lp_idmap *unique=lp_idmap_new();
+    PG_TRY();{
+        /* Preserve ANY's set semantics: duplicates do not duplicate paths and
+         * null array members do not identify an entity. */
+        for(int i=0;i<count;i++)if(!nulls[i]){bool fresh;lp_idmap_put(unique,(const lp_id *)DatumGetPointer(values[i]),&fresh);}
+        if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_paths: SPI_connect")));
+        PathRows output={fcinfo,rows,descriptor};
+        lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),path_row,&output,false);
+        SPI_finish();
+    }PG_FINALLY();{lp_idmap_free(unique);}PG_END_TRY();
+    pfree(values);pfree(nulls);PG_RETURN_NULL();
+}
 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
@@ -937,6 +961,12 @@ PG_FUNCTION_INFO_V1(laplace_path_starts);
 Datum laplace_path_starts(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.first, (const lp_id *)PG_GETARG_POINTER(1))); }
 PG_FUNCTION_INFO_V1(laplace_path_ends);
 Datum laplace_path_ends(PG_FUNCTION_ARGS){ PathEnds ends = path_ends(path_ewkb(PG_GETARG_DATUM(0))); PG_RETURN_BOOL(ends.found && lp_id_eq(&ends.last, (const lp_id *)PG_GETARG_POINTER(1))); }
+PG_FUNCTION_INFO_V1(laplace_path_last);
+Datum laplace_path_last(PG_FUNCTION_ARGS){
+    PathEnds ends=path_ends(path_ewkb(PG_GETARG_DATUM(0)));
+    if(!ends.found)PG_RETURN_NULL();
+    return id_datum(&ends.last);
+}
 PG_FUNCTION_INFO_V1(laplace_path_contains);
 Datum laplace_path_contains(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(path_has(fcinfo, true)); }
 PG_FUNCTION_INFO_V1(laplace_path_overlaps);

@@ -87,6 +87,7 @@ laplace_path_ewkb	false
 laplace_path_length	false
 laplace_path_overlaps	false
 laplace_path_starts	false
+laplace_path_last	false
 laplace_path_times	false
 laplace_path4d_gist_compress	false
 laplace_path4d_gist_distance	false

@@ -58,6 +58,15 @@ and a multi-gigabyte external sort. Path/mask column privileges and the shared
 relation's RLS boundary are checked before direct access. Tuple detoasting is
 released as each carrier is consumed; graph state remains transaction-owned.
 
+`laplace_paths(ids)` uses the same Native primary-key kernel and returns one
+stored path per distinct present ID; missing IDs and null array members return
+no path. `laplace_path_last(path)` returns the last constituent ID in path order,
+including POINT carriers with compressed runs. It reads the packed carrier in
+Native; the sorted GIN key set is not an ordered content path. The endpoint is a
+pure intrinsic, while the set read retains the SQL binding scope and parent
+column privilege checks recorded in `manifest/function_bindings.tsv`.
+Path-only reads require `entity` and `path`; provenance callers also request `mask`.
+
 A real ISO witness read on 2026-10-26 returned 93,441 series in 1.55 seconds
 with the candidate, versus 70.91 seconds through the previous containment path.
 A complete comparison of all returned columns found zero differences. The
