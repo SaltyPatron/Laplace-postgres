@@ -1,0 +1,1030 @@
+-- Current Laplace installation. Historical development migrations are not an installation path.
+\echo Use "CREATE EXTENSION laplace" to load this file. \quit
+
+-- Auxiliary operator and working namespaces are shared only by explicit object names.
+DO $namespaces$ BEGIN
+ IF pg_catalog.to_regnamespace('laplace') IS NULL THEN CREATE SCHEMA laplace; END IF;
+END $namespaces$;
+
+CREATE TYPE @extschema@.blake3;
+
+CREATE FUNCTION @extschema@.blake3_in(cstring) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_in';
+
+CREATE FUNCTION @extschema@.blake3_out(@extschema@.blake3) RETURNS cstring
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_out';
+
+CREATE FUNCTION @extschema@.blake3_recv(internal) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_recv';
+
+CREATE FUNCTION @extschema@.blake3_send(@extschema@.blake3) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_send';
+
+CREATE TYPE @extschema@.blake3 (
+    INTERNALLENGTH = 16,
+    INPUT = @extschema@.blake3_in,
+    OUTPUT = @extschema@.blake3_out,
+    RECEIVE = @extschema@.blake3_recv,
+    SEND = @extschema@.blake3_send,
+    ALIGNMENT = char,
+    STORAGE = plain
+);
+
+CREATE TYPE @extschema@.laplace_box4d;
+
+CREATE FUNCTION @extschema@.laplace_box4d_in(cstring) RETURNS @extschema@.laplace_box4d
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_box4d_in';
+
+CREATE FUNCTION @extschema@.laplace_box4d_out(@extschema@.laplace_box4d) RETURNS cstring
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_box4d_out';
+
+CREATE TYPE @extschema@.laplace_box4d (
+    INTERNALLENGTH = 64,
+    INPUT = @extschema@.laplace_box4d_in,
+    OUTPUT = @extschema@.laplace_box4d_out,
+    ALIGNMENT = double,
+    STORAGE = plain
+);
+
+CREATE TYPE @extschema@.laplace_path4d_key;
+
+CREATE FUNCTION @extschema@.laplace_path4d_key_in(cstring) RETURNS @extschema@.laplace_path4d_key
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_key_in';
+
+CREATE FUNCTION @extschema@.laplace_path4d_key_out(@extschema@.laplace_path4d_key) RETURNS cstring
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_key_out';
+
+CREATE TYPE @extschema@.laplace_path4d_key (
+    INTERNALLENGTH = 128,
+    INPUT = @extschema@.laplace_path4d_key_in,
+    OUTPUT = @extschema@.laplace_path4d_key_out,
+    ALIGNMENT = double,
+    STORAGE = plain
+);
+
+CREATE FUNCTION @extschema@.blake3_cmp(@extschema@.blake3, @extschema@.blake3) RETURNS integer
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_cmp';
+
+CREATE FUNCTION @extschema@.blake3_eq(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_eq';
+
+CREATE FUNCTION @extschema@.blake3_ge(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_ge';
+
+CREATE FUNCTION @extschema@.blake3_gt(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_gt';
+
+CREATE FUNCTION @extschema@.blake3_hash(@extschema@.blake3) RETURNS integer
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_hash';
+
+CREATE FUNCTION @extschema@.blake3_hash_extended(@extschema@.blake3, bigint) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_hash_extended';
+
+CREATE FUNCTION @extschema@.blake3_le(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_le';
+
+CREATE FUNCTION @extschema@.blake3_lt(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_lt';
+
+CREATE FUNCTION @extschema@.blake3_ne(@extschema@.blake3, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_ne';
+
+CREATE FUNCTION @extschema@.laplace_angular4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_angular4d';
+
+CREATE FUNCTION @extschema@.laplace_angular4d_gist_compress(internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_angular4d_gist_compress';
+
+CREATE FUNCTION @extschema@.laplace_angular4d_gist_distance(internal, @extschema:postgis@.geometry, smallint, oid, internal) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_angular4d_gist_distance';
+
+CREATE FUNCTION @extschema@.laplace_attested(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_attested';
+
+CREATE FUNCTION @extschema@.laplace_attested(claims @extschema@.blake3[], include_files boolean, OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_attested';
+
+CREATE FUNCTION @extschema@.laplace_attested_series(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean, OUT dependence_root @extschema@.blake3) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_attested_series';
+
+CREATE FUNCTION @extschema@.laplace_attribution(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT trust double precision, OUT share_bp integer) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_attribution';
+
+CREATE FUNCTION @extschema@.laplace_bank_bit(bank text, value text) RETURNS smallint
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_bank_bit';
+
+CREATE FUNCTION @extschema@.laplace_bank_of(@extschema@.blake3, OUT bank text, OUT grp text, OUT carrier text, OUT "bit" smallint) RETURNS record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_bank_of';
+
+CREATE FUNCTION @extschema@.laplace_centroid4d_final(internal) RETURNS bytea
+    LANGUAGE c IMMUTABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_centroid4d_final';
+
+CREATE FUNCTION @extschema@.laplace_centroid4d_step(internal, @extschema:postgis@.geometry) RETURNS internal
+    LANGUAGE c IMMUTABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_centroid4d_step';
+
+CREATE FUNCTION @extschema@.laplace_claims(parts @extschema@.blake3[], fan bigint, bits smallint[], refuse @extschema@.blake3[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_claims';
+
+CREATE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[], fan bigint, bits smallint[], refuse @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 1024 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_claims_each';
+
+CREATE FUNCTION @extschema@.laplace_clean_stage(paths regclass) RETURNS bigint
+    LANGUAGE c STRICT
+
+    AS 'MODULE_PATHNAME', 'laplace_clean_stage';
+
+CREATE FUNCTION @extschema@.laplace_codepoint(@extschema@.blake3) RETURNS integer
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_codepoint';
+
+CREATE FUNCTION @extschema@.laplace_compose(@extschema@.blake3[]) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_compose';
+
+CREATE FUNCTION @extschema@.laplace_confidence(rating double precision, deviation double precision, k double precision DEFAULT 2) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_confidence';
+
+CREATE FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[], OUT trunk @extschema@.blake3, OUT claim @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT dependence_root @extschema@.blake3, OUT dependence_trust double precision) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_contained_series';
+
+CREATE FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[], claims @extschema@.blake3[], OUT trunk @extschema@.blake3, OUT claim @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT dependence_root @extschema@.blake3, OUT dependence_trust double precision) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_contained_series';
+
+CREATE FUNCTION @extschema@.laplace_containers(parts @extschema@.blake3[], bits smallint[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bit) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_containers';
+
+CREATE FUNCTION @extschema@.laplace_coord_ewkb(text) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_coord_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_coord(text) RETURNS @extschema:postgis@.geometry
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT @extschema:postgis@.st_geomfromewkb(@extschema@.laplace_coord_ewkb($1)) AS st_geomfromewkb;
+END;
+
+CREATE FUNCTION @extschema@.laplace_couple(occ @extschema@.blake3[], fan bigint, refuse @extschema@.blake3[], shape smallint, shape_n double precision, keep integer, OUT entity @extschema@.blake3, OUT occ integer, OUT route smallint, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT via @extschema@.blake3, OUT rel @extschema@.blake3, OUT tier smallint, OUT distance double precision, OUT vertices @extschema@.blake3[]) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 4096 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_couple';
+
+CREATE FUNCTION @extschema@.laplace_cp_coord_ewkb(integer) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_cp_coord_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_cp_id(integer) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_cp_id';
+
+CREATE FUNCTION @extschema@.laplace_direction4d_ewkb(@extschema:postgis@.geometry) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_direction4d_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_direction4d(@extschema:postgis@.geometry) RETURNS @extschema:postgis@.geometry
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT @extschema:postgis@.st_geomfromewkb(@extschema@.laplace_direction4d_ewkb($1)) AS st_geomfromewkb;
+END;
+
+CREATE FUNCTION @extschema@.laplace_distance4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_distance4d';
+
+CREATE FUNCTION @extschema@.laplace_dtw4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_dtw4d';
+
+CREATE FUNCTION @extschema@.laplace_edr4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry, double precision) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_edr4d';
+
+CREATE FUNCTION @extschema@.laplace_enrich_stage(input regclass, target regclass) RETURNS bigint
+    LANGUAGE c STRICT
+
+    AS 'MODULE_PATHNAME', 'laplace_enrich_stage';
+
+CREATE FUNCTION @extschema@.laplace_enrich_stage(input regclass, target regclass, classified regclass, selected_rows bigint) RETURNS bigint
+    LANGUAGE c STRICT
+
+    AS 'MODULE_PATHNAME', 'laplace_enrich_stage';
+
+CREATE FUNCTION @extschema@.laplace_fills(keys @extschema@.blake3[], OUT entity @extschema@.blake3, OUT id @extschema@.blake3, OUT times bigint, OUT tier smallint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_fills';
+
+CREATE FUNCTION @extschema@.laplace_fingerprint() RETURNS text
+    LANGUAGE c STABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_fingerprint';
+
+CREATE FUNCTION @extschema@.laplace_flags(integer) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_cp_flags';
+
+CREATE FUNCTION @extschema@.laplace_follows(@extschema:postgis@.geometry, @extschema@.blake3[]) RETURNS @extschema@.blake3[]
+    LANGUAGE c IMMUTABLE STRICT COST 1000 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_follows';
+
+CREATE FUNCTION @extschema@.laplace_forward(ids @extschema@.blake3[], fan bigint, OUT i integer, OUT j integer, OUT paths bigint, OUT runs bigint, OUT next @extschema@.blake3, OUT times bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_forward';
+
+CREATE FUNCTION @extschema@.laplace_frechet4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_frechet4d';
+
+CREATE FUNCTION @extschema@.laplace_frechet4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry, integer) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_frechet4d_outliers';
+
+CREATE FUNCTION @extschema@.laplace_function_bindings(OUT symbol text, OUT sql_scope boolean) RETURNS SETOF record
+    LANGUAGE c IMMUTABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_function_bindings';
+
+CREATE FUNCTION @extschema@.laplace_gin_consistent(internal, smallint, @extschema@.blake3[], integer, internal, internal, internal, internal) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_gin_consistent';
+
+CREATE FUNCTION @extschema@.laplace_gin_extract_query(@extschema@.blake3[], internal, smallint, internal, internal, internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_gin_extract_query';
+
+CREATE FUNCTION @extschema@.laplace_gin_extract_value(@extschema:postgis@.geometry, internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_gin_extract_value';
+
+CREATE FUNCTION @extschema@.laplace_gin_triconsistent(internal, smallint, @extschema@.blake3[], integer, internal, internal, internal) RETURNS "char"
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_gin_triconsistent';
+
+CREATE FUNCTION @extschema@.laplace_hausdorff4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hausdorff4d';
+
+CREATE FUNCTION @extschema@.laplace_highway_fingerprint() RETURNS text
+    LANGUAGE c STABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_highway_fingerprint';
+
+CREATE FUNCTION @extschema@.laplace_hilbert(text) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert';
+
+CREATE FUNCTION @extschema@.laplace_hilbert4(@extschema:postgis@.geometry) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert4';
+
+CREATE FUNCTION @extschema@.laplace_hilbert_ranges_flat(@extschema:postgis@.geometry, @extschema:postgis@.geometry, integer) RETURNS bigint[]
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert_ranges_flat';
+
+CREATE FUNCTION @extschema@.laplace_hilbert_ranges(lo @extschema:postgis@.geometry, hi @extschema:postgis@.geometry, budget integer DEFAULT 64) RETURNS TABLE(lo bigint, hi bigint)
+    LANGUAGE sql IMMUTABLE STRICT ROWS 64 PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT s.f[((2 * i.i) - 1)] AS f,
+     s.f[(2 * i.i)] AS f
+    FROM ( SELECT @extschema@.laplace_hilbert_ranges_flat(laplace_hilbert_ranges.lo, laplace_hilbert_ranges.hi, laplace_hilbert_ranges.budget) AS f) s,
+     LATERAL generate_series(1, (COALESCE(array_length(s.f, 1), 0) / 2)) i(i);
+END;
+
+CREATE FUNCTION @extschema@.laplace_id(text) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_id';
+
+CREATE FUNCTION @extschema@.laplace_inside(@extschema:postgis@.geometry) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_inside';
+
+CREATE FUNCTION @extschema@.laplace_is(integer, text, text) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_cp_is';
+
+CREATE FUNCTION @extschema@.laplace_is(@extschema@.blake3, text, text) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_is';
+
+CREATE FUNCTION @extschema@.laplace_isa() RETURNS text
+    LANGUAGE c STABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_isa';
+
+CREATE FUNCTION @extschema@.laplace_labels(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_labels';
+
+CREATE FUNCTION @extschema@.laplace_mask_consistent(internal, smallint, internal, integer, internal, internal, internal, internal) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_consistent';
+
+CREATE FUNCTION @extschema@.laplace_mask_extract_query(internal, internal, smallint, internal, internal, internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_extract_query';
+
+CREATE FUNCTION @extschema@.laplace_mask_extract_value(bit, internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_extract_value';
+
+CREATE FUNCTION @extschema@.laplace_mask_field(bank text) RETURNS bit
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_field';
+
+CREATE FUNCTION @extschema@.laplace_mask_has(bit, smallint) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_has';
+
+CREATE FUNCTION @extschema@.laplace_mask_has_all(bit, smallint[]) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_has_all';
+
+CREATE FUNCTION @extschema@.laplace_mask_has_any(bit, smallint[]) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_has_any';
+
+CREATE FUNCTION @extschema@.laplace_mask_has_value(mask bit, bank text, value text) RETURNS boolean
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_has_value';
+
+CREATE FUNCTION @extschema@.laplace_mask_merge(a bit, b bit) RETURNS bit
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_merge';
+
+CREATE FUNCTION @extschema@.laplace_mask_slot(bank text, value text) RETURNS bit
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_slot';
+
+CREATE FUNCTION @extschema@.laplace_mask_triconsistent(internal, smallint, internal, integer, internal, internal, internal) RETURNS "char"
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_triconsistent';
+
+CREATE FUNCTION @extschema@.laplace_mask_valid(mask bit) RETURNS boolean
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_valid';
+
+CREATE FUNCTION @extschema@.laplace_mask_value(mask bit, bank text) RETURNS smallint
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_value';
+
+CREATE FUNCTION @extschema@.laplace_middle_any(@extschema:postgis@.geometry, @extschema@.blake3[]) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_middle_any';
+
+CREATE FUNCTION @extschema@.laplace_parts(text) RETURNS @extschema@.blake3[]
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_parts';
+
+CREATE FUNCTION @extschema@.laplace_path_ewkb(@extschema@.blake3[]) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_path(@extschema@.blake3[]) RETURNS @extschema:postgis@.geometry
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT @extschema:postgis@.st_geomfromewkb(@extschema@.laplace_path_ewkb($1)) AS st_geomfromewkb;
+END;
+
+CREATE FUNCTION @extschema@.laplace_path4d_gist_compress(internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_gist_compress';
+
+CREATE FUNCTION @extschema@.laplace_path4d_gist_distance(internal, @extschema:postgis@.geometry, smallint, oid, internal) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_gist_distance';
+
+CREATE FUNCTION @extschema@.laplace_path4d_gist_picksplit(internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_gist_picksplit';
+
+CREATE FUNCTION @extschema@.laplace_path4d_gist_same(@extschema@.laplace_path4d_key, @extschema@.laplace_path4d_key, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_gist_same';
+
+CREATE FUNCTION @extschema@.laplace_path4d_gist_union(internal, internal) RETURNS @extschema@.laplace_path4d_key
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path4d_gist_union';
+
+CREATE FUNCTION @extschema@.laplace_path_contains(@extschema:postgis@.geometry, @extschema@.blake3[]) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_contains';
+
+CREATE FUNCTION @extschema@.laplace_path_ends(@extschema:postgis@.geometry, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT COST 10000 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_ends';
+
+CREATE FUNCTION @extschema@.laplace_path_enrich_ewkb(recorded @extschema:postgis@.geometry, incoming @extschema:postgis@.geometry) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_enrich_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_path_enrich(recorded @extschema:postgis@.geometry, incoming @extschema:postgis@.geometry) RETURNS @extschema:postgis@.geometry
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT @extschema:postgis@.st_setsrid(@extschema:postgis@.st_geomfromewkb(@extschema@.laplace_path_enrich_ewkb(recorded, incoming)), @extschema:postgis@.st_srid(recorded)) AS st_setsrid
+   WHERE (@extschema:postgis@.st_srid(recorded) = @extschema:postgis@.st_srid(incoming));
+END;
+
+CREATE FUNCTION @extschema@.laplace_path_length(@extschema:postgis@.geometry) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_length';
+
+CREATE FUNCTION @extschema@.laplace_path_overlaps(@extschema:postgis@.geometry, @extschema@.blake3[]) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_overlaps';
+
+CREATE FUNCTION @extschema@.laplace_path_starts(@extschema:postgis@.geometry, @extschema@.blake3) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT COST 10000 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_starts';
+
+CREATE FUNCTION @extschema@.laplace_path_times(@extschema:postgis@.geometry, @extschema@.blake3[], OUT id @extschema@.blake3, OUT times bigint) RETURNS SETOF record
+    LANGUAGE c IMMUTABLE STRICT COST 1000 ROWS 4 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_times';
+
+CREATE FUNCTION @extschema@.laplace_paths(ids @extschema@.blake3[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_paths';
+
+CREATE FUNCTION @extschema@.laplace_point4d_distance(@extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_distance';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_compress(internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_compress';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_consistent(internal, @extschema:postgis@.geometry, smallint, oid, internal) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_consistent';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_distance(internal, @extschema:postgis@.geometry, smallint, oid, internal) RETURNS double precision
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_distance';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_penalty(internal, internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_penalty';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_picksplit(internal, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_picksplit';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_same(@extschema@.laplace_box4d, @extschema@.laplace_box4d, internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_same';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_sortsupport(internal) RETURNS void
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_sortsupport';
+
+CREATE FUNCTION @extschema@.laplace_point4d_gist_union(internal, internal) RETURNS @extschema@.laplace_box4d
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_point4d_gist_union';
+
+CREATE FUNCTION @extschema@.laplace_present_ids(ids @extschema@.blake3[], OUT id @extschema@.blake3, OUT ordinal bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_present_ids';
+
+CREATE FUNCTION @extschema@.laplace_present_stage(input regclass, target regclass, id_column name, present_column name, OUT id @extschema@.blake3, OUT ordinal bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT
+
+    AS 'MODULE_PATHNAME', 'laplace_present_stage';
+
+CREATE FUNCTION @extschema@.laplace_project_path(@extschema@.blake3, @extschema:postgis@.geometry, @extschema@.blake3[], @extschema:postgis@.geometry[], OUT coord_ewkb bytea, OUT hilbert bigint) RETURNS record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_project_path';
+
+CREATE FUNCTION @extschema@.laplace_said(integer, text) RETURNS text
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_cp_said';
+
+CREATE FUNCTION @extschema@.laplace_said(@extschema@.blake3, text) RETURNS text
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_said';
+
+CREATE FUNCTION @extschema@.laplace_series(roots @extschema@.blake3[], games bigint[], scores double precision[], trusts double precision[], OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint, OUT witnesses bigint) RETURNS record
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_series';
+
+CREATE FUNCTION @extschema@.laplace_series_snapshot(pending regclass, changed @extschema@.blake3[] DEFAULT NULL::@extschema@.blake3[], OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE
+
+    AS 'MODULE_PATHNAME', 'laplace_series_snapshot';
+
+CREATE FUNCTION @extschema@.laplace_stage_compatible(recorded_id @extschema@.blake3, incoming_id @extschema@.blake3, recorded @extschema:postgis@.geometry, incoming @extschema:postgis@.geometry, recorded_hilbert bigint, incoming_hilbert bigint, paths boolean) RETURNS boolean
+    LANGUAGE c IMMUTABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_stage_compatible';
+
+CREATE FUNCTION @extschema@.laplace_stage_snapshot(pending regclass, changed regclass, OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE
+
+    AS 'MODULE_PATHNAME', 'laplace_series_snapshot';
+
+CREATE FUNCTION @extschema@.laplace_text(@extschema@.blake3) RETURNS text
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_text';
+
+CREATE FUNCTION @extschema@.laplace_text_batch(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+
+    AS 'MODULE_PATHNAME', 'laplace_text_batch';
+
+CREATE FUNCTION @extschema@.laplace_text_coord_ewkb(text) RETURNS bytea
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_text_coord_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_text_coord(text) RETURNS @extschema:postgis@.geometry
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT @extschema:postgis@.st_geomfromewkb(@extschema@.laplace_text_coord_ewkb($1)) AS st_geomfromewkb;
+END;
+
+CREATE FUNCTION @extschema@.laplace_text_hilbert(text) RETURNS bigint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_text_hilbert';
+
+CREATE FUNCTION @extschema@.laplace_text_id(text) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_text_id';
+
+CREATE FUNCTION @extschema@.laplace_tier(text) RETURNS smallint
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_tier';
+
+CREATE FUNCTION @extschema@.laplace_type(list text, value text) RETURNS integer
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_type';
+
+CREATE FUNCTION @extschema@.laplace_type_edges(a text, slot integer, b text) RETURNS integer[]
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_type_edges';
+
+CREATE FUNCTION @extschema@.laplace_type_id(list text, slot integer) RETURNS @extschema@.blake3
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_type_id';
+
+CREATE FUNCTION @extschema@.laplace_type_key(list text, key text) RETURNS integer
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_type_key';
+
+CREATE FUNCTION @extschema@.laplace_vertex_ids(@extschema:postgis@.geometry) RETURNS @extschema@.blake3[]
+    LANGUAGE c IMMUTABLE STRICT COST 10000 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_vertex_ids';
+
+CREATE FUNCTION @extschema@.laplace_within4d(@extschema:postgis@.geometry, @extschema:postgis@.geometry, @extschema:postgis@.geometry) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_within4d';
+
+CREATE AGGREGATE @extschema@.laplace_centroid4d_ewkb(@extschema:postgis@.geometry) (
+    SFUNC = @extschema@.laplace_centroid4d_step,
+    STYPE = internal,
+    FINALFUNC = @extschema@.laplace_centroid4d_final
+);
+
+CREATE OPERATOR laplace.<-> (
+    FUNCTION = @extschema@.laplace_frechet4d,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema:postgis@.geometry,
+    COMMUTATOR = OPERATOR(laplace.<->)
+);
+
+CREATE OPERATOR @extschema@.&& (
+    FUNCTION = @extschema@.laplace_path_overlaps,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema@.blake3[],
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.< (
+    FUNCTION = @extschema@.blake3_lt,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.>),
+    NEGATOR = OPERATOR(@extschema@.>=),
+    RESTRICT = scalarltsel,
+    JOIN = scalarltjoinsel
+);
+
+CREATE OPERATOR @extschema@.<%%> (
+    FUNCTION = @extschema@.laplace_hausdorff4d,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema:postgis@.geometry,
+    COMMUTATOR = OPERATOR(@extschema@.<%%>)
+);
+
+CREATE OPERATOR @extschema@.<%> (
+    FUNCTION = @extschema@.laplace_frechet4d,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema:postgis@.geometry,
+    COMMUTATOR = OPERATOR(@extschema@.<%>)
+);
+
+CREATE OPERATOR @extschema@.<= (
+    FUNCTION = @extschema@.blake3_le,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.>=),
+    NEGATOR = OPERATOR(@extschema@.>),
+    RESTRICT = scalarlesel,
+    JOIN = scalarlejoinsel
+);
+
+CREATE OPERATOR @extschema@.<=> (
+    FUNCTION = @extschema@.laplace_angular4d,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema:postgis@.geometry,
+    COMMUTATOR = OPERATOR(@extschema@.<=>)
+);
+
+CREATE OPERATOR @extschema@.<> (
+    FUNCTION = @extschema@.blake3_ne,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.<>),
+    NEGATOR = OPERATOR(@extschema@.=),
+    RESTRICT = neqsel,
+    JOIN = neqjoinsel
+);
+
+CREATE OPERATOR @extschema@.<~> (
+    FUNCTION = @extschema@.laplace_point4d_distance,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema:postgis@.geometry,
+    COMMUTATOR = OPERATOR(@extschema@.<~>)
+);
+
+CREATE OPERATOR @extschema@.= (
+    FUNCTION = @extschema@.blake3_eq,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.=),
+    NEGATOR = OPERATOR(@extschema@.<>),
+    MERGES,
+    HASHES,
+    RESTRICT = eqsel,
+    JOIN = eqjoinsel
+);
+
+CREATE OPERATOR @extschema@.> (
+    FUNCTION = @extschema@.blake3_gt,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.<),
+    NEGATOR = OPERATOR(@extschema@.<=),
+    RESTRICT = scalargtsel,
+    JOIN = scalargtjoinsel
+);
+
+CREATE OPERATOR @extschema@.>= (
+    FUNCTION = @extschema@.blake3_ge,
+    LEFTARG = @extschema@.blake3,
+    RIGHTARG = @extschema@.blake3,
+    COMMUTATOR = OPERATOR(@extschema@.<=),
+    NEGATOR = OPERATOR(@extschema@.<),
+    RESTRICT = scalargesel,
+    JOIN = scalargejoinsel
+);
+
+CREATE OPERATOR @extschema@.? (
+    FUNCTION = @extschema@.laplace_mask_has,
+    LEFTARG = bit,
+    RIGHTARG = smallint,
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.?& (
+    FUNCTION = @extschema@.laplace_mask_has_all,
+    LEFTARG = bit,
+    RIGHTARG = smallint[],
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.?| (
+    FUNCTION = @extschema@.laplace_mask_has_any,
+    LEFTARG = bit,
+    RIGHTARG = smallint[],
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.@> (
+    FUNCTION = @extschema@.laplace_path_contains,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema@.blake3[],
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.@^ (
+    FUNCTION = @extschema@.laplace_path_ends,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema@.blake3,
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR @extschema@.^@ (
+    FUNCTION = @extschema@.laplace_path_starts,
+    LEFTARG = @extschema:postgis@.geometry,
+    RIGHTARG = @extschema@.blake3,
+    RESTRICT = contsel,
+    JOIN = contjoinsel
+);
+
+CREATE OPERATOR FAMILY @extschema@.blake3_hash_ops USING hash;
+ALTER OPERATOR FAMILY @extschema@.blake3_hash_ops USING hash ADD
+    FUNCTION 2 (@extschema@.blake3, @extschema@.blake3) @extschema@.blake3_hash_extended(@extschema@.blake3,bigint);
+
+CREATE OPERATOR CLASS @extschema@.blake3_hash_ops
+    DEFAULT FOR TYPE @extschema@.blake3 USING hash FAMILY @extschema@.blake3_hash_ops AS
+    OPERATOR 1 @extschema@.=(@extschema@.blake3,@extschema@.blake3) ,
+    FUNCTION 1 (@extschema@.blake3, @extschema@.blake3) @extschema@.blake3_hash(@extschema@.blake3);
+
+CREATE OPERATOR FAMILY @extschema@.blake3_ops USING btree;
+
+CREATE OPERATOR CLASS @extschema@.blake3_ops
+    DEFAULT FOR TYPE @extschema@.blake3 USING btree FAMILY @extschema@.blake3_ops AS
+    OPERATOR 1 @extschema@.<(@extschema@.blake3,@extschema@.blake3) ,
+    OPERATOR 2 @extschema@.<=(@extschema@.blake3,@extschema@.blake3) ,
+    OPERATOR 3 @extschema@.=(@extschema@.blake3,@extschema@.blake3) ,
+    OPERATOR 4 @extschema@.>=(@extschema@.blake3,@extschema@.blake3) ,
+    OPERATOR 5 @extschema@.>(@extschema@.blake3,@extschema@.blake3) ,
+    FUNCTION 1 (@extschema@.blake3, @extschema@.blake3) @extschema@.blake3_cmp(@extschema@.blake3,@extschema@.blake3);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_angular4d_ops USING gist;
+ALTER OPERATOR FAMILY @extschema@.laplace_angular4d_ops USING gist ADD
+    OPERATOR 15 @extschema@.<=>(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_angular4d_gist_compress(internal) ,
+    FUNCTION 8 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_angular4d_gist_distance(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 11 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_sortsupport(internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_angular4d_ops
+    FOR TYPE @extschema:postgis@.geometry USING gist FAMILY @extschema@.laplace_angular4d_ops AS
+    STORAGE @extschema@.laplace_box4d ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_consistent(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_union(internal,internal) ,
+    FUNCTION 5 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_penalty(internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_picksplit(internal,internal) ,
+    FUNCTION 7 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_same(@extschema@.laplace_box4d,@extschema@.laplace_box4d,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_coord_ops USING gist;
+ALTER OPERATOR FAMILY @extschema@.laplace_coord_ops USING gist ADD
+    OPERATOR 15 laplace.<->(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_compress(internal) ,
+    FUNCTION 8 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_distance(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 11 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_sortsupport(internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_coord_ops
+    FOR TYPE @extschema:postgis@.geometry USING gist FAMILY @extschema@.laplace_coord_ops AS
+    STORAGE @extschema@.laplace_box4d ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_consistent(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_union(internal,internal) ,
+    FUNCTION 5 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_penalty(internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_picksplit(internal,internal) ,
+    FUNCTION 7 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_same(@extschema@.laplace_box4d,@extschema@.laplace_box4d,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_mask_ops USING gin;
+ALTER OPERATOR FAMILY @extschema@.laplace_mask_ops USING gin ADD
+    OPERATOR 1 @extschema@.?(bit,smallint) ,
+    OPERATOR 2 @extschema@.?&(bit,smallint[]) ,
+    OPERATOR 3 @extschema@.?|(bit,smallint[]) ,
+    FUNCTION 1 (bit, bit) btint2cmp(smallint,smallint) ,
+    FUNCTION 4 (bit, bit) @extschema@.laplace_mask_consistent(internal,smallint,internal,integer,internal,internal,internal,internal) ,
+    FUNCTION 6 (bit, bit) @extschema@.laplace_mask_triconsistent(internal,smallint,internal,integer,internal,internal,internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_mask_ops
+    FOR TYPE bit USING gin FAMILY @extschema@.laplace_mask_ops AS
+    STORAGE smallint ,
+    FUNCTION 2 (bit, bit) @extschema@.laplace_mask_extract_value(bit,internal,internal) ,
+    FUNCTION 3 (bit, bit) @extschema@.laplace_mask_extract_query(internal,internal,smallint,internal,internal,internal,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_path4d_ops USING gist;
+ALTER OPERATOR FAMILY @extschema@.laplace_path4d_ops USING gist ADD
+    OPERATOR 15 @extschema@.<%>(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    OPERATOR 16 @extschema@.<%%>(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_compress(internal) ,
+    FUNCTION 8 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_distance(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 11 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_sortsupport(internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_path4d_ops
+    FOR TYPE @extschema:postgis@.geometry USING gist FAMILY @extschema@.laplace_path4d_ops AS
+    STORAGE @extschema@.laplace_path4d_key ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_consistent(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_union(internal,internal) ,
+    FUNCTION 5 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_penalty(internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_picksplit(internal,internal) ,
+    FUNCTION 7 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_same(@extschema@.laplace_path4d_key,@extschema@.laplace_path4d_key,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_path_ops USING gin;
+ALTER OPERATOR FAMILY @extschema@.laplace_path_ops USING gin ADD
+    OPERATOR 3 @extschema@.&&(@extschema:postgis@.geometry,@extschema@.blake3[]) ,
+    OPERATOR 7 @extschema@.@>(@extschema:postgis@.geometry,@extschema@.blake3[]) ,
+    OPERATOR 8 @extschema@.^@(@extschema:postgis@.geometry,@extschema@.blake3) ,
+    OPERATOR 9 @extschema@.@^(@extschema:postgis@.geometry,@extschema@.blake3) ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) byteacmp(bytea,bytea) ,
+    FUNCTION 4 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_consistent(internal,smallint,@extschema@.blake3[],integer,internal,internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_triconsistent(internal,smallint,@extschema@.blake3[],integer,internal,internal,internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_path_ops
+    FOR TYPE @extschema:postgis@.geometry USING gin FAMILY @extschema@.laplace_path_ops AS
+    STORAGE bytea ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_extract_value(@extschema:postgis@.geometry,internal,internal) ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_extract_query(@extschema@.blake3[],internal,smallint,internal,internal,internal,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_point4d_ops USING gist;
+ALTER OPERATOR FAMILY @extschema@.laplace_point4d_ops USING gist ADD
+    OPERATOR 15 @extschema@.<~>(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_compress(internal) ,
+    FUNCTION 8 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_distance(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 11 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_sortsupport(internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_point4d_ops
+    FOR TYPE @extschema:postgis@.geometry USING gist FAMILY @extschema@.laplace_point4d_ops AS
+    STORAGE @extschema@.laplace_box4d ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_consistent(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_union(internal,internal) ,
+    FUNCTION 5 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_penalty(internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_picksplit(internal,internal) ,
+    FUNCTION 7 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_same(@extschema@.laplace_box4d,@extschema@.laplace_box4d,internal);
+
+CREATE OPERATOR FAMILY @extschema@.laplace_traj_ops USING gist;
+ALTER OPERATOR FAMILY @extschema@.laplace_traj_ops USING gist ADD
+    OPERATOR 15 laplace.<->(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
+    FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_compress(internal) ,
+    FUNCTION 8 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_distance(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 11 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_sortsupport(internal);
+
+CREATE OPERATOR CLASS @extschema@.laplace_traj_ops
+    FOR TYPE @extschema:postgis@.geometry USING gist FAMILY @extschema@.laplace_traj_ops AS
+    STORAGE @extschema@.laplace_path4d_key ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_consistent(internal,@extschema:postgis@.geometry,smallint,oid,internal) ,
+    FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_union(internal,internal) ,
+    FUNCTION 5 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_point4d_gist_penalty(internal,internal,internal) ,
+    FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_picksplit(internal,internal) ,
+    FUNCTION 7 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_path4d_gist_same(@extschema@.laplace_path4d_key,@extschema@.laplace_path4d_key,internal);
+
+-- Canonical retained content; partitions are a storage detail of these four tables.
+
+CREATE TABLE @extschema@.entity (
+    id @extschema@.blake3 NOT NULL,
+    tier smallint NOT NULL,
+    coord @extschema:postgis@.geometry(PointZM) NOT NULL,
+    hilbert bigint NOT NULL,
+    mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
+    CONSTRAINT entity_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
+)
+PARTITION BY RANGE (id);
+
+CREATE TABLE @extschema@.physicality (
+    entity @extschema@.blake3 NOT NULL,
+    tier smallint NOT NULL,
+    hilbert bigint NOT NULL,
+    path @extschema:postgis@.geometry NOT NULL,
+    mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
+    CONSTRAINT physicality_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
+)
+PARTITION BY RANGE (entity);
+
+CREATE TABLE @extschema@.witness (
+    id @extschema@.blake3 NOT NULL,
+    lineage @extschema@.blake3,
+    trust double precision NOT NULL
+);
+
+CREATE TABLE @extschema@.consensus (
+    claim @extschema@.blake3 NOT NULL,
+    rating double precision NOT NULL,
+    deviation double precision NOT NULL,
+    volatility double precision NOT NULL,
+    matches bigint NOT NULL
+)
+PARTITION BY RANGE (claim);
+
+ALTER TABLE @extschema@.entity
+    ADD CONSTRAINT entity_pkey PRIMARY KEY (id);
+
+ALTER TABLE @extschema@.physicality
+    ADD CONSTRAINT physicality_pkey PRIMARY KEY (entity);
+
+ALTER TABLE @extschema@.witness
+    ADD CONSTRAINT witness_pkey PRIMARY KEY (id);
+
+ALTER TABLE @extschema@.consensus
+    ADD CONSTRAINT consensus_pkey PRIMARY KEY (claim);
+
+DO $partitions$
+DECLARE i integer; lo text; hi text; suffix text;
+BEGIN
+ FOR i IN 0..255 LOOP
+  suffix:=pg_catalog.lpad(pg_catalog.to_hex(i),2,'0');
+  lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE pg_catalog.quote_literal(suffix||pg_catalog.repeat('0',30)) END;
+  hi:=CASE WHEN i=255 THEN 'MAXVALUE' ELSE pg_catalog.quote_literal(pg_catalog.lpad(pg_catalog.to_hex(i+1),2,'0')||pg_catalog.repeat('0',30)) END;
+  EXECUTE pg_catalog.format('CREATE TABLE @extschema@.entity_%s PARTITION OF @extschema@.entity FOR VALUES FROM (%s) TO (%s)',suffix,lo,hi);
+  EXECUTE pg_catalog.format('CREATE TABLE @extschema@.physicality_%s PARTITION OF @extschema@.physicality FOR VALUES FROM (%s) TO (%s) WITH (parallel_workers=0)',suffix,lo,hi);
+ END LOOP;
+ FOR i IN 0..15 LOOP
+  suffix:=pg_catalog.to_hex(i);
+  lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE pg_catalog.quote_literal(suffix||pg_catalog.repeat('0',31)) END;
+  hi:=CASE WHEN i=15 THEN 'MAXVALUE' ELSE pg_catalog.quote_literal(pg_catalog.to_hex(i+1)||pg_catalog.repeat('0',31)) END;
+  EXECUTE pg_catalog.format('CREATE TABLE @extschema@.consensus_%s PARTITION OF @extschema@.consensus FOR VALUES FROM (%s) TO (%s) WITH (fillfactor=80)',suffix,lo,hi);
+ END LOOP;
+END $partitions$;
+ALTER TABLE @extschema@.physicality ALTER COLUMN path SET STATISTICS 0;
+CREATE INDEX entity_hilbert ON @extschema@.entity(hilbert);
+CREATE INDEX entity_coord ON @extschema@.entity USING gist(coord @extschema@.laplace_point4d_ops);
+CREATE INDEX physicality_paths ON @extschema@.physicality USING gin(path @extschema@.laplace_path_ops,mask @extschema@.laplace_mask_ops) WITH(gin_pending_list_limit=32768);
+ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(entity) REFERENCES @extschema@.entity(id);
+DO $dump_content$
+DECLARE item record;
+BEGIN
+ FOR item IN SELECT c.oid FROM pg_catalog.pg_class c
+  JOIN pg_catalog.pg_depend d ON d.classid='pg_catalog.pg_class'::pg_catalog.regclass AND d.objid=c.oid
+  JOIN pg_catalog.pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_catalog.pg_extension'::pg_catalog.regclass
+  WHERE e.extname='laplace' AND d.deptype='e' AND c.relkind='r'
+ LOOP PERFORM pg_catalog.pg_extension_config_dump(item.oid,''); END LOOP;
+END $dump_content$;
+
+-- @laplace_operations@
+
+COMMENT ON FUNCTION @extschema@.laplace_attest_series(pending regclass, changed @extschema@.blake3[]) IS 'Publish the shared Native series snapshot under ordered consensus bucket locks. Preserve cumulative replay, signed trust, dependence folding and removal of claims without evidence.';
+
+COMMENT ON FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[], fan bigint, bits smallint[], refuse @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) IS 'Native indexed claim set for every input occurrence, with the caller-selected fan or NULL for all responders. Virtual Tier-0 identities need no entity row.';
+
+COMMENT ON FUNCTION @extschema@.laplace_clean_pending_list(index_id regclass) IS 'Clean only an extension-owned physicality GIN index for an invoker with INSERT and UPDATE on its partition or parent; does not require canonical-table TRUNCATE or index ownership.';
+
+COMMENT ON FUNCTION @extschema@.laplace_clean_stage(paths regclass) IS 'Drain GIN pending entries for copied path IDs, routing through Native partition bounds and the existing restricted maintenance authority. Returns cleaned pending pages; no input cutoff or public path scan.';
+
+COMMENT ON FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[], OUT trunk @extschema@.blake3, OUT claim @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT dependence_root @extschema@.blake3, OUT dependence_trust double precision) IS 'Read Native claim series below persisted trunks using bounded SPI frontier sets. Shares edge, RLE, outcome and dependence-class tallying with upward containment; no source bytes, standings mutation or witness publication.';
+
+COMMENT ON FUNCTION @extschema@.laplace_enrich_stage(input regclass, target regclass) IS 'Enrich existing Native carriers from an UNLOGGED stage set, routing copied keys by destination partition with work_mem-sized SPI buffers. Parent-table privileges, guards and transaction boundaries are preserved.';
+
+COMMENT ON FUNCTION @extschema@.laplace_ensure_stage() IS 'Prepare three UNLOGGED column templates once; readiness does not loop over partitions, scan pending rows, or truncate data.';
+
+COMMENT ON FUNCTION @extschema@.laplace_labels(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) IS 'Native selected-ID labels in one DAG context: Unicode text and ordered tuple/run structure. Other structural roles and missing realizations retain their canonical identity; package bodies are not reconstructed to label them.';
+
+COMMENT ON FUNCTION @extschema@.laplace_mask_merge(a bit, b bit) IS 'Native checked bitwise OR: combine disjoint fields and row-role flags; reject conflicting enum values.';
+
+COMMENT ON FUNCTION @extschema@.laplace_mask_slot(bank text, value text) IS '64-bit carrier encoding of a frozen bank slot. For exact enum filtering use (mask & @extschema@.laplace_mask_field(bank)) = @extschema@.laplace_mask_slot(bank, value).';
+
+COMMENT ON FUNCTION @extschema@.laplace_merge_stage(entities regclass, paths regclass, OUT entity_rows bigint, OUT physicality_rows bigint, OUT updated_rows bigint) IS 'Consume a paired formed batch in Hilbert order. Retain optional Native client presence classifications; verify only claimed-new IDs once for concurrent overlap; insert absent IDs and enrich existing carriers. No global apply lock, destination anti-join or conflict-driven insertion.';
+
+COMMENT ON FUNCTION @extschema@.laplace_present_ids(ids @extschema@.blake3[], OUT id @extschema@.blake3, OUT ordinal bigint) IS 'Indexed stored-ID presence for a complete client frontier. Native partition routing and btree array scans preserve input occurrences without per-ID executor/partition restarts; Tier-0 membership belongs to the client cache.';
+
+COMMENT ON FUNCTION @extschema@.laplace_recoordinate(apply boolean, OUT entity_rows bigint, OUT physicality_rows bigint) IS 'Explicit canonical DAG projection audit or atomic repair, including stored canonical scalar atoms; rejects unknown/non-atomic leaves and preserves content IDs, paths, masks, witnesses and consensus.';
+
+COMMENT ON FUNCTION @extschema@.laplace_series(roots @extschema@.blake3[], games bigint[], scores double precision[], trusts double precision[], OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint, OUT witnesses bigint) IS 'Native rooted Glicko-2 posterior: games and mean outcomes, bounded trust, shared source uncertainty. Complete evidence is recomputed from the stock prior; input permutations and replay are identical.';
+
+COMMENT ON FUNCTION @extschema@.laplace_series_snapshot(pending regclass, changed @extschema@.blake3[], OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) IS 'Read-only Native standing candidates from cumulative stage observations and registered containment evidence. No public mutation or consensus advisory lock. A selected claim with no evidence returns a NULL standing.';
+
+COMMENT ON FUNCTION @extschema@.laplace_stage_snapshot(pending regclass, changed regclass, OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) IS 'One Native calculation for the supplied stage-resident claim set, sharing indexed carrier proofs, witness registry, lineage resolution and containment DAG; no fixed claim slicing or recursive SQL.';
+
+COMMENT ON FUNCTION @extschema@.laplace_text_batch(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) IS 'Realize selected Native identities together, preserving input occurrences and runs while reading shared DAG descendants once. Transfer windows follow work_mem and PostgreSQL array capacity.';
+
+COMMENT ON FUNCTION @extschema@.laplace_text_id(text) IS 'Canonical Native UAX #29 codepoint/grapheme/word/phrase composition, identical to Engine text ingestion. Empty content returns NULL; source bytes are not normalized.';
+
+COMMENT ON OPERATOR laplace.<-> (@extschema:postgis@.geometry, @extschema:postgis@.geometry) IS 'Native 4D discrete Frechet distance, equal to chord distance for two points. Use OPERATOR(laplace.<->).';

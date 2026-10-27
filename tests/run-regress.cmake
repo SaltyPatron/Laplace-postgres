@@ -13,7 +13,16 @@ file(MAKE_DIRECTORY "${package}/extension" "${output}")
 # pg_regress feeds scripts on stdin, so psql's relative include has no script
 # directory. Keep the shared geometry fixture beside the driver's working dir.
 configure_file("${SOURCE}/tests/sql/geometry_cases.sql" "${build_root}/geometry_cases.sql" COPYONLY)
-file(GLOB scripts "${SOURCE}/sql/laplace--*.sql")
+file(GLOB scripts "${build_root}/extension/laplace--*.sql")
+if(NOT scripts)
+  message(FATAL_ERROR "No generated extension SQL in the candidate build")
+endif()
+# This private package may survive a failed earlier candidate. Do not let an
+# old development chain become an accidental install/upgrade path in the test.
+file(GLOB previous_scripts "${package}/extension/laplace--*.sql")
+if(previous_scripts)
+  file(REMOVE ${previous_scripts})
+endif()
 file(COPY ${scripts} DESTINATION "${package}/extension")
 file(READ "${SOURCE}/laplace.control" control)
 file(TO_CMAKE_PATH "${MODULE}" module_path)
@@ -49,7 +58,7 @@ execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
-  mask_upgrade mask geometry gin_path gist4d text_id attestation stage
+  schema mask geometry gin_path gist4d text_id projection attestation stage function_bindings
   WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
 endif()
 if(NOT result EQUAL 0)

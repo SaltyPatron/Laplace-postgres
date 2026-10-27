@@ -41,15 +41,6 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
                                  int include_files, const lp_idmap *roots,
                                  const lp_idmap *known_witnesses, PgAttrRows *out);
 
-static long frontier_fetch_rows(Portal scan)
-{
-    PlannedStmt *statement = PortalGetPrimaryStmt(scan);
-    size_t tuple_bytes = MAXALIGN(sizeof(HeapTupleData)) + MAXALIGN(SizeofHeapTupleHeader)
-        + sizeof(HeapTuple) + MAXALIGN((size_t)Max(statement->planTree->plan_width, 1));
-    uint64 bytes = (uint64)work_mem * 1024;
-    return Max(1L, (long)Min(bytes / tuple_bytes, (uint64)LONG_MAX));
-}
-
 static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
 {
     bool fresh = false;
@@ -156,23 +147,17 @@ static const lp_trust_class *pg_dependence_class(lp_idmap *classes, const lp_ver
     return *c;
 }
 
-typedef struct { FmgrInfo function; text *kind,*claim;MemoryContext context; } PgClaimBinding;
+typedef struct { lp_mask claim;MemoryContext context; } PgClaimBinding;
 static void pg_claim_bind(PgClaimBinding *binding)
 {
-    Oid arguments[3]={BITOID,TEXTOID,TEXTOID};
-    Oid function=LookupFuncName(list_make2(makeString("public"),makeString("laplace_mask_has_value")),3,arguments,false);
-    AclResult permission=object_aclcheck(ProcedureRelationId,function,GetUserId(),ACL_EXECUTE);
-    if(permission!=ACLCHECK_OK)aclcheck_error(permission,OBJECT_FUNCTION,get_func_name(function));
     binding->context=AllocSetContextCreate(CurrentMemoryContext,"Native claim binding",ALLOCSET_DEFAULT_SIZES);
-    fmgr_info_cxt(function,&binding->function,binding->context);
     MemoryContext previous=MemoryContextSwitchTo(binding->context);
-    binding->kind=cstring_to_text("kind");binding->claim=cstring_to_text("claim");
+    binding->claim=lp_pg_kind_mask("claim");
     MemoryContextSwitchTo(previous);
 }
 static bool pg_claim_carrier(PgClaimBinding *binding,Datum path,Datum mask,const Geo *decoded)
 {
-    if(!DatumGetBool(FunctionCall3Coll(&binding->function,InvalidOid,mask,
-        PointerGetDatum(binding->kind),PointerGetDatum(binding->claim))))return false;
+    if(!(lp_pg_mask_native(mask)&binding->claim))return false;
     Geo geometry;if(!decoded){geometry=geo_of(path);decoded=&geometry;}
     size_t length=lp_path_len(decoded->p);
     if(length>PG_INT64_MAX)
@@ -259,7 +244,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
          * roots once, then use the shared upward kernel directly; there is no
          * speculative downward graph or cardinality-based fallback. */
         PgRootFrontier probe={&vertices,0};
-        lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),pg_root_frontier_row,&probe);
+        lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),true,pg_root_frontier_row,&probe);
         if(probe.found!=lp_idmap_count(roots))
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_contained_series: root has no stored path")));
         PgAttrRows rows={0};
@@ -286,7 +271,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     bool initial=true;
     while(lp_idmap_count(front)){
         lp_idmap *next=lp_idmap_new();down.front=front;down.next=next;
-        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),pg_down_frontier_row,&down);
+        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),true,pg_down_frontier_row,&down);
         lp_idmap_free(front);front=next;
         if(initial){
             for(size_t i=0;i<lp_idmap_count(roots);i++)
@@ -333,6 +318,35 @@ static int by_attr_row(const void *a, const void *b)
     return memcmp(x->dependence.b,y->dependence.b,16);
 }
 
+typedef struct { PgDag *dag;lp_idmap *front,*next,*seen,*classes;PgVertices *vertices;int level; } PgUpward;
+static void pg_upward_row(TupleTableSlot *slot,void *context)
+{
+    PgUpward *walk=context;bool missing;Datum value=slot_getattr(slot,1,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native provenance parent has no identity")));
+    lp_id id=*(const lp_id *)DatumGetPointer(value);bool first;
+    lp_idmap_put(walk->seen,&id,&first);if(!first)return;
+    value=slot_getattr(slot,2,&missing);if(missing)ereport(ERROR,(errmsg("Native provenance parent has no path")));
+    Geo geometry=geo_of(value);int count=(int)geometry.p.n;if(count<=0)return;
+    lp_vec_reserve(walk->vertices,(size_t)count);lp_vertex *vertices=walk->vertices->v;
+    if(lp_path_decode(geometry.p,vertices,(size_t)count)!=(size_t)count)return;
+    size_t parent=PG_NONE;int fresh=0;const lp_trust_class *pending=NULL;lp_id dependence={{0}};
+    for(int k=0;k<count;k++){
+        if(vertices[k].said==LP_SAID_DEPENDENCE){pending=pg_dependence_class(walk->classes,vertices,count,k);dependence=vertices[k].id;continue;}
+        const lp_trust_class *scope=pending;pending=NULL;
+        if(lp_idmap_find(walk->front,&vertices[k].id)<0)continue;
+        uint32_t said=vertices[k].said;
+        if(walk->level==0 && said!=LP_SAID_CLAIM && said!=LP_SAID_RECORD)continue;
+        if(walk->level>0 && said==LP_SAID_METADATA)continue;
+        if(parent==PG_NONE){parent=pg_dag_node(walk->dag,&id,&fresh);walk->dag->n.v[parent].file=vertices[0].said==LP_SAID_METADATA;}
+        size_t child=(size_t)lp_idmap_find(walk->dag->m,&vertices[k].id);
+        PgEdge *edge=pg_dag_edge(walk->dag,parent,child,vertices+k);
+        if(walk->level==0){edge->claim=1;edge->rec=said==LP_SAID_RECORD;
+            if(scope){edge->has_dependence=1;edge->dependence=dependence;edge->dependence_trust=scope->prior;}}
+    }
+    if(parent!=PG_NONE && fresh)lp_idmap_put(walk->next,&id,NULL);
+}
+
+
 static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots,
                                  const lp_idmap *known_witnesses, PgAttrRows *out)
@@ -347,22 +361,23 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
          * direction, including callers selecting non-claim content. */
         if(n){
             PgClaimFrontier selected={.front=front,.dag=&d};pg_claim_bind(&selected.binding);
-            lp_pg_lookup_paths(claims,(size_t)n,pg_claim_frontier_row,&selected);
+            lp_pg_lookup_paths(claims,(size_t)n,true,pg_claim_frontier_row,&selected);
             MemoryContextDelete(selected.binding.context);
         }
     }else for (int i = 0; i < n; i++) {
         lp_idmap_put(front, &claims[i], NULL);pg_dag_node(&d, &claims[i], NULL);
     }
-    lp_vec(lp_vertex) vx = {0};
+    PgVertices vx = {0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
-    /* A custom plan copies the complete frontier into every partition's
-     * scan. Serializing that plan for parallel workers can exceed 1 GiB.
-     * Keep one parameter without PARAM_FLAG_CONST: the planner can estimate
-     * its actual search keys without embedding its value in every scan. */
-    SPIPlanPtr upward = SPI_prepare_cursor(
-        "SELECT p.entity, p.path FROM physicality p "
-        "WHERE p.path && $1 ORDER BY p.entity", 1, &idarr,
-        CURSOR_OPT_CUSTOM_PLAN | CURSOR_OPT_PARALLEL_OK);
+    /* This is one indexed frontier inside a Native walk, not a whole-query
+     * parallel scan. Starting worker processes at every hop/window dominates
+     * sparse containment.
+     * Admit no parallel plan at this boundary. Keep the frontier as a parameter
+     * without PARAM_FLAG_CONST rather than embedding it in every partition. */
+    SPIPlanPtr upward = lp_pg_prepare_cursor(
+        "SELECT p.entity, p.path FROM @extschema@.physicality p "
+        "WHERE p.path OPERATOR(@extschema@.&&) $1 ORDER BY p.entity", 1, &idarr,
+        CURSOR_OPT_CUSTOM_PLAN);
     if (!upward) ereport(ERROR, (errmsg("laplace_attested: upward plan failed")));
     ParamListInfo frontier_params = makeParamList(1);
     frontier_params->params[0].ptype = idarr;
@@ -379,47 +394,8 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
             size_t amount = count - begin; if (amount > window_ids) amount = window_ids;
             ArrayType *window = id_array_of(idelm, lp_idmap_keys(front) + begin, (int)amount);
             frontier_params->params[0].value = PointerGetDatum(window);
-            Portal scan = SPI_cursor_open_with_paramlist(NULL, upward, frontier_params, true);
-            if (!scan)
-                ereport(ERROR, (errmsg("laplace_attested: upward walk failed")));
-            long fetch_rows = frontier_fetch_rows(scan);
-            for (;;) {
-                SPI_cursor_fetch(scan, true, fetch_rows);
-                if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
-                for (uint64 r = 0; r < SPI_processed; r++) {
-                    bool nl; lp_id pid;
-                    memcpy(pid.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
-                    bool first; lp_idmap_put(seen, &pid, &first); if (!first) continue;
-                    Geo g = geo_of(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-                    int nv = (int)g.p.n; if (nv <= 0) continue;
-                    lp_vec_reserve(&vx, (size_t)nv);
-                    if (lp_path_decode(g.p, vx.v, (size_t)nv) != (size_t)nv) continue;
-                    size_t pi = PG_NONE; int fresh = 0;
-                    const lp_trust_class *pending_class=NULL; lp_id pending_id={{0}};
-                    for (int k = 0; k < nv; k++) {
-                        if (vx.v[k].said==LP_SAID_DEPENDENCE) {
-                            pending_class=pg_dependence_class(classes,vx.v,nv,k); pending_id=vx.v[k].id; continue;
-                        }
-                        const lp_trust_class *scope=pending_class; pending_class=NULL;
-                        if (lp_idmap_find(front, &vx.v[k].id) < 0) continue;
-                        uint32_t sd = vx.v[k].said;
-                        if (lvl == 0 && sd != LP_SAID_CLAIM && sd != LP_SAID_RECORD) continue;
-                        if (lvl > 0 && sd == LP_SAID_METADATA) continue;
-                        if (pi == PG_NONE) {
-                            pi = pg_dag_node(&d, &pid, &fresh);
-                            d.n.v[pi].file = vx.v[0].said == LP_SAID_METADATA;
-                        }
-                        size_t ci = (size_t)lp_idmap_find(d.m, &vx.v[k].id);
-                        PgEdge *e = pg_dag_edge(&d, pi, ci, &vx.v[k]);
-                        if (lvl == 0) { e->claim = 1; e->rec = (sd == LP_SAID_RECORD);
-                            if (scope) { e->has_dependence=1; e->dependence=pending_id; e->dependence_trust=scope->prior; }
-                        }
-                    }
-                    if (pi != PG_NONE && fresh) lp_idmap_put(next, &pid, NULL);
-                }
-                SPI_freetuptable(SPI_tuptable);
-            }
-            SPI_cursor_close(scan);
+            PgUpward walk={&d,front,next,seen,classes,&vx,lvl};
+            lp_pg_stream(upward,frontier_params,pg_upward_row,&walk);
             pfree(window);
         }
         lp_idmap_free(seen);
@@ -443,7 +419,7 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     lp_idmap *wmap = known_witnesses ? (lp_idmap *)known_witnesses : lp_idmap_sized(sizeof(double));
     if (!known_witnesses && rids.n > 0) {
         Datum a[1] = { PointerGetDatum(id_array_of(idelm, rids.v, (int)rids.n)) }; Oid t[1] = { idarr };
-        if (SPI_execute_with_args("SELECT id, trust FROM witness WHERE id = ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
+        if (lp_pg_execute_args("SELECT id, trust FROM @extschema@.witness WHERE id OPERATOR(@extschema@.=) ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_attested: witness lookup failed")));
         for (uint64 r = 0; r < SPI_processed; r++) {
             bool nl; lp_id wid;
@@ -688,6 +664,37 @@ static int pg_series_by_claim(const void *a, const void *b)
     return memcmp(((const PgSeriesObservation *)a)->claim.b, ((const PgSeriesObservation *)b)->claim.b, sizeof(lp_id));
 }
 
+static void pg_series_claim_row(TupleTableSlot *slot,void *context)
+{
+    PgSeriesBatch *batch=context;bool missing;Datum value=slot_getattr(slot,1,&missing);
+    if(missing)pg_series_invalid();lp_idmap_put(batch->claims,(const lp_id *)DatumGetPointer(value),NULL);
+}
+static void pg_series_pending_row(TupleTableSlot *slot,void *context)
+{
+    PgSeriesBatch *batch=context;
+    CHECK_FOR_INTERRUPTS(); bool missing; Datum value; PgSeriesObservation o = {0};
+    value = slot_getattr(slot, 1, &missing);
+    if (missing) pg_series_invalid(); memcpy(o.claim.b, DatumGetPointer(value), sizeof(lp_id));
+    value = slot_getattr(slot, 2, &missing);
+    if (missing) pg_series_invalid(); memcpy(o.witness.b, DatumGetPointer(value), sizeof(lp_id));
+    value = slot_getattr(slot, 3, &missing);
+    o.has_lineage = !missing; if (!missing) memcpy(o.lineage.b, DatumGetPointer(value), sizeof(lp_id));
+    value = slot_getattr(slot, 4, &missing);
+    if (missing) pg_series_invalid(); int64 games = DatumGetInt64(value);
+    if (games<=0 || games>INT64CONST(9007199254740992)) pg_series_invalid(); o.games=(uint64_t)games;
+    value = slot_getattr(slot, 5, &missing);
+    if (missing) pg_series_invalid(); o.score=DatumGetFloat8(value);
+    value = slot_getattr(slot, 6, &missing);
+    if (missing) pg_series_invalid(); o.trust=DatumGetFloat8(value);
+    if (!isfinite(o.score) || o.score<0 || o.score>1 || !isfinite(o.trust) || o.trust < -1 || o.trust>1) pg_series_invalid();
+    uint8_t key[49]={0}; memcpy(key,o.claim.b,16); memcpy(key+16,o.witness.b,16); memcpy(key+32,o.lineage.b,16); key[48]=o.has_lineage;
+    bool fresh; lp_strmap_put(batch->pending,key,sizeof key,&fresh); if (!fresh) pg_series_invalid();
+    lp_strmap_put(batch->pairs,key,32,NULL);
+    double *trust = lp_strmap_get(batch->trusts,key+16,33,&fresh);
+    if (!fresh && *trust != o.trust) pg_series_invalid(); *trust=o.trust;
+    lp_push(&batch->observations,o);
+}
+
 PG_FUNCTION_INFO_V1(laplace_series_snapshot);
 Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
 {
@@ -702,8 +709,8 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
     MemoryContextRegisterResetCallback(context, cleanup);
     batch->claims = lp_idmap_new(); batch->witnesses = lp_idmap_sized(sizeof(PgSeriesWitness));
     batch->pending = lp_strmap_sized(1); batch->pairs = lp_strmap_sized(1); batch->trusts = lp_strmap_sized(sizeof(double));
-    Oid native_id = get_atttype(get_relname_relid("physicality", get_namespace_oid("public", false)),
-        get_attnum(get_relname_relid("physicality", get_namespace_oid("public", false)), "entity"));
+    Oid physicality=lp_pg_relation("physicality");
+    Oid native_id=get_atttype(physicality,get_attnum(physicality,"entity"));
     Oid idarray = get_array_type(native_id);
     char *pending = pg_series_stage(PG_GETARG_OID(0), "claim", native_id, false);
     char *changed = NULL;
@@ -717,31 +724,20 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
         pfree(ids);
     } else {
         char *sql = psprintf("SELECT claim FROM %s", changed ? changed : pending);
-        SPIPlanPtr plan = SPI_prepare_cursor(sql, 0, NULL, CURSOR_OPT_NO_SCROLL);
-        Portal scan = plan ? SPI_cursor_open(NULL, plan, NULL, NULL, true) : NULL;
-        if (!scan) ereport(ERROR, (errmsg("laplace_series_snapshot: claim selection failed")));
-        long fetch = frontier_fetch_rows(scan);
-        for (;;) {
-            SPI_cursor_fetch(scan, true, fetch);
-            if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
-            for (uint64 row = 0; row < SPI_processed; row++) {
-                bool missing; Datum value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
-                if (missing) pg_series_invalid();
-                lp_idmap_put(batch->claims, (const lp_id *)DatumGetPointer(value), NULL);
-            }
-            SPI_freetuptable(SPI_tuptable);
-        }
-        SPI_cursor_close(scan); SPI_freeplan(plan); pfree(sql);
+        SPIPlanPtr plan = lp_pg_prepare_cursor(sql, 0, NULL, CURSOR_OPT_NO_SCROLL);
+        if(!plan)ereport(ERROR,(errmsg("laplace_series_snapshot: claim plan failed")));
+        lp_pg_stream(plan,NULL,pg_series_claim_row,batch);
+        SPI_freeplan(plan);pfree(sql);
     }
     size_t count = lp_idmap_count(batch->claims);
     if (count) {
         /* Validate the requested carrier set once. The provenance kernel below
          * reuses this proof and the witness registry instead of querying both again. */
         PgClaimFrontier verified={0};pg_claim_bind(&verified.binding);
-        lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,pg_claim_frontier_row,&verified);
+        lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,true,pg_claim_frontier_row,&verified);
         MemoryContextDelete(verified.binding.context);
         if(verified.found!=count)pg_series_invalid();
-        if (SPI_execute("SELECT id,lineage,trust FROM public.witness ORDER BY id", true, 0) != SPI_OK_SELECT)
+        if (lp_pg_execute("SELECT id,lineage,trust FROM @extschema@.witness ORDER BY id", true, 0) != SPI_OK_SELECT)
             ereport(ERROR, (errmsg("laplace_series_snapshot: witness registry failed")));
         for (uint64 row = 0; row < SPI_processed; row++) {
             bool missing; lp_id id;
@@ -755,44 +751,16 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
         /* A stage-resident selection stays a set in PostgreSQL; no client-side
          * array export or fixed-count keyset loop is needed. */
         char *sql = changed ? psprintf("SELECT s.claim,s.witness,s.lineage,s.games::bigint,s.score::float8,s.trust::float8"
-            " FROM %s s WHERE EXISTS(SELECT FROM %s c WHERE c.claim=s.claim)", pending, changed)
+            " FROM %s s WHERE EXISTS(SELECT FROM %s c WHERE c.claim OPERATOR(@extschema@.=) s.claim)", pending, changed)
             : psprintf("SELECT s.claim,s.witness,s.lineage,s.games::bigint,s.score::float8,s.trust::float8"
-                " FROM %s s WHERE s.claim=ANY($1)", pending);
+                " FROM %s s WHERE s.claim OPERATOR(@extschema@.=) ANY($1)", pending);
         ArrayType *selected = changed ? NULL : id_array_of(native_id, lp_idmap_keys(batch->claims), (int)count);
-        Datum argument = selected ? PointerGetDatum(selected) : (Datum)0;
-        SPIPlanPtr plan = SPI_prepare_cursor(sql, changed ? 0 : 1, changed ? NULL : &idarray, CURSOR_OPT_NO_SCROLL);
-        Portal scan = plan ? SPI_cursor_open(NULL, plan, changed ? NULL : &argument, NULL, true) : NULL;
-        if (!scan) ereport(ERROR, (errmsg("laplace_series_snapshot: pending selection failed")));
-        long fetch = frontier_fetch_rows(scan);
-        for (;;) {
-            SPI_cursor_fetch(scan, true, fetch);
-            if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
-            for (uint64 row = 0; row < SPI_processed; row++) {
-                CHECK_FOR_INTERRUPTS(); bool missing; Datum value; PgSeriesObservation o = {0};
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
-                if (missing) pg_series_invalid(); memcpy(o.claim.b, DatumGetPointer(value), sizeof(lp_id));
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 2, &missing);
-                if (missing) pg_series_invalid(); memcpy(o.witness.b, DatumGetPointer(value), sizeof(lp_id));
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 3, &missing);
-                o.has_lineage = !missing; if (!missing) memcpy(o.lineage.b, DatumGetPointer(value), sizeof(lp_id));
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 4, &missing);
-                if (missing) pg_series_invalid(); int64 games = DatumGetInt64(value);
-                if (games<=0 || games>INT64CONST(9007199254740992)) pg_series_invalid(); o.games=(uint64_t)games;
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 5, &missing);
-                if (missing) pg_series_invalid(); o.score=DatumGetFloat8(value);
-                value = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 6, &missing);
-                if (missing) pg_series_invalid(); o.trust=DatumGetFloat8(value);
-                if (!isfinite(o.score) || o.score<0 || o.score>1 || !isfinite(o.trust) || o.trust < -1 || o.trust>1) pg_series_invalid();
-                uint8_t key[49]={0}; memcpy(key,o.claim.b,16); memcpy(key+16,o.witness.b,16); memcpy(key+32,o.lineage.b,16); key[48]=o.has_lineage;
-                bool fresh; lp_strmap_put(batch->pending,key,sizeof key,&fresh); if (!fresh) pg_series_invalid();
-                lp_strmap_put(batch->pairs,key,32,NULL);
-                double *trust = lp_strmap_get(batch->trusts,key+16,33,&fresh);
-                if (!fresh && *trust != o.trust) pg_series_invalid(); *trust=o.trust;
-                lp_push(&batch->observations,o);
-            }
-            SPI_freetuptable(SPI_tuptable);
-        }
-        SPI_cursor_close(scan); SPI_freeplan(plan); pfree(sql); if (selected) pfree(selected);
+        SPIPlanPtr plan=lp_pg_prepare_cursor(sql,changed?0:1,changed?NULL:&idarray,0);
+        if(!plan)ereport(ERROR,(errmsg("laplace_series_snapshot: pending plan failed")));
+        ParamListInfo parameters=changed?NULL:makeParamList(1);
+        if(parameters){parameters->params[0]=(ParamExternData){.value=PointerGetDatum(selected),.ptype=idarray,.pflags=0};}
+        lp_pg_stream(plan,parameters,pg_series_pending_row,batch);
+        SPI_freeplan(plan);pfree(sql);if(selected)pfree(selected);if(parameters)pfree(parameters);
         if (lp_idmap_count(batch->witnesses)) {
             compute_attested_rows(lp_idmap_keys(batch->claims), (int)count, idarray, 0, 0,
                 batch->witnesses, batch->witnesses, &batch->historical);

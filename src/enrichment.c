@@ -20,6 +20,7 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/partcache.h"
+#include "utils/acl.h"
 #include "laplace/geometry.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partbounds.h"
@@ -118,20 +119,27 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
     indexed_keys(parent,column,keys,(size_t)count,presence_visit,&out);
 }
 
-static Relation presence_parent(Oid target,const char **column,const char *columns)
+static Relation presence_parent(Oid target,const char **column,int columns)
 {
-    Oid schema=get_namespace_oid("public",false);
+    Oid schema=lp_pg_schema();
     bool paths=target==get_relname_relid("physicality",schema);
     if(!paths && target!=get_relname_relid("entity",schema))
-        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native presence target must be public.entity or public.physicality")));
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native presence target must be the installed entity or physicality relation")));
     *column=paths?"entity":"id";
     Relation parent=table_open(target,AccessShareLock);
     if(check_enable_rls(target,InvalidOid,false)==RLS_ENABLED)
         ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native presence requires a canonical shared relation without active RLS")));
-    char *permission=psprintf("SELECT %s FROM public.%s WHERE false",columns?columns:*column,paths?"physicality":"entity");
-    if(SPI_execute(permission,true,0)!=SPI_OK_SELECT)
-        ereport(ERROR,(errmsg("Native presence: permission proof failed")));
-    SPI_freetuptable(SPI_tuptable);pfree(permission);
+    /* Apply PostgreSQL's parent/column privileges directly. Planning a dummy
+     * SELECT for every frontier added an avoidable SQL executor boundary. */
+    if(pg_class_aclcheck(target,GetUserId(),ACL_SELECT)!=ACLCHECK_OK){
+        const char *selected[]={*column,"path","mask"};
+        int count=columns;
+        for(int i=0;i<count;i++){
+            AclResult allowed=pg_attribute_aclcheck(target,get_attnum(target,selected[i]),GetUserId(),ACL_SELECT);
+            if(allowed!=ACLCHECK_OK)
+                aclcheck_error_col(allowed,OBJECT_TABLE,RelationGetRelationName(parent),selected[i]);
+        }
+    }
     List *children=find_all_inheritors(target,AccessShareLock,NULL);list_free(children);
     return parent;
 }
@@ -142,40 +150,77 @@ typedef struct {
 static void path_frontier_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
     PathFrontier *front=context;bool path_null,mask_null;
-    Datum path=slot_getattr(slot,front->path,&path_null),mask=slot_getattr(slot,front->mask,&mask_null);
+    Datum path=slot_getattr(slot,front->path,&path_null),mask=(Datum)0;
+    mask_null=false;if(front->mask>0)mask=slot_getattr(slot,front->mask,&mask_null);
     if(path_null||mask_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native path frontier: null carrier")));
     MemoryContext previous=MemoryContextSwitchTo(front->tuple_context);
     front->visit(&key->id,path,mask,front->context);
     MemoryContextSwitchTo(previous);MemoryContextReset(front->tuple_context);
 }
-void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context)
+void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context)
 {
     if(!count)return;
-    const char *column;Oid target=get_relname_relid("physicality",get_namespace_oid("public",false));
-    Relation parent=presence_parent(target,&column,"entity,path,mask");
+    const char *column;Oid target=lp_pg_relation("physicality");
+    Relation parent=presence_parent(target,&column,masks?3:2);
     if(count>MaxAllocHugeSize/sizeof(PresenceKey))
         ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native path frontier exceeds addressable memory")));
     PresenceKey *keys=palloc_extended(count*sizeof(*keys),MCXT_ALLOC_HUGE);
     for(size_t i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
-    PathFrontier front={visit,context,get_attnum(target,"path"),get_attnum(target,"mask"),
+    PathFrontier front={visit,context,get_attnum(target,"path"),masks?get_attnum(target,"mask"):InvalidAttrNumber,
         AllocSetContextCreate(CurrentMemoryContext,"Native path frontier tuple",ALLOCSET_DEFAULT_SIZES)};
     indexed_keys(parent,column,keys,count,path_frontier_visit,&front);
     MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
 }
 
 PG_FUNCTION_INFO_V1(laplace_present_ids);
+static void present_bitmap_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    ((bool *)context)[key->ordinal-1]=true;
+}
+void lp_pg_present(const lp_id *ids,size_t count,bool *present)
+{
+    if(!count)return;
+    size_t wanted=0;
+    for(size_t i=0;i<count;i++)wanted+=!present[i];
+    if(!wanted)return;
+    if(wanted>MaxAllocHugeSize/sizeof(PresenceKey))
+        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native presence frontier exceeds addressable memory")));
+    PresenceKey *keys=palloc_extended(sizeof(*keys)*wanted,MCXT_ALLOC_HUGE);
+    size_t at=0;
+    for(size_t i=0;i<count;i++)if(!present[i])keys[at++]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
+    const char *column;Relation parent=presence_parent(lp_pg_relation("entity"),&column,1);
+    indexed_keys(parent,column,keys,wanted,present_bitmap_row,present);
+    pfree(keys);table_close(parent,NoLock);
+}
 Datum laplace_present_ids(PG_FUNCTION_ARGS)
 {
     TupleDesc descriptor;Tuplestorestate *output=set_begin(fcinfo,"laplace_present_ids",&descriptor);
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
     if(!count){pfree(ids);PG_RETURN_NULL();}
-    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_present_ids: SPI_connect")));
     const char *column;
-    Relation parent=presence_parent(get_relname_relid("entity",get_namespace_oid("public",false)),&column,NULL);
+    Relation parent=presence_parent(lp_pg_relation("entity"),&column,1);
     PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
     for(int i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=i+1};
     presence_keys(fcinfo,output,descriptor,parent,column,keys,count);
-    pfree(keys);pfree(ids);table_close(parent,NoLock);SPI_finish();PG_RETURN_NULL();
+    pfree(keys);pfree(ids);table_close(parent,NoLock);PG_RETURN_NULL();
+}
+
+typedef struct {
+    FunctionCallInfo call;Tuplestorestate *rows;TupleDesc descriptor;Relation parent;
+    const char *column;PresenceKey *keys;int used,capacity;int64 ordinal;
+} PresenceBatch;
+static void presence_flush(PresenceBatch *batch)
+{
+    if(!batch->used)return;
+    presence_keys(batch->call,batch->rows,batch->descriptor,batch->parent,batch->column,batch->keys,batch->used);
+    batch->used=0;
+}
+static void presence_stage_row(TupleTableSlot *slot,void *context)
+{
+    PresenceBatch *batch=context;bool missing;Datum id=slot_getattr(slot,1,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace_present_stage: null Native ID")));
+    batch->keys[batch->used++]=(PresenceKey){.id=*(const lp_id *)DatumGetPointer(id),.ordinal=++batch->ordinal};
+    if(batch->used==batch->capacity)presence_flush(batch);
 }
 
 PG_FUNCTION_INFO_V1(laplace_present_stage);
@@ -192,29 +237,17 @@ Datum laplace_present_stage(PG_FUNCTION_ARGS)
         || get_atttype(input,get_attnum(input,present_column))!=BOOLOID)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_present_stage requires a private stage ID set and boolean presence column")));
     if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_present_stage: SPI_connect")));
-    const char *column;Relation parent=presence_parent(target,&column,NULL);
+    const char *column;Relation parent=presence_parent(target,&column,1);
     if(get_atttype(input,get_attnum(input,id_column))!=get_atttype(target,get_attnum(target,column)))
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_present_stage requires Native content IDs")));
     char *source=quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)),RelationGetRelationName(stage));
     char *sql=psprintf("SELECT %s FROM %s WHERE %s IS NOT TRUE",quote_identifier(id_column),source,quote_identifier(present_column));
-    SPIPlanPtr plan=SPI_prepare_cursor(sql,0,NULL,CURSOR_OPT_NO_SCROLL);
-    Portal scan=plan?SPI_cursor_open(NULL,plan,NULL,NULL,true):NULL;
-    if(!scan)ereport(ERROR,(errmsg("laplace_present_stage: stage selection failed")));
-    long fetch=enrichment_fetch_rows();int64 ordinal=0;
-    for(;;){
-        SPI_cursor_fetch(scan,true,fetch);
-        if(!SPI_processed){SPI_freetuptable(SPI_tuptable);break;}
-        int count=(int)SPI_processed;
-        PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
-        for(int i=0;i<count;i++){
-            bool missing;Datum id=SPI_getbinval(SPI_tuptable->vals[i],SPI_tuptable->tupdesc,1,&missing);
-            if(missing)ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace_present_stage: null Native ID")));
-            keys[i]=(PresenceKey){.id=*(const lp_id *)DatumGetPointer(id),.ordinal=++ordinal};
-        }
-        SPI_freetuptable(SPI_tuptable);
-        presence_keys(fcinfo,output,descriptor,parent,column,keys,count);pfree(keys);
-    }
-    SPI_cursor_close(scan);SPI_freeplan(plan);pfree(sql);pfree(source);
+    SPIPlanPtr plan=lp_pg_prepare_cursor(sql,0,NULL,CURSOR_OPT_NO_SCROLL);
+    if(!plan)ereport(ERROR,(errmsg("laplace_present_stage: stage plan failed")));
+    int capacity=(int)enrichment_fetch_rows();
+    PresenceBatch batch={fcinfo,output,descriptor,parent,column,palloc(sizeof(PresenceKey)*(Size)capacity),0,capacity,0};
+    lp_pg_stream(plan,NULL,presence_stage_row,&batch);presence_flush(&batch);
+    pfree(batch.keys);SPI_freeplan(plan);pfree(sql);pfree(source);
     table_close(parent,NoLock);table_close(stage,NoLock);SPI_finish();PG_RETURN_NULL();
 }
 
@@ -278,15 +311,58 @@ static ArrayType *enrichment_array(Oid type, const EnrichmentKey *keys, int coun
     return ids;
 }
 
+typedef struct {
+    Oid target,idtype;Relation parent;SPIPlanPtr apply;EnrichmentKey *keys;
+    size_t used,capacity;bool range;uint64 updated;
+} EnrichmentBatch;
+static int enrichment_order(const void *a,const void *b)
+{
+    return memcmp(((const EnrichmentKey *)a)->id.b,((const EnrichmentKey *)b)->id.b,sizeof(lp_id));
+}
+static void enrichment_flush(EnrichmentBatch *batch)
+{
+    if(!batch->used)return;
+    PartitionKey key=batch->range?RelationGetPartitionKey(batch->parent):NULL;
+    PartitionDesc partitions=batch->range?RelationGetPartitionDesc(batch->parent,true):NULL;
+    for(size_t i=0;i<batch->used;i++)batch->keys[i].partition=enrichment_partition(batch->target,key,partitions,PointerGetDatum(&batch->keys[i].id));
+    lp_sort(batch->keys,batch->used,sizeof(*batch->keys),enrichment_order);
+    /* The reader remains one executor pass. Each bounded partition set is
+     * updated in a nested SPI frame, preserving the reader's result state. */
+    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_enrich_stage: writer SPI_connect")));
+    PG_TRY();{
+        for(size_t begin=0;begin<batch->used;){
+            CHECK_FOR_INTERRUPTS();size_t end=begin+1;
+            while(end<batch->used && batch->keys[end].partition==batch->keys[begin].partition)end++;
+            ArrayType *ids=enrichment_array(batch->idtype,batch->keys+begin,(int)(end-begin),false);
+            ArrayType *locations=enrichment_array(TIDOID,batch->keys+begin,(int)(end-begin),true);
+            Datum parameters[]={PointerGetDatum(ids),PointerGetDatum(locations)};
+            if(SPI_execute_plan(batch->apply,parameters,NULL,false,0)!=SPI_OK_UPDATE)
+                ereport(ERROR,(errmsg("laplace_enrich_stage: update failed")));
+            batch->updated+=SPI_processed;pfree(ids);pfree(locations);begin=end;
+        }
+    }PG_FINALLY();{SPI_finish();}PG_END_TRY();
+    batch->used=0;
+}
+static void enrichment_stage_row(TupleTableSlot *slot,void *context)
+{
+    EnrichmentBatch *batch=context;bool missing;Datum id=slot_getattr(slot,1,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace_enrich_stage: null Native ID")));
+    EnrichmentKey *key=batch->keys+batch->used++;key->id=*(const lp_id *)DatumGetPointer(id);
+    Datum location=slot_getattr(slot,2,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace_enrich_stage: null input location")));
+    key->source=*(const ItemPointerData *)DatumGetPointer(location);
+    if(batch->used==batch->capacity)enrichment_flush(batch);
+}
+
 PG_FUNCTION_INFO_V1(laplace_enrich_stage);
 Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
 {
     Oid input = PG_GETARG_OID(0), target = PG_GETARG_OID(1);
-    Oid public = get_namespace_oid("public", false);
-    bool paths = target == get_relname_relid("physicality", public);
-    if (!paths && target != get_relname_relid("entity", public))
+    Oid schema = lp_pg_schema();
+    bool paths = target == get_relname_relid("physicality", schema);
+    if (!paths && target != get_relname_relid("entity", schema))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                       errmsg("laplace_enrich_stage: target must be public.entity or public.physicality")));
+                       errmsg("laplace_enrich_stage: target must be the installed entity or physicality relation")));
     /* Keep the copied input immutable while its tuple locations are used.
      * This does not lock destination rows or alter the caller's transaction. */
     Relation stage = table_open(input, AccessShareLock);
@@ -309,9 +385,8 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
     PartitionKey partition_key = RelationGetPartitionKey(parent);
     bool range = partition_key && partition_key->strategy == PARTITION_STRATEGY_RANGE
         && partition_key->partnatts == 1 && partition_key->partattrs[0] == get_attnum(target, key);
-    PartitionDesc partitions = range ? RelationGetPartitionDesc(parent, true) : NULL;
     char *source = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(stage)), RelationGetRelationName(stage));
-    char *destination = quote_qualified_identifier("public", paths ? "physicality" : "entity");
+    char *destination = quote_qualified_identifier(get_namespace_name(schema), paths ? "physicality" : "entity");
     char *proof_name=NULL,*restriction=pstrdup("");
     if(PG_NARGS()>2){
         Oid selected=PG_GETARG_OID(2);Relation proof=table_open(selected,ShareLock);
@@ -325,31 +400,31 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_enrich_stage requires a private classified ID set")));
         proof_name=quote_qualified_identifier(get_namespace_name(RelationGetNamespace(proof)),RelationGetRelationName(proof));
         pfree(restriction);restriction=direct?pstrdup(" AND s.present"):
-            psprintf(" AND EXISTS (SELECT FROM %s classified WHERE classified.id=s.%s AND classified.%s)",proof_name,key,flag);
+            psprintf(" AND EXISTS (SELECT FROM %s classified WHERE classified.id OPERATOR(@extschema@.=) s.%s AND classified.%s)",proof_name,key,flag);
         table_close(proof,NoLock);
     }
     const char *changed = paths
-        ? "(d.tier>s.tier OR (d.mask|s.mask)<>d.mask OR CASE WHEN s.path IS NULL THEN false ELSE (ST_AsEWKB(d.path)<>ST_AsEWKB(s.path)"
-          " AND ST_AsEWKB(laplace_path_enrich(d.path,s.path))<>ST_AsEWKB(d.path)) END)"
+        ? "(d.tier>s.tier OR (d.mask|s.mask)<>d.mask OR CASE WHEN s.path IS NULL THEN false ELSE (@postgis@.ST_AsEWKB(d.path)<>@postgis@.ST_AsEWKB(s.path)"
+          " AND @postgis@.ST_AsEWKB(@extschema@.laplace_path_enrich(d.path,s.path))<>@postgis@.ST_AsEWKB(d.path)) END)"
         : "(d.tier>s.tier OR (d.mask|s.mask)<>d.mask)";
     /* Do not join the entire destination merely to discover target leaves.
      * PostgreSQL's own range-bound search routes the copied keys in C. */
-    char *compatible=proof_name?psprintf("public.laplace_stage_compatible(d.%s,s.%s,d.%s,s.%s,d.hilbert,s.hilbert,%s)",
+    char *compatible=proof_name?psprintf("@extschema@.laplace_stage_compatible(d.%s,s.%s,d.%s,s.%s,d.hilbert,s.hilbert,%s)",
         key,key,paths?"path":"coord",paths?"path":"coord",paths?"true":"false"):pstrdup("true");
     char *needed=proof_name?psprintf("(%s OR NOT %s)",changed,compatible):pstrdup(changed);
-    char *select = psprintf("SELECT s.%s,s.ctid FROM %s s WHERE true%s ORDER BY s.%s", key, source, restriction, key);
-    char *update = psprintf("UPDATE %s d SET tier=CASE WHEN %s THEN least(d.tier,s.tier) ELSE d.tier END,mask=laplace_mask_merge(d.mask,s.mask)%s"
-                           " FROM %s s WHERE d.%s=s.%s AND d.%s=ANY($1) AND s.ctid=ANY($2) AND %s%s",
-                           destination,compatible, paths ? ",path=CASE WHEN s.path IS NULL THEN d.path WHEN ST_AsEWKB(d.path)<>ST_AsEWKB(s.path)"
-                           " THEN laplace_path_enrich(d.path,s.path) ELSE d.path END" : "",
+    char *select = psprintf("SELECT s.%s,s.ctid FROM %s s WHERE true%s", key, source, restriction);
+    char *update = psprintf("UPDATE %s d SET tier=CASE WHEN %s THEN least(d.tier,s.tier) ELSE d.tier END,mask=@extschema@.laplace_mask_merge(d.mask,s.mask)%s"
+                           " FROM %s s WHERE d.%s OPERATOR(@extschema@.=) s.%s AND d.%s OPERATOR(@extschema@.=) ANY($1) AND s.ctid=ANY($2) AND %s%s",
+                           destination,compatible, paths ? ",path=CASE WHEN s.path IS NULL THEN d.path WHEN @postgis@.ST_AsEWKB(d.path)<>@postgis@.ST_AsEWKB(s.path)"
+                           " THEN @extschema@.laplace_path_enrich(d.path,s.path) ELSE d.path END" : "",
                            source, key, key, key, needed,restriction);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errmsg("laplace_enrich_stage: SPI_connect")));
     /* A custom UPDATE sees the actual partition-local ID array. It has the
      * same parent permissions and latest-tuple enrichment guard as before. */
     Oid types[2] = {idarray, TIDARRAYOID};
-    SPIPlanPtr apply = SPI_prepare_cursor(update, 2, types, CURSOR_OPT_CUSTOM_PLAN);
-    SPIPlanPtr selection = SPI_prepare_cursor(select, 0, NULL, CURSOR_OPT_NO_SCROLL);
+    SPIPlanPtr apply = lp_pg_prepare_cursor(update, 2, types, CURSOR_OPT_CUSTOM_PLAN);
+    SPIPlanPtr selection = lp_pg_prepare_cursor(select, 0, NULL, CURSOR_OPT_NO_SCROLL);
     if (!apply || !selection)
         ereport(ERROR, (errmsg("laplace_enrich_stage: plan failed")));
     /* An unchanged set must still enforce the original UPDATE privileges,
@@ -363,53 +438,11 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
             ExecCheckPermissions(query->rtable, query->rteperminfos, true);
         }
     }
-    Portal scan = SPI_cursor_open(NULL, selection, NULL, NULL, true);
-    if (!scan) ereport(ERROR, (errmsg("laplace_enrich_stage: selection failed")));
-    uint64 updated = 0;
-    long fetch = enrichment_fetch_rows();
-    for (;;) {
-        SPI_cursor_fetch(scan, true, fetch);
-        uint64 count = SPI_processed;
-        SPITupleTable *tuples = SPI_tuptable;
-        if (!count) { SPI_freetuptable(tuples); break; }
-        /* SPI may process relcache invalidations between fetches. Keep no
-         * partition-bound pointer across an executor call. */
-        if (range) {
-            partition_key = RelationGetPartitionKey(parent);
-            partitions = RelationGetPartitionDesc(parent, true);
-        }
-        EnrichmentKey *keys = palloc(sizeof(*keys) * count);
-        for (uint64 i = 0; i < count; i++) {
-            bool missing;
-            Datum id = SPI_getbinval(tuples->vals[i], tuples->tupdesc, 1, &missing);
-            if (missing) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_enrich_stage: null Native ID")));
-            memcpy(keys[i].id.b, DatumGetPointer(id), sizeof(lp_id));
-            Datum location = SPI_getbinval(tuples->vals[i], tuples->tupdesc, 2, &missing);
-            if (missing) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_enrich_stage: null input location")));
-            memcpy(&keys[i].source, DatumGetPointer(location), sizeof(ItemPointerData));
-            keys[i].partition = enrichment_partition(target, partition_key, partitions,
-                PointerGetDatum(&keys[i].id));
-        }
-        /* Nested SPI execution replaces SPI_tuptable. Copy routing keys and
-         * release the fetched tuples before applying any destination set. */
-        SPI_freetuptable(tuples);
-        for (uint64 begin = 0; begin < count;) {
-            CHECK_FOR_INTERRUPTS();
-            uint64 end = begin + 1;
-            while (end < count && keys[end].partition == keys[begin].partition) end++;
-            ArrayType *ids = enrichment_array(idtype, keys + begin, (int)(end - begin), false);
-            ArrayType *locations = enrichment_array(TIDOID, keys + begin, (int)(end - begin), true);
-            Datum parameters[2] = {PointerGetDatum(ids), PointerGetDatum(locations)};
-            if (SPI_execute_plan(apply, parameters, NULL, false, 0) != SPI_OK_UPDATE)
-                ereport(ERROR, (errmsg("laplace_enrich_stage: update failed")));
-            updated += SPI_processed;
-            pfree(ids); pfree(locations);
-            begin = end;
-        }
-        pfree(keys);
-    }
-    SPI_cursor_close(scan);
-    SPI_freeplan(selection); SPI_freeplan(apply); SPI_finish();
+    size_t capacity=(size_t)enrichment_fetch_rows();
+    EnrichmentBatch batch={target,idtype,parent,apply,palloc(sizeof(EnrichmentKey)*capacity),0,capacity,range,0};
+    lp_pg_stream(selection,NULL,enrichment_stage_row,&batch);enrichment_flush(&batch);
+    uint64 updated=batch.updated;pfree(batch.keys);
+    SPI_freeplan(selection);SPI_freeplan(apply);SPI_finish();
     table_close(stage, NoLock);
     table_close(parent, NoLock);
     pfree(source); pfree(destination); pfree(select); pfree(update);
@@ -420,11 +453,19 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
  * Route copied IDs through the same Native partition bounds as enrichment;
  * neither scan public paths again nor sweep unrelated destination indexes. */
 PG_FUNCTION_INFO_V1(laplace_clean_stage);
+typedef struct { Oid target;Relation parent;HTAB *touched; } CleanStage;
+static void clean_stage_row(TupleTableSlot *slot,void *context)
+{
+    CleanStage *stage=context;bool missing;Datum id=slot_getattr(slot,1,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace_clean_stage: null Native ID")));
+    Oid partition=enrichment_partition(stage->target,RelationGetPartitionKey(stage->parent),RelationGetPartitionDesc(stage->parent,true),id);
+    hash_search(stage->touched,&partition,HASH_ENTER,NULL);
+}
 Datum laplace_clean_stage(PG_FUNCTION_ARGS)
 {
     Oid input = PG_GETARG_OID(0);
     Relation stage = table_open(input, AccessShareLock);
-    Oid target = get_relname_relid("physicality", get_namespace_oid("public", false));
+    Oid target = lp_pg_relation("physicality");
     Relation parent = table_open(target, AccessShareLock);
     Oid idtype = get_atttype(target, get_attnum(target, "entity"));
     if (RelationGetNamespace(stage) != get_namespace_oid("stage", false)
@@ -447,34 +488,16 @@ Datum laplace_clean_stage(PG_FUNCTION_ARGS)
     HASHCTL control = {.keysize=sizeof(Oid), .entrysize=sizeof(Oid)};
     HTAB *touched = hash_create("Native copied path partitions",
         Max(RelationGetPartitionDesc(parent, true)->nparts, 1), &control, HASH_ELEM | HASH_BLOBS);
-    SPIPlanPtr plan = SPI_prepare_cursor(selection, 0, NULL, CURSOR_OPT_NO_SCROLL);
+    SPIPlanPtr plan = lp_pg_prepare_cursor(selection, 0, NULL, CURSOR_OPT_NO_SCROLL);
     if (!plan) ereport(ERROR, (errmsg("laplace_clean_stage: selection plan failed")));
-    Portal scan = SPI_cursor_open(NULL, plan, NULL, NULL, true);
-    if (!scan) ereport(ERROR, (errmsg("laplace_clean_stage: selection failed")));
-    for (;;) {
-        SPI_cursor_fetch(scan, true, enrichment_fetch_rows());
-        if (!SPI_processed) { SPI_freetuptable(SPI_tuptable); break; }
-        key = RelationGetPartitionKey(parent);
-        PartitionDesc partitions = RelationGetPartitionDesc(parent, true);
-        for (uint64 row = 0; row < SPI_processed; row++) {
-            CHECK_FOR_INTERRUPTS();
-            bool missing;
-            Datum id = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
-            if (missing)
-                ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_clean_stage: null Native ID")));
-            Oid partition = enrichment_partition(target, key, partitions, id);
-            hash_search(touched, &partition, HASH_ENTER, NULL);
-        }
-        SPI_freetuptable(SPI_tuptable);
-    }
-    SPI_cursor_close(scan); SPI_freeplan(plan);
+    CleanStage scan={target,parent,touched};lp_pg_stream(plan,NULL,clean_stage_row,&scan);SPI_freeplan(plan);
     int count = hash_get_num_entries(touched), at = 0;
     Datum *values = palloc(sizeof(Datum) * Max(count, 1));
     HASH_SEQ_STATUS entries; hash_seq_init(&entries, touched); Oid *partition;
     while ((partition = hash_seq_search(&entries))) values[at++] = ObjectIdGetDatum(*partition);
     ArrayType *ids = construct_array(values, count, OIDOID, sizeof(Oid), true, TYPALIGN_INT);
     Oid type = OIDARRAYOID; Datum parameter = PointerGetDatum(ids);
-    if (SPI_execute_with_args("SELECT public.laplace_clean_pending_list(i.indexrelid)"
+    if (lp_pg_execute_args("SELECT @extschema@.laplace_clean_pending_list(i.indexrelid)"
         " FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid"
         " WHERE i.indrelid=ANY($1) AND c.relam=" CppAsString2(GIN_AM_OID)
         " ORDER BY i.indexrelid", 1, &type, &parameter, NULL, false, 0) != SPI_OK_SELECT)

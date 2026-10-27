@@ -1,4 +1,4 @@
-# Exported Native symbol and whether it owns SQL/SPI namespace resolution.
+# Exported Native symbol and whether its C call graph reaches SQL/SPI.
 blake3_cmp	false
 blake3_eq	false
 blake3_ge	false
@@ -26,6 +26,7 @@ laplace_centroid4d_final	false
 laplace_centroid4d_step	false
 laplace_claims	true
 laplace_claims_each	true
+laplace_claim_preview	false
 laplace_clean_stage	true
 laplace_codepoint	false
 laplace_compose	false
@@ -64,7 +65,7 @@ laplace_id	false
 laplace_inside	false
 laplace_is	false
 laplace_isa	false
-laplace_labels	true
+laplace_labels	false
 laplace_mask_consistent	false
 laplace_mask_extract_query	false
 laplace_mask_extract_value	false
@@ -95,7 +96,7 @@ laplace_path4d_gist_same	false
 laplace_path4d_gist_union	false
 laplace_path4d_key_in	false
 laplace_path4d_key_out	false
-laplace_paths	true
+laplace_paths	false
 laplace_point4d_distance	false
 laplace_point4d_gist_compress	false
 laplace_point4d_gist_consistent	false
@@ -105,15 +106,18 @@ laplace_point4d_gist_picksplit	false
 laplace_point4d_gist_same	false
 laplace_point4d_gist_sortsupport	false
 laplace_point4d_gist_union	false
-laplace_present_ids	true
+laplace_present_ids	false
 laplace_present_stage	true
+laplace_restore_function_bindings	true
+laplace_resolve_ref	false
+laplace_resolve_refs	false
 laplace_project_path	false
 laplace_said	false
 laplace_series	false
 laplace_series_snapshot	true
 laplace_stage_compatible	false
-laplace_text	true
-laplace_text_batch	true
+laplace_text	false
+laplace_text_batch	false
 laplace_text_coord_ewkb	false
 laplace_text_hilbert	false
 laplace_text_id	false
