@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
-project(LaplacePostgres VERSION 1.38.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.39.0 LANGUAGES C CXX ASM)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
@@ -33,7 +33,7 @@ foreach(_row IN LISTS _binding_rows)
   endif()
 endforeach()
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_function_bindings.h" CONTENT "${_bindings}")
-add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c src/projection.c src/provenance.c src/enrichment.c src/function_bindings.c)
+add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c src/projection.c src/provenance.c src/enrichment.c src/function_bindings.c src/binding.c)
 target_include_directories(laplace_pg PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 set_target_properties(laplace_pg PROPERTIES OUTPUT_NAME laplace PREFIX "" C_VISIBILITY_PRESET hidden
                                             BUILD_RPATH "${LAPLACE_ICU_DIR}/lib" INSTALL_RPATH "${LAPLACE_ICU_DIR}/lib")
@@ -53,7 +53,27 @@ else()
   target_link_options(laplace_pg PRIVATE -Wl,--exclude-libs,ALL)
 endif()
 
-file(GLOB LAPLACE_EXTENSION_SQL sql/laplace--*.sql)
+# One current object definition, shared by cold install and the actual
+# populated-development transition. Never replay unreleased migration history.
+set(_sql_root "${CMAKE_CURRENT_SOURCE_DIR}/sql")
+set(_sql_output "${CMAKE_CURRENT_BINARY_DIR}/extension")
+file(MAKE_DIRECTORY "${_sql_output}")
+file(READ "${_sql_root}/operations.sql" _operations)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/operations.sql")
+set(LAPLACE_EXTENSION_SQL "")
+foreach(_version "1.39" "1.38--1.39")
+  if(_version STREQUAL "1.39")
+    set(_input "${_sql_root}/laplace.sql.in")
+  else()
+    set(_input "${_sql_root}/laplace--${_version}.sql.in")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_input}")
+  file(READ "${_input}" _sql)
+  string(REPLACE "-- @laplace_operations@" "${_operations}" _sql "${_sql}")
+  set(_output "${_sql_output}/laplace--${_version}.sql")
+  file(WRITE "${_output}" "${_sql}")
+  list(APPEND LAPLACE_EXTENSION_SQL "${_output}")
+endforeach()
 if(WIN32)
   # LoadLibrary does not search PATH: the DLLs laplace.dll loads (ICU's, and libmmd from the compiler) go next to
   # postgres.exe, as PostGIS's do. The list comes from the built module's imports at install time; the system's and

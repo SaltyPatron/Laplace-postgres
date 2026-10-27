@@ -45,6 +45,7 @@ DO $$
 DECLARE deep blake3:=laplace_id('dog'); bang blake3:=laplace_cp_id(ascii('!'));
         lambda blake3:=laplace_cp_id(ascii('λ')); chinese blake3:=laplace_cp_id(ascii('中'));
         repeated blake3; tuple blake3; tuple_run blake3; nested_tuple blake3; package blake3;
+        preview_claim blake3; preview_joint blake3; preview_binary blake3;
         expected text:='dog'||repeat('!',70); actual text[];
 BEGIN
   -- Linear-size content with more than the former 64-level rejection: every
@@ -67,6 +68,49 @@ BEGIN
                                   package::text,'00000000000000000000000000000000',expected] THEN
     RAISE EXCEPTION 'Native labels changed tuple structure, runs or selected identities';
   END IF;
+  preview_claim:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')],'claim');
+  preview_joint:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[4]),'claim');
+  preview_binary:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('noun')],'claim');
+  SELECT array_agg(fact ORDER BY i) INTO actual FROM laplace_claim_preview(ARRAY[
+    preview_claim,preview_joint,preview_binary,
+    preview_claim,package,'00000000000000000000000000000000'::blake3]);
+  IF actual IS DISTINCT FROM ARRAY['noun','dog × 4','noun','noun']
+     OR EXISTS(SELECT FROM laplace_claim_preview(ARRAY[preview_claim])
+       WHERE predicate IS DISTINCT FROM laplace_id('is') OR object IS DISTINCT FROM laplace_id('noun') OR type_label<>'is')
+     OR EXISTS(SELECT FROM laplace_claim_preview(ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'Native preview changed typed claims, n-ary/RLE content, input occurrences or missing paths: %',actual;
+  END IF;
+  SELECT array_agg(label ORDER BY ordinal) INTO actual FROM laplace_resolve_refs(
+    ARRAY[decode(deep::text,'hex'),decode(tuple::text,'hex'),decode(deep::text,'hex'),
+          decode(lambda::text,'hex'),decode('00000000000000000000000000000000','hex')],
+    ARRAY[NULL,NULL,'caller surface',NULL,NULL]);
+  IF actual IS DISTINCT FROM ARRAY[expected,'[dog · λ · 中]','caller surface','λ','00000000000000000000000000000000']
+     OR (SELECT count(*) FROM laplace_resolve_refs(
+          ARRAY[decode(deep::text,'hex'),decode(lambda::text,'hex'),decode('00000000000000000000000000000000','hex')],
+          ARRAY[NULL,NULL,NULL]) WHERE present)<>2 THEN
+    RAISE EXCEPTION 'Native references changed occurrences, surfaces, virtual floor or missing membership';
+  END IF;
+  IF encode(laplace_resolve_ref('dog'),'hex')<>laplace_id('dog')::text
+     OR encode(laplace_resolve_ref(upper(deep::text)),'hex')<>deep::text
+     OR encode(laplace_resolve_ref('λ'),'hex')<>lambda::text
+     OR laplace_resolve_ref('00000000000000000000000000000000') IS NOT NULL
+     OR laplace_resolve_ref('') IS NOT NULL OR laplace_resolve_ref(NULL) IS NOT NULL
+     OR EXISTS(SELECT FROM laplace_resolve_refs(NULL,NULL))
+     OR EXISTS(SELECT FROM laplace_resolve_refs(ARRAY[]::bytea[],ARRAY[]::text[])) THEN
+    RAISE EXCEPTION 'Native scalar/empty reference contract changed';
+  END IF;
+  BEGIN
+    PERFORM laplace_resolve_refs(ARRAY[decode(deep::text,'hex')],ARRAY[]::text[]);
+    RAISE EXCEPTION 'mismatched reference positions accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_resolve_refs(ARRAY[NULL]::bytea[],ARRAY[NULL]::text[]);
+    RAISE EXCEPTION 'NULL reference identity accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_resolve_refs(ARRAY[decode('0011','hex')],ARRAY[NULL]::text[]);
+    RAISE EXCEPTION 'malformed reference identity accepted';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
   BEGIN
     UPDATE physicality SET path=laplace_path(ARRAY[deep,bang]) WHERE entity=deep;
     PERFORM laplace_text_batch(ARRAY[deep]);
@@ -615,8 +659,9 @@ BEGIN
   ) THEN RAISE EXCEPTION 'downward memory windows changed Native testimony'; END IF;
 END $$;
 
--- A large frontier must remain a parameter while a parallel worker plan is
--- serialized. Expanding these IDs into all 256 partition scans exceeds 1 GiB.
+-- A large frontier remains a parameter of bounded indexed Native windows.
+-- Even under forced outer parallel planning, the Native walk owns its
+-- frontier execution and must not start a worker fleet at every hop/window.
 CREATE TEMP TABLE frontier_expected AS
 SELECT * FROM laplace_attribution(ARRAY(SELECT id FROM series_claims ORDER BY name));
 CREATE TEMP TABLE frontier_actual (LIKE frontier_expected);

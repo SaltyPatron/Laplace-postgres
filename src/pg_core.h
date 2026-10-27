@@ -8,16 +8,36 @@
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "executor/spi.h"
+#include "executor/tuptable.h"
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
+#include "laplace/highway.h"
 
 const lp_tier0_record *lp_pg_tier0(void);
 lp_text *lp_pg_text_context(void);
+lp_mask lp_pg_mask_native(Datum mask);
+lp_mask lp_pg_kind_mask(const char *role);
+
+/* Bind the installed extension, never the caller's search_path. PostgreSQL
+ * catalog invalidation refreshes names after schema/extension changes. */
+Oid lp_pg_schema(void);
+Oid lp_pg_relation(const char *name);
+uint64 lp_pg_binding_generation(void);
+char *lp_pg_sql(const char *sql);
+int lp_pg_execute(const char *sql,bool read_only,long count);
+int lp_pg_execute_args(const char *sql,int nargs,Oid *types,Datum *values,const char *nulls,bool read_only,long count);
+SPIPlanPtr lp_pg_prepare_cursor(const char *sql,int nargs,Oid *types,int options);
+typedef void (*lp_pg_row_visit)(TupleTableSlot *slot,void *context);
+void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit,void *context);
 
 /* Complete ID-addressed path frontier. Native range routing and primary
  * indexes retain ascending ID order without sorting geometry in SQL. */
 typedef void (*lp_pg_path_visit)(const lp_id *id,Datum path,Datum mask,void *context);
-void lp_pg_lookup_paths(const lp_id *ids,size_t count,lp_pg_path_visit visit,void *context);
+void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context);
+/* Positive classifications (for example mapped Tier-0 IDs) are retained.
+ * Only false entries are probed; missing stored IDs stay false. */
+void lp_pg_present(const lp_id *ids,size_t count,bool *present);
 
 /* The live parameter buffers and the actual PostgreSQL array boundary size
  * every indexed frontier transfer. This is a window, never an input limit. */

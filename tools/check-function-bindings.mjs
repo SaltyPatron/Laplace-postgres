@@ -21,15 +21,20 @@ function callsOf(node,calls){
   for(const child of node.inner||[])callsOf(child,calls);
 }
 try{
-  for(const command of commands.filter(c=>path.dirname(c.file)===path.join(root,'src'))){
+  for(const command of commands.filter(c=>path.dirname(path.resolve(c.directory,c.file))===path.join(root,'src'))){
     const args=command.arguments||command.command.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g)
       .map(s=>(s[0]==='"'||s[0]==="'")?s.slice(1,-1):s);
     const argv=[];
-    for(let i=1;i<args.length;i++){if(args[i]==='-o'){i++;continue;}if(args[i]!=='-c')argv.push(args[i]);}
-    argv.push('-fsyntax-only','-Xclang','-ast-dump=json');
+    const msvc=process.platform==='win32' && args.some(a=>/^[/\-]Fo/.test(a));
+    for(let i=1;i<args.length;i++){
+      if(args[i]==='-o' || (msvc && /^[/\-]F[od]$/.test(args[i]))){i++;continue;}
+      if(args[i]==='-c' || args[i]==='/c' || (msvc && /^[/\-]F[od]/.test(args[i])))continue;
+      argv.push(args[i]);
+    }
+    argv.push(...(msvc?['/clang:-fsyntax-only','/clang:-Xclang','/clang:-ast-dump=json']:['-fsyntax-only','-Xclang','-ast-dump=json']));
     const output=path.join(scratch,'ast.json'),fd=fs.openSync(output,'w');
     let result;try{result=spawnSync(args[0],argv,{cwd:command.directory,stdio:['ignore',fd,'inherit']});}finally{fs.closeSync(fd);}
-    if(result.status!==0)throw Error(`Compiler call-graph extraction failed for ${command.file}`);
+    if(result.error || result.status!==0)throw Error(`Compiler call-graph extraction failed for ${command.file}: ${result.error || result.status}`);
     const ast=JSON.parse(fs.readFileSync(output,'utf8'));
     for(const node of ast.inner||[])if(node.kind==='FunctionDecl'){
       if(node.name.startsWith('pg_finfo_'))exports.set(node.name.slice(9),command.file);

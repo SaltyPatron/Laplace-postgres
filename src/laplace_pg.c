@@ -156,11 +156,13 @@ Datum laplace_path_ewkb(PG_FUNCTION_ARGS){
 /* PostGIS owns its private serialization. Ask its qualified EWKB exporter once
  * per value, then use Native's validated reader for every geometry family. */
 static bytea *path_ewkb(Datum geometry){
-    static Oid exporter;
-    if (!OidIsValid(exporter)) {
+    static Oid exporter;static uint64 generation;
+    uint64 current=lp_pg_binding_generation();
+    if (!OidIsValid(exporter) || generation!=current) {
         Oid schema = get_extension_schema(get_extension_oid("postgis", false));
         Oid type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("geometry"), ObjectIdGetDatum(schema));
         exporter = LookupFuncName(list_make2(makeString(get_namespace_name(schema)), makeString("st_asewkb")), 1, &type, false);
+        generation=current;
     }
     bytea *ewkb = DatumGetByteaP(OidFunctionCall1(exporter, geometry));
     if (!lp_ewkb_visit((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), NULL, NULL, NULL))
@@ -437,14 +439,18 @@ Datum laplace_confidence(PG_FUNCTION_ARGS){
 /* ---------------------------------------------------------------- set access: statements planned once, run over sets
  * Every read of the web is a statement planned once per backend and kept, run as one executor pass over a set, its
  * rows returned through a tuplestore. */
-typedef struct { const char *name; const char *sql; int nargs; SPIPlanPtr plan; } Kept;
+typedef struct { const char *name; const char *sql; int nargs; SPIPlanPtr plan; uint64 generation; } Kept;
 #define KEPT_ARGS 8
 /* The statement's plan, made the first time it is run, with these argument types. Inside SPI. */
 static SPIPlanPtr kept_plan(Kept *k, const Oid *types){
+    uint64 generation=lp_pg_binding_generation();
+    if(k->plan && k->generation!=generation){SPI_freeplan(k->plan);k->plan=NULL;}
     if (!k->plan) {
-        k->plan = SPI_prepare(k->sql, k->nargs, (Oid *)types);
+        char *bound=lp_pg_sql(k->sql);
+        k->plan = SPI_prepare(bound, k->nargs, (Oid *)types);pfree(bound);
         if (!k->plan) ereport(ERROR, (errmsg("%s: SPI_prepare: %s", k->name, SPI_result_code_string(SPI_result))));
         SPI_keepplan(k->plan);
+        k->generation=generation;
     }
     return k->plan;
 }
@@ -481,18 +487,39 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k){
  * The composition is read one DAG level per statement: every entity a level names that is not an atom and not yet
  * read is fetched in one set, from the trunk down, and the text is then written out of memory in path order. */
 typedef struct { size_t node; uint32 run; } TChild;
-typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque; uint8 text_state; } TNode;
+typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque, claim; uint8 text_state; } TNode;
 static size_t tnode(lp_idmap *t, const lp_id *id){
     bool fresh; size_t i = lp_idmap_put(t, id, &fresh);
     if (fresh) *(TNode *)lp_idmap_at(t,i) = (TNode){ .have=lp_tier0_codepoint(lp_pg_tier0(),id)>=0 };
     return i;
 }
-static Kept level_kept = { "laplace_text", "SELECT entity, st_asewkb(path) FROM physicality WHERE entity = ANY($1)", 1, NULL };
-static Kept label_level_kept = { "laplace_labels",
-    "SELECT entity,st_asewkb(path),laplace_mask_has_value(mask,'kind','tuple'),"
-    "laplace_mask_has_value(mask,'kind','file') OR laplace_mask_has_value(mask,'kind','record') OR laplace_mask_has_value(mask,'kind','claim') "
-    "FROM physicality WHERE entity=ANY($1)",1,NULL };
-static void read_levels(lp_idmap *t, Oid idarr, MemoryContext keep, bool labels){
+static lp_mask mask_native(VarBit *mask);
+static const lp_bank *mask_bank(text *name);
+static int64 mask_slot(const lp_bank *bank,text *value);
+typedef struct { lp_idmap *nodes; const lp_idmap *inspect; MemoryContext keep; bool labels; lp_mask tuple,opaque,claim; size_t found; } TextFrontier;
+static void text_frontier_row(const lp_id *id,Datum path,Datum mask,void *context){
+    TextFrontier *front=context;front->found++;
+    lp_mask carrier=front->labels?mask_native(DatumGetVarBitP(mask)):0;
+    bool tuple=(carrier&front->tuple)!=0,opaque=!tuple && (carrier&front->opaque)!=0;
+    bool claim=(carrier&front->claim)!=0;
+    bool inspect=claim && front->inspect && lp_idmap_find(front->inspect,id)>=0;
+    if(opaque && !inspect){TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;}
+    Geo geometry=geo_of(path);lp_path p=geometry.p;
+    TChild *kid=MemoryContextAlloc(front->keep,sizeof(TChild)*(p.n?p.n:1));
+    for(size_t i=0;i<p.n;i++){lp_id child=lp_path_id(p,i);kid[i]=(TChild){tnode(front->nodes,&child),lp_path_run(p,i)};}
+    TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));
+    me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;me->opaque=opaque;me->claim=claim;
+}
+static void read_levels(lp_idmap *t, MemoryContext keep, bool labels,const lp_idmap *inspect){
+    TextFrontier front={.nodes=t,.inspect=inspect,.keep=keep,.labels=labels};
+    if(labels){
+        const char *roles[]={"tuple","file","record","claim"};
+        for(size_t i=0;i<lengthof(roles);i++){
+            lp_mask value=lp_pg_kind_mask(roles[i]);
+            if(i==0)front.tuple=value;else front.opaque|=value;
+            if(i==3)front.claim=value;
+        }
+    }
     size_t begin=0,end=lp_idmap_count(t),window=frontier_window_ids();
     while(begin<end){
       /* Only newly discovered nodes form the next frontier. Shared descendants
@@ -502,29 +529,13 @@ static void read_levels(lp_idmap *t, Oid idarr, MemoryContext keep, bool labels)
         lp_id *want=palloc((stop-at)*sizeof(lp_id));
         for(;at<stop;at++)if(!((TNode *)lp_idmap_at(t,at))->have)want[nwant++]=*lp_idmap_key(t,at);
         if(!nwant){pfree(want);continue;}
-        ArrayType *ids=id_array_of(get_element_type(idarr),want,(int)nwant);
-        Datum arg = PointerGetDatum(ids);
-        kept_run(labels ? &label_level_kept : &level_kept, &idarr, &arg);
-        if (!labels && SPI_processed != nwant) ereport(ERROR, (errmsg("laplace_text: no physicality for an entity")));
-        for (uint64 j = 0; j < SPI_processed; j++) {
-            bool nl; lp_id id; memcpy(&id, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 1, &nl)), 16);
-            bool tuple=false,opaque=false;
-            if(labels){
-              tuple=DatumGetBool(SPI_getbinval(SPI_tuptable->vals[j],SPI_tuptable->tupdesc,3,&nl));
-              opaque=!tuple && DatumGetBool(SPI_getbinval(SPI_tuptable->vals[j],SPI_tuptable->tupdesc,4,&nl));
-            }
-            if(opaque){TNode *me=lp_idmap_at(t,tnode(t,&id));me->have=true;me->opaque=true;continue;}
-            bytea *e = DatumGetByteaP(SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, 2, &nl));
-            lp_path p = lp_path_of((const uint8_t *)VARDATA_ANY(e), VARSIZE_ANY_EXHDR(e));
-            TChild *kid=MemoryContextAlloc(keep,sizeof(TChild)*(p.n ? p.n : 1));
-            for(size_t i=0;i<p.n;i++){lp_id cid=lp_path_id(p,i);kid[i]=(TChild){tnode(t,&cid),lp_path_run(p,i)};}
-            TNode *me=lp_idmap_at(t,tnode(t,&id));me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;
-        }
+        front.found=0;lp_pg_lookup_paths(want,nwant,labels,text_frontier_row,&front);
+        if(!labels && front.found!=nwant)ereport(ERROR,(errmsg("laplace_text: no physicality for an entity")));
         if(labels)for(size_t i=0;i<nwant;i++){
           TNode *me=lp_idmap_at(t,(size_t)lp_idmap_find(t,want+i));
           if(!me->have){me->have=true;me->opaque=true;}
         }
-        SPI_freetuptable(SPI_tuptable);pfree(ids);pfree(want);
+        pfree(want);
       }
       begin=end;end=lp_idmap_count(t);
     }
@@ -566,9 +577,8 @@ Datum laplace_text(PG_FUNCTION_ARGS){
     StringInfoData out; initStringInfo(&out); MemoryContext keep = CurrentMemoryContext;
     lp_idmap *t = lp_idmap_sized(sizeof(TNode)); size_t root = tnode(t, (const lp_id *)PG_GETARG_POINTER(0));
     PG_TRY();{
-      if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_text: SPI")));
-      read_levels(t, get_array_type(get_fn_expr_argtype(fcinfo->flinfo, 0)), keep,false);
-      SPI_finish();render(t,root,&out);
+      read_levels(t,keep,false,NULL);
+      render(t,root,&out);
     }PG_FINALLY();{lp_idmap_free(t);}PG_END_TRY();
     PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
@@ -579,9 +589,7 @@ static Datum realize_batch(FunctionCallInfo fcinfo,bool labels){
     lp_idmap *t=lp_idmap_sized(sizeof(TNode));size_t *roots=palloc(Max(n,1)*sizeof(size_t));
     PG_TRY();{
       for(int i=0;i<n;i++)roots[i]=tnode(t,ids+i);
-      if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_text_batch: SPI")));
-      read_levels(t,get_fn_expr_argtype(fcinfo->flinfo,0),keep,labels);
-      SPI_finish();
+      read_levels(t,keep,labels,NULL);
       for(int i=0;i<n;i++){
         StringInfoData out;initStringInfo(&out);
         if(labels)render_label(t,roots[i],&out);else render(t,roots[i],&out);
@@ -598,6 +606,99 @@ Datum laplace_text_batch(PG_FUNCTION_ARGS){return realize_batch(fcinfo,false);}
 PG_FUNCTION_INFO_V1(laplace_labels);
 Datum laplace_labels(PG_FUNCTION_ARGS){return realize_batch(fcinfo,true);}
 
+/* Reference preparation is one Native operation: preserve client ID/surface
+ * positions, probe the complete identity set, then materialize only missing
+ * labels for present identities. Text is never used to elect another entity. */
+PG_FUNCTION_INFO_V1(laplace_resolve_refs);
+Datum laplace_resolve_refs(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_resolve_refs",&descriptor);
+    if(PG_ARGISNULL(0) && PG_ARGISNULL(1))PG_RETURN_NULL();
+    if(PG_ARGISNULL(0) || PG_ARGISNULL(1))
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("reference identities and surfaces must retain the same non-NULL ID positions")));
+    ArrayType *identities=PG_GETARG_ARRAYTYPE_P(0),*labels=PG_GETARG_ARRAYTYPE_P(1);
+    Datum *values,*surfaces;bool *missing,*unlabeled;int count,nlabels;
+    deconstruct_array(identities,BYTEAOID,-1,false,TYPALIGN_INT,&values,&missing,&count);
+    deconstruct_array(labels,TEXTOID,-1,false,TYPALIGN_INT,&surfaces,&unlabeled,&nlabels);
+    if(count!=nlabels || ARR_NDIM(identities)>1 || ARR_NDIM(labels)>1)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("reference identities and surfaces must retain the same non-NULL ID positions")));
+    lp_id *ids=palloc(sizeof(*ids)*Max(count,1));bool *present=palloc0(sizeof(*present)*Max(count,1));
+    for(int i=0;i<count;i++){
+        if(missing[i])ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("reference identities and surfaces must retain the same non-NULL ID positions")));
+        bytea *value=DatumGetByteaPP(values[i]);
+        if(VARSIZE_ANY_EXHDR(value)!=sizeof(lp_id))ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native reference ID must contain exactly 16 bytes")));
+        memcpy(ids[i].b,VARDATA_ANY(value),sizeof(lp_id));
+        present[i]=lp_tier0_codepoint(lp_pg_tier0(),ids+i)>=0;
+    }
+    lp_pg_present(ids,(size_t)count,present);
+    lp_idmap *tree=lp_idmap_sized(sizeof(TNode));MemoryContext keep=CurrentMemoryContext;
+    PG_TRY();{
+        for(int i=0;i<count;i++){
+            if(present[i] && unlabeled[i])tnode(tree,ids+i);
+        }
+        read_levels(tree,keep,true,NULL);
+        for(int i=0;i<count;i++){
+            Datum label=surfaces[i];StringInfoData text;bool rendered=false;
+            if(unlabeled[i]){
+                initStringInfo(&text);rendered=true;
+                if(present[i])render_label(tree,(size_t)lp_idmap_find(tree,ids+i),&text);
+                else{char hex[33];lp_id_hex(ids+i,hex);appendStringInfoString(&text,hex);}
+                label=PointerGetDatum(cstring_to_text_with_len(text.data,text.len));
+            }
+            Datum output[]={Int64GetDatum((int64)i+1),values[i],label,BoolGetDatum(present[i])};bool nulls[]={false,false,false,false};
+            set_put(fcinfo,rows,descriptor,output,nulls);
+            if(rendered){pfree(DatumGetPointer(label));pfree(text.data);}
+        }
+    }PG_FINALLY();{lp_idmap_free(tree);}PG_END_TRY();
+    pfree(ids);pfree(present);pfree(values);pfree(surfaces);pfree(missing);pfree(unlabeled);PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_resolve_ref);
+Datum laplace_resolve_ref(PG_FUNCTION_ARGS){
+    text *input=PG_GETARG_TEXT_PP(0);lp_id id;bool present=false;
+    if(VARSIZE_ANY_EXHDR(input)==32){char hex[33];memcpy(hex,VARDATA_ANY(input),32);hex[32]=0;
+        if(!lp_id_unhex(hex,&id))id=trunk_of(input,NULL,0,NULL).id;
+    }else{if(!VARSIZE_ANY_EXHDR(input))PG_RETURN_NULL();id=trunk_of(input,NULL,0,NULL).id;}
+    present=lp_tier0_codepoint(lp_pg_tier0(),&id)>=0;
+    lp_pg_present(&id,1,&present);
+    if(!present)PG_RETURN_NULL();
+    PG_RETURN_BYTEA_P(bytes_datum(id.b,sizeof id));
+}
+
+/* Selected claims use the same path frontier and display reader as labels.
+ * Only elected claim roots are opened; structural descendants retain their
+ * existing label policy. Runs remain compressed throughout inspection. */
+PG_FUNCTION_INFO_V1(laplace_claim_preview);
+Datum laplace_claim_preview(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_claim_preview",&descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    lp_idmap *tree=lp_idmap_sized(sizeof(TNode)),*selected=lp_idmap_new();
+    PG_TRY();{
+        for(int i=0;i<count;i++){tnode(tree,ids+i);lp_idmap_put(selected,ids+i,NULL);}
+        read_levels(tree,CurrentMemoryContext,true,selected);
+        for(int i=0;i<count;i++){
+            CHECK_FOR_INTERRUPTS();TNode *node=lp_idmap_at(tree,(size_t)lp_idmap_find(tree,ids+i));
+            if(!node->claim || !node->nkid)continue;
+            uint64 arity=0;for(size_t k=0;k<node->nkid;k++)arity+=node->kid[k].run;
+            size_t last=node->kid[node->nkid-1].node;
+            size_t predicate=arity==3?node->kid[node->kid[0].run>=2?0:1].node:SIZE_MAX;
+            StringInfoData type,fact;initStringInfo(&type);initStringInfo(&fact);
+            if(predicate!=SIZE_MAX)render_label(tree,predicate,&type);
+            if(arity<=3)render_label(tree,last,&fact);
+            else for(size_t k=0;k<node->nkid;k++){
+                if(k)appendStringInfoString(&fact," · ");
+                render_label(tree,node->kid[k].node,&fact);
+                if(node->kid[k].run>1)appendStringInfo(&fact," × %u",node->kid[k].run);
+            }
+            text *type_text=cstring_to_text_with_len(type.data,type.len),*fact_text=cstring_to_text_with_len(fact.data,fact.len);
+            Datum values[]={Int64GetDatum((int64)i+1),PointerGetDatum(ids+i),
+                predicate==SIZE_MAX?(Datum)0:PointerGetDatum(lp_idmap_key(tree,predicate)),
+                PointerGetDatum(arity<=3?lp_idmap_key(tree,last):ids+i),PointerGetDatum(type_text),PointerGetDatum(fact_text)};
+            bool nulls[]={false,false,predicate==SIZE_MAX,false,false,false};set_put(fcinfo,rows,descriptor,values,nulls);
+            pfree(type_text);pfree(fact_text);pfree(type.data);pfree(fact.data);
+        }
+    }PG_FINALLY();{lp_idmap_free(tree);lp_idmap_free(selected);}PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
+}
+
 /* ---------------------------------------------------------------- the web: what tugs back when a strand is pulled
  * A claim is content like any other, hashed over its parts. A tier is a floor: what holds an entity sits above it, at
  * whatever tier its own recipe composed it, so the claims that hold an entity are found by the ID they hold, among the
@@ -607,10 +708,10 @@ Datum laplace_labels(PG_FUNCTION_ARGS){return realize_batch(fcinfo,true);}
  * between two installs of the same content). A claim sits above its highest part, at no fixed distance: every tier above is read, by
  * the IDs held. */
 static Kept claims_kept = { "laplace_claims",
-    "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > (SELECT max(COALESCE(e.tier,CASE WHEN laplace_codepoint(u.id) IS NOT NULL THEN 0 END)) "
-    "FROM unnest($1) u(id) LEFT JOIN entity e ON e.id=u.id) "
-    "AND p.path @> $1 AND p.mask ?& $3 AND NOT laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL };
+    "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity "
+    "WHERE p.tier > (SELECT max(COALESCE(e.tier,CASE WHEN @extschema@.laplace_codepoint(u.id) IS NOT NULL THEN 0 END)) "
+    "FROM pg_catalog.unnest($1) u(id) LEFT JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id) "
+    "AND p.path OPERATOR(@extschema@.@>) $1 AND p.mask OPERATOR(@extschema@.?&) $3 AND NOT @extschema@.laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL, 0 };
 SET_FN(laplace_claims, claims_kept)
 /* laplace_claims_each(ids, fan, bits, refuse): for each of a set of entities, the claims holding it, none refused: one
  * call for a whole level of a walk. At most fan an entity, whichever the scan meets first: a caller asks for one more
@@ -619,21 +720,21 @@ SET_FN(laplace_claims, claims_kept)
  * claim), so the path alone is the index condition and the bits are a check on the rows found: the kind bit's posting
  * list is every claim. */
 static Kept each_kept = { "laplace_claims_each",
-    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM unnest($1) WITH ORDINALITY AS u(id, i) LEFT JOIN entity e ON e.id = u.id "
-    "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM physicality p JOIN consensus s ON s.claim = p.entity "
-    "WHERE p.tier > COALESCE(e.tier,CASE WHEN laplace_codepoint(u.id) IS NOT NULL THEN 0 END) "
-    "AND p.path @> ARRAY[u.id] AND laplace_mask_has_all(p.mask, $3) AND NOT laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL };
+    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) LEFT JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
+    "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity "
+    "WHERE p.tier > COALESCE(e.tier,CASE WHEN @extschema@.laplace_codepoint(u.id) IS NOT NULL THEN 0 END) "
+    "AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] AND @extschema@.laplace_mask_has_all(p.mask, $3) AND NOT @extschema@.laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL, 0 };
 SET_FN(laplace_claims_each, each_kept)
 /* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
  * direct constituents, so what holds the parts sits above the highest of them, at no fixed distance: every tier above
  * is read, by the IDs held. */
 static Kept containers_kept = { "laplace_containers",
-    "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 AND p.mask ?& $2", 2, NULL };
+    "SELECT p.entity, p.path, p.tier, p.mask FROM @extschema@.physicality p "
+    "WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1 AND p.mask OPERATOR(@extschema@.?&) $2", 2, NULL, 0 };
 /* With no bits asked for, the mask takes no part: "any of no bits" would send the index over every row. */
 static Kept containers_any_kept = { "laplace_containers",
-    "SELECT p.entity, p.path, p.tier, p.mask FROM physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1", 1, NULL };
+    "SELECT p.entity, p.path, p.tier, p.mask FROM @extschema@.physicality p "
+    "WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1", 1, NULL, 0 };
 PG_FUNCTION_INFO_V1(laplace_containers);
 Datum laplace_containers(PG_FUNCTION_ARGS){
     ArrayType *bits = PG_GETARG_ARRAYTYPE_P(1);
@@ -642,12 +743,26 @@ Datum laplace_containers(PG_FUNCTION_ARGS){
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by
  * the next vertex of that path: what fills the gap after it. */
 static Kept fills_kept = { "laplace_fills",
-    "SELECT p.entity, t.id, t.times, p.tier FROM physicality p, laplace_path_times(p.path, $1) t "
-    "WHERE p.tier > (SELECT min(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path && $1", 1, NULL };
+    "SELECT p.entity, t.id, t.times, p.tier FROM @extschema@.physicality p, @extschema@.laplace_path_times(p.path, $1) t "
+    "WHERE p.tier > (SELECT min(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.&&) $1", 1, NULL, 0 };
 SET_FN(laplace_fills, fills_kept)
 /* laplace_paths(ids): the paths of a set of entities: one DAG level per call. */
-static Kept paths_kept = { "laplace_paths", "SELECT entity, path FROM physicality WHERE entity = ANY($1)", 1, NULL };
-SET_FN(laplace_paths, paths_kept)
+typedef struct { FunctionCallInfo call; Tuplestorestate *rows; TupleDesc descriptor; } PathOutput;
+static void path_output_row(const lp_id *id,Datum path,Datum mask,void *context){
+    PathOutput *output=context;Datum values[]={id_datum(id),path};bool nulls[]={false,false};
+    set_put(output->call,output->rows,output->descriptor,values,nulls);
+}
+PG_FUNCTION_INFO_V1(laplace_paths);
+Datum laplace_paths(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_paths",&descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);lp_idmap *unique=lp_idmap_new();
+    PG_TRY();{
+        for(int i=0;i<count;i++)lp_idmap_put(unique,ids+i,NULL);
+        PathOutput output={fcinfo,rows,descriptor};
+        lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),false,path_output_row,&output);
+    }PG_FINALLY();{lp_idmap_free(unique);}PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
+}
 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
@@ -659,9 +774,9 @@ SET_FN(laplace_paths, paths_kept)
  * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
  * trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "SELECT p.path, p.tier FROM physicality p WHERE p.tier > (SELECT max(e.tier) FROM entity e WHERE e.id = ANY($1)) AND p.path @> $1 "
-    "AND NOT laplace_mask_has(p.mask, 0::smallint) LIMIT $2", 2, NULL };
-static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i, e.tier FROM unnest($1) WITH ORDINALITY u(id, i) JOIN entity e ON e.id = u.id", 1, NULL };
+    "SELECT p.path, p.tier FROM @extschema@.physicality p WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1 "
+    "AND NOT @extschema@.laplace_mask_has(p.mask, 0::smallint) LIMIT $2", 2, NULL, 0 };
+static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i, e.tier FROM pg_catalog.unnest($1) WITH ORDINALITY u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id", 1, NULL, 0 };
 /* A segment's observations: each path as it lies, and its tier. */
 typedef struct { Datum path; int16 tier; } Held;
 typedef lp_vec(Held) Helds;
@@ -1004,6 +1119,13 @@ static int64 mask_slot(const lp_bank *bank, text *value){
     return lp_highway_slot(highway(), bank->list, &ref.id);
 }
 
+lp_mask lp_pg_mask_native(Datum value){return mask_native(DatumGetVarBitP(value));}
+lp_mask lp_pg_kind_mask(const char *role){
+    const lp_bank *kind=mask_bank(cstring_to_text("kind"));
+    int64 slot=mask_slot(kind,cstring_to_text(role));lp_mask mask=0;
+    if(slot>=0)lp_mask_put(&mask,kind,(uint32)slot);return mask;
+}
+
 /* Frozen names are execution bindings, not per-row text to decompose. Keep
  * one binding per expression and compare the actual arguments so prepared
  * executions and row-varying names cannot reuse another argument's slot. */
@@ -1161,7 +1283,7 @@ typedef struct { double x[4]; bool has; } Coord4;
 static void coords_spi(Oid idarr, lp_idmap *at){
     size_t n = lp_idmap_count(at); if (!n) return;
     Datum a[1] = { PointerGetDatum(id_array_of(get_element_type(idarr), lp_idmap_keys(at), (int)n)) }; Oid t[1] = { idarr };
-    if (SPI_execute_with_args("SELECT e.id, e.coord FROM entity e WHERE e.id = ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: coordinates")));
+    if (lp_pg_execute_args("SELECT e.id, e.coord FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: coordinates")));
     for (uint64 r = 0; r < SPI_processed; r++) {
         bool nl; Datum g = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl); if (nl) continue;
         Coord4 *c = lp_idmap_lookup(at, (const lp_id *)DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)));
@@ -1197,9 +1319,9 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
     Datum fanp1 = Int64GetDatum(fan + 1), fand = Int64GetDatum(fan);
     /* strands: every claim holding an occurrence, refusals out before the fan; the strand answers with its other end */
     { Datum a[3] = { PointerGetDatum(occa), fanp1, PG_GETARG_DATUM(2) }; Oid t[3] = { idarr, INT8OID, idarr };
-      if (SPI_execute_with_args("SELECT u.i, c.path, c.rating, c.deviation, c.volatility FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
-            "CROSS JOIN LATERAL (SELECT p.path, s.rating, s.deviation, s.volatility FROM physicality p JOIN consensus s ON s.claim = p.entity WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] "
-            "AND p.mask ? 0::smallint AND NOT laplace_middle_any(p.path, $3) LIMIT $2) c", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
+      if (lp_pg_execute_args("SELECT u.i, c.path, c.rating, c.deviation, c.volatility FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
+            "CROSS JOIN LATERAL (SELECT p.path, s.rating, s.deviation, s.volatility FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity WHERE p.tier > e.tier AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] "
+            "AND p.mask OPERATOR(@extschema@.?) 0::smallint AND NOT @extschema@.laplace_middle_any(p.path, $3) LIMIT $2) c", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
       int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: what the scan met first is not its strands */
       for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
       for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
@@ -1211,8 +1333,8 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
     /* containment: what holds each occurrence, the paths kept as the shape's GIN nominations */
     lp_idmap *seen = lp_idmap_new(); Curves cv = { 0 };
     { Datum a[2] = { PointerGetDatum(occa), fanp1 }; Oid t[2] = { idarr, INT8OID };
-      if (SPI_execute_with_args("SELECT u.i, c.entity, c.tier, c.path FROM unnest($1) WITH ORDINALITY AS u(id, i) JOIN entity e ON e.id = u.id "
-            "CROSS JOIN LATERAL (SELECT p.entity, p.tier, p.path FROM physicality p WHERE p.tier > e.tier AND p.path @> ARRAY[u.id] AND NOT (p.mask ? 0::smallint) LIMIT $2) c", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: containment")));
+      if (lp_pg_execute_args("SELECT u.i, c.entity, c.tier, c.path FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
+            "CROSS JOIN LATERAL (SELECT p.entity, p.tier, p.path FROM @extschema@.physicality p WHERE p.tier > e.tier AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] AND NOT (p.mask OPERATOR(@extschema@.?) 0::smallint) LIMIT $2) c", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: containment")));
       int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: reached, never crossed */
       for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
       for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
@@ -1231,7 +1353,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
             uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt);
             Datum a[2] = { PointerGetDatum(bytes_datum(pt, pl)), fand }; Oid t[2] = { BYTEAOID, INT8OID };
-            if (SPI_execute_with_args("SELECT e.id, p.path FROM (SELECT e.id FROM entity e WHERE e.tier >= 3 ORDER BY e.coord <~> ST_GeomFromEWKB($1) LIMIT $2) e JOIN physicality p ON p.entity = e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
+            if (lp_pg_execute_args("SELECT e.id, p.path FROM (SELECT e.id FROM @extschema@.entity e WHERE e.tier >= 3 ORDER BY e.coord OPERATOR(@extschema@.<~>) @postgis@.ST_GeomFromEWKB($1) LIMIT $2) e JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
             for (uint64 r = 0; r < SPI_processed; r++) { bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
                 nominate(&cv, seen, &id, SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl)); }
             /* every child's real coordinate, once; each curve realized and measured */

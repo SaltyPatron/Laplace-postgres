@@ -41,13 +41,13 @@ mv "$stage/control" "$share/extension/laplace.control"
 "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
 created=1
 connection=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$db/")
-"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v routing_cases="$source_root/tests/sql/stage_routing.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" -v gin_cases="$source_root/tests/sql/gin_path.sql" -v geometry_suite="$source_root/tests/sql/geometry.sql" -v frontier_cases="$source_root/tests/sql/frontier_runtime.sql" <<'SQL'
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v schema_cases="$source_root/tests/sql/schema.sql" -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v routing_cases="$source_root/tests/sql/stage_routing.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" -v gin_cases="$source_root/tests/sql/gin_path.sql" -v geometry_suite="$source_root/tests/sql/geometry.sql" -v frontier_cases="$source_root/tests/sql/frontier_runtime.sql" <<'SQL'
 SELECT set_config('extension_control_path', :'candidate_share' || ':$system', false);
 CREATE EXTENSION postgis;
--- Exercise the upgrade from the prior delivered version. gist4d.sql also
--- performs a cold install of the default version in its isolated transaction.
-CREATE EXTENSION laplace VERSION '1.30';
-ALTER EXTENSION laplace UPDATE;
+-- Install the current schema directly; unreleased development history is not
+-- a supported installation path. gist4d.sql also checks a shared namespace.
+CREATE EXTENSION laplace;
+\i :schema_cases
 SELECT extname, extversion FROM pg_extension WHERE extname='laplace';
 SELECT laplace_isa();
 CREATE TEMP TABLE candidate_module_check AS

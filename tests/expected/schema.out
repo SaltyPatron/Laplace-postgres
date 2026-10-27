@@ -1,0 +1,2 @@
+\set ECHO none
+schema: current install, independent PostGIS and Native namespaces, shadow tables and indexed reads passed

@@ -2,8 +2,8 @@
 \pset format unaligned
 \pset tuples_only on
 DO $$ BEGIN
-  -- Recover the old per-row scope, including a frozen-bank primitive and an
-  -- already parsed SQL adapter, without losing the SPI reader's protection.
+  -- Remove per-call scope from both a frozen-bank primitive and an already
+  -- parsed SQL adapter. Native SPI readers bind installed objects explicitly.
   ALTER FUNCTION public.laplace_mask_has_value(bit,text,text) SET search_path=public,pg_temp;
   ALTER FUNCTION public.laplace_coord(text) SET search_path=public,pg_temp;
   PERFORM public.laplace_restore_function_bindings();
@@ -13,7 +13,7 @@ DO $$ BEGIN
     JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
     JOIN public.laplace_function_bindings() c ON c.symbol=p.prosrc
     WHERE e.extname='laplace' AND d.deptype='e'
-      AND (coalesce(p.proconfig @> ARRAY['search_path=public, pg_temp'],false) IS DISTINCT FROM c.sql_scope)
+      AND EXISTS(SELECT FROM unnest(p.proconfig) setting WHERE setting LIKE 'search_path=%')
   ) THEN RAISE EXCEPTION 'Native function binding contract was not restored'; END IF;
   IF EXISTS (
     SELECT FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang

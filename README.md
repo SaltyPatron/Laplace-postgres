@@ -20,6 +20,20 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 ## The schema
 
+The installation source is `sql/laplace.sql.in`: one current baseline.
+`sql/operations.sql` defines the publication and maintenance operations once;
+CMake includes it in both the baseline and the in-place 1.38-to-1.39 development
+transition. The two installable scripts are generated under the build's
+`extension/` directory. Cold installs do not replay earlier development revisions.
+
+`CREATE EXTENSION laplace SCHEMA chosen_schema` binds the native substrate to
+that namespace; PostGIS may be installed in a different namespace. The C binding
+owner resolves both installed extension namespaces and invalidates cached names
+and plans after catalog changes. Ordinary functions do not set `search_path`.
+Parsed SQL adapters bind references at definition time. A dedicated database
+may use `public`; installation alongside unrelated tables uses a chosen schema.
+Functional API schemas remain separate from the storage namespace.
+
 `CREATE EXTENSION laplace` makes the four tables (`entity`, `physicality`, `witness`, `consensus`), their partitions, their indexes and the lookups, as PostGIS makes `spatial_ref_sys`; their data goes with a dump. `physicality.mask` holds what a row is and the types it holds, indexed with the path's constituents in one GIN (`laplace_path_ops`, `laplace_mask_ops`). The highway (`laplace.highway`) gives a type's slot, bit and mappings in place. `laplace_schema_indexes()` makes every index again if one was dropped.
 
 Provenance is containment (`LP_SAID_RECORD`, `LP_SAID_CLAIM` vertices under each file's trunk in `physicality`), walked natively in C by `laplace_attested(claims blake3[], scope blake3[] DEFAULT '{}')` and aggregated into Glicko-2 Fisher-information basis-point shares (`share_bp` summing to `10000`) by `laplace_attribution(claims blake3[], scope blake3[] DEFAULT '{}')`.
@@ -37,6 +51,13 @@ the server's stack/resource checks still apply.
 ordered tuples with their runs. It retains canonical IDs for other structural
 roles or missing realizations, and does not reconstruct a package body to label
 the package. Labels remain output; they are never lookup or traversal keys.
+
+`laplace_claim_preview` opens a selected claim set through that same reader and
+batch-realizes its constituents once. Ternary predicates and binary/ternary
+objects retain their IDs; n-ary claims retain their own object identity and
+complete ordered, counted preview. It preserves duplicate request ordinals,
+omits missing/non-claim roots, and does not expand RLE runs into occurrence
+arrays. Host relation metadata remains a projection over the returned IDs.
 
 Containment provenance prepares a DAG's adjacency and topological order once
 for all requested witness roots. Root-local path counts use that shared plan
@@ -104,15 +125,46 @@ the recorded content. Clients without classifications use an ID-only write plan
 through the same verifier and publication statements. That lower-level import
 interface does not replace the ingest spine's client-side novelty descent.
 
+## Shared database interfaces
+
+The lower layers are inventoried in [Native's interface map](../Laplace-Native/README.md#shared-interfaces-from-codepoints-upward).
+This extension adds PostgreSQL access and result adapters above those kernels.
+
+| Boundary | Owner | Shared inputs and variation |
+| --- | --- | --- |
+| Installed object binding | `src/binding.c`: `lp_pg_schema/relation/sql` | Catalog-derived namespace; SQL templates use `@extschema@` / `@postgis@` |
+| Indexed identity sets | `src/enrichment.c`: `indexed_keys`, `lp_pg_present` | Complete ID set, canonical relation, original ordinals, result callback |
+| Downward path frontier | `lp_pg_lookup_paths` | Complete ID set, whether masks are needed, path callback and context |
+| Executor result stream | `lp_pg_stream` | Prepared SELECT, typed parameters, row callback and context |
+| Realization | `read_levels`, `realize_batch` | Shared discovered-ID map; exact text or display-label policy |
+| Provenance and series | `src/provenance.c` | Shared containment edges, runs and rooted reduction; explicit claims, roots and witness scope |
+| SQL API adapters | Parsed `BEGIN ATOMIC` bodies | Typed arguments and output projection; Native owns repeated computation |
+
+Callbacks borrow a tuple/path for that invocation. Their row memory is reset
+after consumption; retained state must be copied into the operation's context.
+Native maps and buffers use the host allocator. Indexed path access checks the
+parent relation's requested columns and rejects active RLS rather than bypassing
+it. Missing IDs are omitted from path/presence set results; original ordinals
+preserve duplicate requests. Exact text requires every path, while labels may
+retain the canonical ID when a realization is unavailable. Transfer windows
+bound working memory and do not cap admitted input or DAG depth.
+
+Use typed data, a callback and its context where mechanics are shared. Keep
+storage authorization, missing-value policy and domain meaning explicit; a
+single mode flag must not silently exchange those contracts. SIMD selection
+belongs to Native kernels rather than SQL wrappers or schema-specific copies.
+
 ## CI installation boundary
 
 Native owns function binding contracts in `manifest/function_bindings.tsv`.
 The compiler call-graph check verifies that registry against all exported C
 entry points. `laplace_restore_function_bindings()` restores it on existing
-installations: ROM/geometry/index intrinsics run directly, SQL/SPI entry points
-retain their namespace scope, and thin SQL adapters use parsed `BEGIN ATOMIC`
-bodies whose references bind at definition time. Consumers call this owner
-instead of assigning settings to every extension function.
+installations by removing per-function search-path settings from ordinary
+functions. ROM/geometry/index intrinsics run directly, SQL/SPI entry points
+bind installed objects explicitly, and thin SQL adapters use parsed
+`BEGIN ATOMIC` bodies. Consumers call this owner instead of assigning settings
+to every extension function. The registry records whether a C entry point uses
+SPI; that classification does not grant authority or require a GUC scope.
 
 Frozen bank and value names bind once per expression; varying arguments are
 checked before reusing that binding. Existing-carrier updates always use the
