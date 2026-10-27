@@ -188,3 +188,11 @@ returned `(container,gap,subject,object,occurrences)` with PostgreSQL spillable
 operators. `laplace_separator_ids()` reads Unicode Zs/Zl/Zp/Cc and CRLF from the
 mapped floor, independent of corpus admission. Passing NULL separators disables
 filtering. No API changes caller planner or search-path settings.
+
+The same CMake target can be embedded after an existing Laplace-Native target.
+Set `LAPLACE_PG_CONFIG` to the target server and `LAPLACE_PG_INSTALL_LIBDIR`,
+`LAPLACE_PG_INSTALL_SHAREDIR`, `LAPLACE_PG_INSTALL_BINDIR` to the product package
+destinations. `LAPLACE_PG_MODULE_PATHNAME` selects its installed module binding;
+the default remains `$libdir/laplace`. The monorepo builds and installs this
+canonical target with its consumers, including the generated baseline and
+upgrade scripts. It does not depend on a separately installed extension version.
