@@ -638,9 +638,11 @@ DO $$ BEGIN
   IF EXISTS ((TABLE cursor_actual EXCEPT ALL TABLE cursor_expected)
              UNION ALL (TABLE cursor_expected EXCEPT ALL TABLE cursor_actual)) THEN
     RAISE EXCEPTION 'transfer windows changed registered witness attribution'
-      USING DETAIL = format('expected=%s actual=%s',
+      USING DETAIL = format('expected=%s actual=%s indexed_files=%s selected_records=%s',
         (SELECT json_agg(r ORDER BY trunk) FROM cursor_expected r),
-        (SELECT json_agg(r ORDER BY trunk) FROM cursor_actual r));
+        (SELECT json_agg(r ORDER BY trunk) FROM cursor_actual r),
+        (SELECT count(*) FROM public.physicality WHERE path && ARRAY(SELECT id FROM cursor_records)),
+        (SELECT count(*) FROM cursor_records));
   END IF;
 END $$;
 -- The downward frontier exceeds a 64kB parameter window and result fetch.
