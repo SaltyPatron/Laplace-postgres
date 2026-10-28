@@ -630,8 +630,10 @@ BEGIN
   INSERT INTO cursor_root SELECT pg_temp.series_node(ARRAY(SELECT id FROM cursor_records ORDER BY id),'tuple');
 END $$;
 SET LOCAL work_mem='64kB';
+SET LOCAL client_min_messages=debug1;
 CREATE TEMP TABLE cursor_actual AS
 SELECT * FROM laplace_attribution(ARRAY[(SELECT id FROM series_claims WHERE name='a')]);
+SET LOCAL client_min_messages=warning;
 DO $$ BEGIN
   IF EXISTS ((TABLE cursor_actual EXCEPT ALL TABLE cursor_expected)
              UNION ALL (TABLE cursor_expected EXCEPT ALL TABLE cursor_actual)) THEN

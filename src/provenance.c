@@ -373,6 +373,8 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
         lp_idmap *seen = lp_idmap_new();
         PgUpward walk={&d,front,next,seen,classes,&vx,lvl};
         lp_pg_lookup_containers(lp_idmap_keys(front),count,false,pg_upward_path,&walk);
+        elog(DEBUG1,"Native containment: level %d; selected %zu; next %zu; nodes %zu; edges %zu",
+             lvl,count,lp_idmap_count(next),d.n.n,d.e.n);
         lp_idmap_free(seen);
         lp_idmap_free(front);
         front = next;
