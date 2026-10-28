@@ -635,7 +635,10 @@ SELECT * FROM laplace_attribution(ARRAY[(SELECT id FROM series_claims WHERE name
 DO $$ BEGIN
   IF EXISTS ((TABLE cursor_actual EXCEPT ALL TABLE cursor_expected)
              UNION ALL (TABLE cursor_expected EXCEPT ALL TABLE cursor_actual)) THEN
-    RAISE EXCEPTION 'cursor chunks changed registered witness attribution';
+    RAISE EXCEPTION 'transfer windows changed registered witness attribution'
+      USING DETAIL = format('expected=%s actual=%s',
+        (SELECT json_agg(r ORDER BY trunk) FROM cursor_expected r),
+        (SELECT json_agg(r ORDER BY trunk) FROM cursor_actual r));
   END IF;
 END $$;
 -- The downward frontier exceeds a 64kB parameter window and result fetch.
