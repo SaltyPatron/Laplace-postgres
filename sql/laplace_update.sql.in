@@ -1,6 +1,8 @@
 -- In-place transition for populated development databases; no retained-data DDL.
 \echo Use "ALTER EXTENSION laplace UPDATE" to load this file. \quit
 
+-- @laplace_path_set_match@
+
 -- @laplace_operations@
 
 SELECT @extschema@.laplace_restore_function_bindings();

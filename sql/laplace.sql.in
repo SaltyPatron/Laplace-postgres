@@ -876,6 +876,8 @@ CREATE OPERATOR CLASS @extschema@.laplace_path_ops
     FUNCTION 2 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_extract_value(@extschema:postgis@.geometry,internal,internal) ,
     FUNCTION 3 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_extract_query(@extschema@.blake3[],internal,smallint,internal,internal,internal,internal);
 
+-- @laplace_path_set_match@
+
 CREATE OPERATOR FAMILY @extschema@.laplace_point4d_ops USING gist;
 ALTER OPERATOR FAMILY @extschema@.laplace_point4d_ops USING gist ADD
     OPERATOR 15 @extschema@.<~>(@extschema:postgis@.geometry,@extschema:postgis@.geometry) FOR ORDER BY pg_catalog.float_ops ,
