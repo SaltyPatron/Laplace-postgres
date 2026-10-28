@@ -90,7 +90,8 @@ array windows follow the same budget and PostgreSQL's representation limits.
 When a complete selection exceeds a leaf's analyzed row estimate, scaled to its
 current heap size, Native reads that small leaf once against the complete ID hash
 set instead of seeking every absent key in GIN. Transfer windows never repeat
-that dense scan. Unknown statistics retain indexed access. Regression covers
+that dense scan. Before ANALYZE, heap pages provide a conservative physical
+upper bound instead of assuming the relation is empty. Regression covers
 120,000 absent IDs and positive dense matches across small transfer windows.
 No planner setting or unknown SPI-array selectivity determines access.
 Parent/column ACLs, active RLS rejection, index validity and

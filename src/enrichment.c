@@ -221,12 +221,16 @@ static void container_remember(TupleTableSlot *slot,AttrNumber id,lp_idmap *pare
 /* A very large selection against a small relation is a dense set operation.
  * Probe each stored path once instead of seeking every absent key in every
  * GIN tree. Scale analyzed density to the current heap size, so growth after
- * ANALYZE does not leave an obsolete small-table estimate. Unknown statistics
- * retain the sparse indexed path. This does not change caller planner GUCs. */
+ * ANALYZE does not leave an obsolete small-table estimate. Before ANALYZE,
+ * heap pages give a conservative physical upper bound on tuple count.
+ * This does not change caller planner GUCs. */
 static bool container_dense(Relation table,size_t wanted)
 {
-    if(table->rd_rel->relpages<=0 || table->rd_rel->reltuples<0)return false;
-    double rows=table->rd_rel->reltuples*(double)RelationGetNumberOfBlocks(table)/table->rd_rel->relpages;
+    double blocks=(double)RelationGetNumberOfBlocks(table),rows;
+    if(table->rd_rel->relpages>0 && table->rd_rel->reltuples>0)
+        rows=table->rd_rel->reltuples*blocks/table->rd_rel->relpages;
+    else if(table->rd_rel->relam==HEAP_TABLE_AM_OID)rows=blocks*MaxHeapTuplesPerPage;
+    else return false;
     return (double)wanted>rows;
 }
 
