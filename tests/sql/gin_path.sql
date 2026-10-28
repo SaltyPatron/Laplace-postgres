@@ -69,3 +69,25 @@ BEGIN
 END $$;
 RESET statement_timeout;
 SELECT 'gin_path: broad stable frontiers and varying arrays preserve exact membership';
+
+CREATE INDEX path_search_cases_gin ON path_search_cases USING gin(path laplace_path_ops) WITH (fastupdate=on);
+-- This path remains in the pending list; the access method must handle it as
+-- well as the built posting lists while Native supplies exact set membership.
+INSERT INTO path_search_cases VALUES(laplace_path(ARRAY[laplace_cp_id(9731),laplace_cp_id(9733)]));
+SET statement_timeout='5s';
+DO $$ DECLARE frontier blake3[]:=ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(1,120000) i);
+ expected bigint; found bigint; plan json; BEGIN
+ SELECT count(*) INTO expected FROM path_search_cases WHERE path && ARRAY[laplace_cp_id(97),laplace_cp_id(9731)];
+ FOR i IN 1..3 LOOP
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path && $1' INTO found
+   USING frontier||ARRAY[laplace_cp_id(97),laplace_cp_id(9731),laplace_cp_id(97)];
+  IF found<>expected THEN RAISE EXCEPTION 'streamed GIN set lost built/pending postings: % versus %',found,expected; END IF;
+  EXECUTE 'SELECT count(*) FROM path_search_cases WHERE path && $1' INTO found USING frontier;
+  IF found<>0 THEN RAISE EXCEPTION 'streamed GIN set reused stale membership'; END IF;
+ END LOOP;
+ EXECUTE 'EXPLAIN (FORMAT JSON) SELECT count(*) FROM path_search_cases WHERE path && $1' INTO plan
+  USING frontier||ARRAY[laplace_cp_id(9731)];
+ IF plan::text NOT LIKE '%Bitmap Index Scan%' THEN RAISE EXCEPTION 'streamed set did not use GIN: %',plan; END IF;
+END $$;
+RESET statement_timeout;
+SELECT 'gin_path: streamed ID sets preserve built and pending postings across repeated scans';

@@ -39,3 +39,34 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';
+
+BEGIN;
+-- Global selection count is not per-leaf density. A few valid compositions
+-- can index many distinct constituents. Sparse misses must retain indexed
+-- access even when the input set exceeds the number of stored paths.
+CREATE TEMP TABLE sparse_expected AS
+WITH children AS (
+ SELECT i,array_agg(laplace_cp_id(20000+i*100+j) ORDER BY j) ids
+ FROM generate_series(0,119) i CROSS JOIN generate_series(0,99) j GROUP BY i
+), paths AS (
+ SELECT laplace_compose(ids) id,laplace_path(ids) path,
+ ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(x)))) FROM unnest(ids) x)) coord
+ FROM children
+)
+SELECT *,laplace_hilbert4(coord) # '-9223372036854775808'::bigint AS hilbert FROM paths;
+INSERT INTO public.entity(id,tier,coord,hilbert) SELECT id,1,coord,hilbert FROM sparse_expected;
+INSERT INTO public.physicality(entity,tier,hilbert,path) SELECT id,1,hilbert,path FROM sparse_expected;
+ANALYZE public.physicality;
+DO $$ DECLARE before_scans bigint; after_scans bigint; found bigint; selected oid[]; BEGIN
+ SELECT array_agg(h.inhrelid) INTO selected FROM pg_inherits h
+ WHERE h.inhparent='public.physicality'::regclass AND pg_relation_size(h.inhrelid)>0;
+ SELECT coalesce(sum(seq_scan),0) INTO before_scans FROM pg_stat_xact_all_tables WHERE relid=ANY(selected);
+ SELECT count(*) INTO found FROM public.laplace_attested(ARRAY(
+   SELECT public.laplace_cp_id(i) FROM generate_series(100000,100499) i));
+ SELECT coalesce(sum(seq_scan),0) INTO after_scans FROM pg_stat_xact_all_tables WHERE relid=ANY(selected);
+ IF found<>0 OR after_scans<>before_scans THEN
+  RAISE EXCEPTION 'sparse global selection scanned physicality heaps: rows %, scans %',found,after_scans-before_scans;
+ END IF;
+END $$;
+ROLLBACK;
+SELECT 'containers: sparse global selections retain GIN access above leaf row counts';

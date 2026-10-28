@@ -22,7 +22,7 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38/1.39-to-1.40 development
+CMake includes it in both the baseline and the in-place 1.38/1.39/1.40-to-1.41 development
 transitions from one update template. The three installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -82,17 +82,17 @@ and a multi-gigabyte external sort. Path/mask column privileges and the shared
 relation's RLS boundary are checked before direct access. Tuple detoasting is
 released as each carrier is consumed; graph state remains transaction-owned.
 
-Sparse upward containment uses the canonical GIN indexes directly. PostgreSQL's bitmap
-table access applies MVCC visibility; lossy pages receive exact Native ID-set
-rechecks. Duplicate parent IDs are reduced before the shared primary-index
-reader visits them in ID order. Each partition's bitmap follows `work_mem`;
-array windows follow the same budget and PostgreSQL's representation limits.
-When a complete selection exceeds a leaf's analyzed row estimate, scaled to its
-current heap size, Native reads that small leaf once against the complete ID hash
-set instead of seeking every absent key in GIN. Transfer windows never repeat
-that dense scan. Before ANALYZE, heap pages provide a conservative physical
-upper bound instead of assuming the relation is empty. Regression covers
-120,000 absent IDs and positive dense matches across small transfer windows.
+Upward containment uses the canonical GIN indexes directly. PostgreSQL's bitmap
+table access applies MVCC visibility. When its memory budget requires page-level
+instead of tuple-level candidates, Native rechecks each candidate path against
+the exact 128-bit ID set. This bitmap representation never approximates IDs or
+discards true matches. Duplicate parent IDs are reduced before the shared
+primary-index reader visits them in ID order. Each partition's bitmap follows
+`work_mem`; array windows follow the same budget and PostgreSQL's representation
+limits. Large selections stream the GIN membership-key range against the owned
+Native ID set; small selections seek individual entries. Neither switches to a
+physicality heap scan. Regression covers 120,000 deliberately absent lookup IDs,
+positive dense matches, and false-candidate rejection under a 64 kB budget.
 No planner setting or unknown SPI-array selectivity determines access.
 Parent/column ACLs, active RLS rejection, index validity and
 snapshot safety remain authoritative. Exact provenance rejects nonzero
@@ -104,6 +104,11 @@ partitions. In one repeatable-read snapshot, the installed reader returned
 14,011 provenance rows in 67.24 seconds; direct GIN returned the identical
 complete-row digest in 45.54 seconds. This ran alongside ingest; it is a
 populated containment comparison, not an isolated whole-source throughput claim.
+
+A later 100,000-claim comparison used two fresh backends at one exported
+repeatable-read snapshot. The installed 1.40 reader returned 142,679 rows in
+29.62 seconds; the 1.41 candidate returned the same complete-row digest in
+11.94 seconds. These are containment-read timings, not whole-ingest throughput.
 
 Perf-cache settings have one backend owner. Loaded module generations consult
 that configuration without redefining its GUCs or keeping divergent private
@@ -159,6 +164,22 @@ interface does not replace the ingest spine's client-side novelty descent.
 
 The lower layers are inventoried in [Native's interface map](../Laplace-Native/README.md#shared-interfaces-from-codepoints-upward).
 This extension adds PostgreSQL access and result adapters above those kernels.
+
+Large containment selections use GIN's [partial-match interface](https://www.postgresql.org/docs/18/gin.html#GIN-PARTIAL-MATCH)
+to stream the membership-key range against one Native ID set. Small selections
+retain ordinary entry seeks. PostgreSQL owns pending lists, posting trees,
+bitmap visibility and concurrency in both cases. No cardinality threshold
+switches a frontier to a physicality heap scan. Existing index keys retain all
+128 ID bits and their endpoint role, so this support-method update needs no
+index rebuild. Index key contexts lease an owned set; exact operand bytes allow
+partition scans to share it. One idle set is retained until transaction end,
+and replaced sets are freed when their last reader releases them. No rows or
+snapshot-dependent answers are cached. Regression checks actual transaction heap-scan counters, exact dense and
+lossy results, and large inputs with matching keys in pending lists.
+
+Upward provenance retains the complete requested ID frontier but creates DAG
+nodes only for actual assertion edges. Missing or unasserted operands cannot
+contribute evidence and do not become thousands of empty reduction roots.
 
 | Boundary | Owner | Shared inputs and variation |
 | --- | --- | --- |

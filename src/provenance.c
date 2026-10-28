@@ -335,7 +335,7 @@ static void pg_upward_path(const lp_id *key,Datum value,Datum mask,void *context
         if(walk->level==0 && said!=LP_SAID_CLAIM && said!=LP_SAID_RECORD)continue;
         if(walk->level>0 && said==LP_SAID_METADATA)continue;
         if(parent==PG_NONE){parent=pg_dag_node(walk->dag,&id,&fresh);walk->dag->n.v[parent].file=vertices[0].said==LP_SAID_METADATA;}
-        size_t child=(size_t)lp_idmap_find(walk->dag->m,&vertices[k].id);
+        size_t child=pg_dag_node(walk->dag,&vertices[k].id,NULL);
         PgEdge *edge=pg_dag_edge(walk->dag,parent,child,vertices+k);
         if(walk->level==0){edge->claim=1;edge->rec=said==LP_SAID_RECORD;
             if(scope){edge->has_dependence=1;edge->dependence=dependence;edge->dependence_trust=scope->prior;}}
@@ -360,9 +360,11 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
             lp_pg_lookup_paths(claims,(size_t)n,true,pg_claim_frontier_row,&selected);
             MemoryContextDelete(selected.binding.context);
         }
-    }else for (int i = 0; i < n; i++) {
-        lp_idmap_put(front, &claims[i], NULL);pg_dag_node(&d, &claims[i], NULL);
-    }
+    }else for (int i = 0; i < n; i++) lp_idmap_put(front, &claims[i], NULL);
+    /* The complete input remains an index selection, not a materialized DAG.
+     * Admit a node only when a retained assertion edge actually names it.
+     * Absent/unasserted operands cannot produce provenance; allocating one
+     * root and reducing a full node array for each made sparse misses O(n^2). */
     PgVertices vx = {0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
     for (int lvl = 0; lp_idmap_count(front); lvl++) {

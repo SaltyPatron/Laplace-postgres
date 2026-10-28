@@ -947,8 +947,9 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
 }
 
 /* ---------------------------------------------------------------- GIN over path geometry
- * The keys of a path are the distinct IDs packed in its vertices. A path holds a set of IDs exactly when every key is
- * present, so containment and overlap are answered by the index alone: no recheck, no path decoded twice. */
+ * The keys are complete, distinct IDs packed in path vertices. Membership and
+ * endpoint postings are exact. PostgreSQL can still require heap rechecks when
+ * its bounded tuple bitmap coarsens candidates to whole pages. */
 #define LP_STRAT_CONTAINS 7        /* path @> blake3[] */
 #define LP_STRAT_OVERLAPS 3        /* path && blake3[] */
 #define LP_STRAT_FIRST 8           /* path ^@ blake3 */
@@ -959,6 +960,78 @@ enum { PATH_MEMBER, PATH_FIRST, PATH_LAST };
 static Datum path_key(const lp_id *id, uint8 role){
     uint8 bytes[17]; bytes[0] = role; memcpy(bytes + 1, id->b, 16);
     return PointerGetDatum(bytes_datum(bytes, sizeof bytes));
+}
+
+/* A large overlap query is one exact set match over the membership-key range,
+ * rather than one entry-tree seek per input ID in every partition. The GIN
+ * access method still owns pending lists, posting trees and concurrency.
+ * https://www.postgresql.org/docs/18/gin.html#GIN-PARTIAL-MATCH */
+typedef struct PathOverlapRegistry PathOverlapRegistry;
+typedef struct {
+    lp_idmap *ids;lp_id first,last;ArrayType *operand;size_t readers;
+    PathOverlapRegistry *owner;
+} PathOverlapSet;
+struct PathOverlapRegistry { PathOverlapSet *last;MemoryContextCallback cleanup;uint64 builds; };
+typedef struct { PathOverlapSet *set;MemoryContextCallback cleanup; } PathOverlapLease;
+static PathOverlapRegistry *path_overlap_registry;
+static void path_overlap_registry_reset(void *context){
+    /* Native working allocations and operand copies belong to this same
+     * transaction. Context teardown frees them, including after errors. */
+    if(path_overlap_registry==context)path_overlap_registry=NULL;
+}
+static void path_overlap_set_free(PathOverlapSet *set){
+    if(set->owner->last==set)set->owner->last=NULL;
+    lp_idmap_free(set->ids);pfree(set->operand);pfree(set);
+}
+static void path_overlap_lease_release(void *context){
+    PathOverlapSet *set=((PathOverlapLease *)context)->set;
+    Assert(set->readers>0);set->readers--;
+    if(!set->readers && set->owner->last!=set)path_overlap_set_free(set);
+}
+static PathOverlapSet *path_overlap_acquire(ArrayType *array){
+    PathOverlapRegistry *registry=path_overlap_registry;
+    if(!registry){
+        registry=MemoryContextAllocZero(TopTransactionContext,sizeof *registry);
+        registry->cleanup=(MemoryContextCallback){.func=path_overlap_registry_reset,.arg=registry};
+        MemoryContextRegisterResetCallback(TopTransactionContext,&registry->cleanup);
+        path_overlap_registry=registry;
+    }
+    PathOverlapSet *set=registry->last;
+    /* Reuse input operands only, never rows or snapshot-dependent answers.
+     * Exact owned bytes prove reuse across the partition scans. One idle set
+     * is retained; overlapping scans hold leases until their key context ends. */
+    if(!set || VARSIZE(set->operand)!=VARSIZE(array) || memcmp(set->operand,array,VARSIZE(array))){
+        int count;lp_id *ids=ids_of(array,&count);
+        if(set && !set->readers)path_overlap_set_free(set);
+        set=MemoryContextAllocZero(TopTransactionContext,sizeof *set);set->owner=registry;
+        set->operand=MemoryContextAlloc(TopTransactionContext,VARSIZE(array));memcpy(set->operand,array,VARSIZE(array));
+        set->ids=lp_idmap_new();if(count)set->first=set->last=ids[0];
+        for(int i=0;i<count;i++){
+            lp_idmap_put(set->ids,ids+i,NULL);
+            if(lp_id_cmp(ids+i,&set->first)<0)set->first=ids[i];
+            if(lp_id_cmp(ids+i,&set->last)>0)set->last=ids[i];
+        }
+        pfree(ids);registry->last=set;registry->builds++;
+        elog(DEBUG1,"Native GIN operand set: %d IDs; build " UINT64_FORMAT,count,registry->builds);
+    }
+    PathOverlapLease *lease=palloc(sizeof *lease);lease->set=set;set->readers++;
+    lease->cleanup=(MemoryContextCallback){.func=path_overlap_lease_release,.arg=lease};
+    MemoryContextRegisterResetCallback(CurrentMemoryContext,&lease->cleanup);
+    return set;
+}
+PG_FUNCTION_INFO_V1(laplace_gin_compare_partial);
+Datum laplace_gin_compare_partial(PG_FUNCTION_ARGS){
+    PathOverlapSet *set=(PathOverlapSet *)PG_GETARG_POINTER(3);
+    if(PG_GETARG_UINT16(2)!=LP_STRAT_OVERLAPS || !set)
+        ereport(ERROR,(errmsg("laplace: invalid path GIN set match")));
+    bytea *key=PG_GETARG_BYTEA_PP(1);
+    if(VARSIZE_ANY_EXHDR(key)!=17)
+        ereport(ERROR,(errcode(ERRCODE_INDEX_CORRUPTED),errmsg("laplace: invalid path GIN key")));
+    const uint8 *bytes=(const uint8 *)VARDATA_ANY(key);
+    if(bytes[0]>PATH_MEMBER)PG_RETURN_INT32(1);
+    const lp_id *id=(const lp_id *)(bytes+1);
+    if(lp_id_cmp(id,&set->last)>0)PG_RETURN_INT32(1);
+    PG_RETURN_INT32(lp_idmap_find(set->ids,id)>=0?0:-1);
 }
 
 /* Whether every check is true (all) or any is; GIN's maybe stays maybe. */
@@ -985,7 +1058,18 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
         *n = 1; PG_RETURN_POINTER(d);
     }
     if (st != LP_STRAT_CONTAINS && st != LP_STRAT_OVERLAPS) ereport(ERROR, (errmsg("laplace: unknown path GIN strategy %u", st)));
-    int k; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &k);
+    ArrayType *array=PG_GETARG_ARRAYTYPE_P(0);
+    /* A page of identity operands selects a streamed key range. This changes
+     * access mechanics only; all input IDs and exact endpoint roles remain. */
+    if(st==LP_STRAT_OVERLAPS && ArrayGetNItems(ARR_NDIM(array),ARR_DIMS(array))>=BLCKSZ/(int)sizeof(lp_id)){
+        PathOverlapSet *set=path_overlap_acquire(array);
+        if(!lp_idmap_count(set->ids)){*n=0;PG_RETURN_POINTER(NULL);}
+        bool **partial=(bool **)PG_GETARG_POINTER(3);*partial=palloc(sizeof(bool));(*partial)[0]=true;
+        Pointer **extra=(Pointer **)PG_GETARG_POINTER(4);*extra=palloc(sizeof(Pointer));(*extra)[0]=(Pointer)set;
+        Datum *d=palloc(sizeof(Datum));d[0]=path_key(&set->first,PATH_MEMBER);*n=1;
+        PG_RETURN_POINTER(d);
+    }
+    int k;lp_id *ids=ids_of(array,&k);
     Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = path_key(&ids[i], PATH_MEMBER);
     *n = k; if (k == 0) *mode = st == LP_STRAT_CONTAINS ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
     PG_RETURN_POINTER(d);
@@ -993,7 +1077,7 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
 PG_FUNCTION_INFO_V1(laplace_gin_consistent);
 Datum laplace_gin_consistent(PG_FUNCTION_ARGS){
     bool *check = (bool *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
-    *(bool *)PG_GETARG_POINTER(5) = false;                                   /* keys are the exact IDs: no recheck */
+    *(bool *)PG_GETARG_POINTER(5) = false; /* Exact key postings; page-level bitmap candidates still require rechecks. */
     PG_RETURN_BOOL(st == LP_STRAT_OVERLAPS ? bool_any(check, n) : bool_all(check, n));
 }
 PG_FUNCTION_INFO_V1(laplace_gin_triconsistent);
