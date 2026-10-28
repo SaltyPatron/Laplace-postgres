@@ -62,7 +62,7 @@ execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
-  schema mask geometry gin_path gist4d text_id projection attestation stage ordered container_frontier function_bindings
+  schema mask geometry gin_path gist4d text_id realization_depth projection attestation stage ordered container_frontier frontier_runtime function_bindings
   WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
 endif()
 if(NOT result EQUAL 0)

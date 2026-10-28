@@ -33,6 +33,7 @@ DESTDIR="$stage" cmake --install "$build" >/dev/null
 share="$stage$("$pg/pg_config" --sharedir)"
 module="$stage$("$pg/pg_config" --pkglibdir)/laplace"
 [[ -s "$share/extension/laplace.control" && -s "$module.so" ]]
+cp "$module.so" "${module}_peer.so"
 # Only the private test control file names the candidate module explicitly.
 # SQL scripts and the candidate library retain their build/install bytes.
 escaped=${module//\'/\'\'}
@@ -41,7 +42,7 @@ mv "$stage/control" "$share/extension/laplace.control"
 "$pg/psql" "$admin" -Xq -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
 created=1
 connection=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed "s/dbname=[^ ]*/dbname=$db/")
-"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v schema_cases="$source_root/tests/sql/schema.sql" -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v routing_cases="$source_root/tests/sql/stage_routing.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" -v gin_cases="$source_root/tests/sql/gin_path.sql" -v geometry_suite="$source_root/tests/sql/geometry.sql" -v frontier_cases="$source_root/tests/sql/frontier_runtime.sql" <<'SQL'
+"$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -v schema_cases="$source_root/tests/sql/schema.sql" -v writer="${db}_writer" -v candidate_share="$share" -v candidate_module="$module" -v gist4d_cases="$source_root/tests/sql/gist4d.sql" -v text_cases="$source_root/tests/sql/text_id.sql" -v projection_cases="$source_root/tests/sql/projection.sql" -v attestation_cases="$source_root/tests/sql/attestation.sql" -v stage_cases="$source_root/tests/sql/stage.sql" -v routing_cases="$source_root/tests/sql/stage_routing.sql" -v annotation_cases="$source_root/tests/sql/path_annotations.sql" -v gin_cases="$source_root/tests/sql/gin_path.sql" -v geometry_suite="$source_root/tests/sql/geometry.sql" -v frontier_cases="$source_root/tests/sql/frontier_runtime.sql" -v depth_cases="$source_root/tests/sql/realization_depth.sql" -v container_cases="$source_root/tests/sql/container_frontier.sql" <<'SQL'
 SELECT set_config('extension_control_path', :'candidate_share' || ':$system', false);
 CREATE EXTENSION postgis;
 -- Install the current schema directly; unreleased development history is not
@@ -109,6 +110,7 @@ RESET SESSION AUTHORIZATION;
 -- candidate package path, rather than accidentally loading an installed copy.
 \i :gist4d_cases
 \i :text_cases
+\i :depth_cases
 \i :projection_cases
 \i :attestation_cases
 \i :stage_cases
@@ -118,6 +120,7 @@ RESET SESSION AUTHORIZATION;
 DROP TABLE geometry_cases;
 \i :geometry_suite
 \i :frontier_cases
+\i :container_cases
 SQL
 "$pg/psql" "$connection" -Xq -v ON_ERROR_STOP=1 -f "$source_root/tests/sql/function_bindings.sql"
 isolation="$LAPLACE_PG_DIR/lib/pgxs/src/test/isolation/isolationtester"

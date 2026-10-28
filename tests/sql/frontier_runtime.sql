@@ -18,7 +18,6 @@ SELECT laplace_id(content),laplace_tier(content),laplace_hilbert(content),
 FROM frontier_words;
 ANALYZE public.physicality;
 SET LOCAL work_mem='16MB';
-\timing on
 DO $$
 DECLARE found bigint;
 BEGIN
@@ -26,6 +25,16 @@ BEGIN
     ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,220000) i));
   IF found <> 0 THEN RAISE EXCEPTION 'missing frontier acquired witness evidence'; END IF;
 END $$;
-\timing off
+-- A dense frontier must also retain genuine matches across multiple transfer
+-- windows. Annotate the existing canonical first scalar as an assertion.
+UPDATE public.physicality SET path=ST_SetPoint(path,0,ST_MakePoint(
+ ST_X(ST_PointN(path,1)),ST_Y(ST_PointN(path,1)),ST_Z(ST_PointN(path,1)),
+ ST_M(ST_PointN(path,1))+1073741824));
+SET LOCAL work_mem='64kB';
+DO $$ DECLARE found bigint; BEGIN
+ SELECT count(*) INTO found FROM laplace_attested(
+  ARRAY[laplace_cp_id(102)] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,105000) i));
+ IF found<>17000 THEN RAISE EXCEPTION 'dense frontier lost true matches or repeated a transfer window: %',found; END IF;
+END $$;
 ROLLBACK;
 SELECT 'frontier runtime: complete traversal over 17000 canonical paths passed';

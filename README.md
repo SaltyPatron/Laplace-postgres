@@ -45,8 +45,11 @@ realizes an ordered set of selected IDs in one context, preserves duplicate inpu
 occurrences and compressed runs, and reads shared descendants once. Scalar
 `laplace_text` uses the same reader. Newly discovered nodes form each frontier;
 transfer windows follow `work_mem` and PostgreSQL's actual array capacity.
-There is no separate 64-level text rejection. Cyclic carriers are rejected and
-the server's stack/resource checks still apply.
+Text and label classification/rendering use explicit Native occurrence stacks,
+preserving child order and runs without a fixed altitude cutoff or recursive C
+calls. Cyclic carriers are rejected; output and working memory remain subject to
+the server's resource limits. Regression realizes 4,096 genuine nested tiers
+with a 100 kB backend stack budget, repeated roots and deliberate cycle rejection.
 `laplace_labels` uses that reader for selected-ID display: Unicode text and
 ordered tuples with their runs. It retains canonical IDs for other structural
 roles or missing realizations, and does not reconstruct a package body to label
@@ -79,13 +82,18 @@ and a multi-gigabyte external sort. Path/mask column privileges and the shared
 relation's RLS boundary are checked before direct access. Tuple detoasting is
 released as each carrier is consumed; graph state remains transaction-owned.
 
-Upward containment uses the canonical GIN indexes directly. PostgreSQL's bitmap
+Sparse upward containment uses the canonical GIN indexes directly. PostgreSQL's bitmap
 table access applies MVCC visibility; lossy pages receive exact Native ID-set
 rechecks. Duplicate parent IDs are reduced before the shared primary-index
 reader visits them in ID order. Each partition's bitmap follows `work_mem`;
 array windows follow the same budget and PostgreSQL's representation limits.
-No planner setting or guessed array selectivity chooses a full physicality scan
-inside this reader. Parent/column ACLs, active RLS rejection, index validity and
+When a complete selection exceeds a leaf's analyzed row estimate, scaled to its
+current heap size, Native reads that small leaf once against the complete ID hash
+set instead of seeking every absent key in GIN. Transfer windows never repeat
+that dense scan. Unknown statistics retain indexed access. Regression covers
+120,000 absent IDs and positive dense matches across small transfer windows.
+No planner setting or unknown SPI-array selectivity determines access.
+Parent/column ACLs, active RLS rejection, index validity and
 snapshot safety remain authoritative. Exact provenance rejects nonzero
 `gin_fuzzy_search_limit`; it cannot accept approximate index results.
 

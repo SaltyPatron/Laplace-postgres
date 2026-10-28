@@ -23,6 +23,7 @@ FROM composed;
 INSERT INTO public.entity(id,tier,coord,hilbert) SELECT id,1,coord,hilbert FROM dense_expected;
 INSERT INTO public.physicality(entity,tier,hilbert,path,placement_padding)
  SELECT id,1,hilbert,path,repeat('x',2000) FROM dense_expected ORDER BY i;
+ANALYZE public.physicality;
 SET LOCAL work_mem='64kB';
 DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  SELECT count(*) INTO expected FROM dense_expected WHERE i%2=0;

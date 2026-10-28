@@ -548,38 +548,81 @@ static void read_levels(lp_idmap *t, MemoryContext keep, bool labels,const lp_id
       begin=end;end=lp_idmap_count(t);
     }
 }
-static void render(lp_idmap *t, size_t i, StringInfo out){
-    check_stack_depth();CHECK_FOR_INTERRUPTS();
-    TNode *x = lp_idmap_at(t, i); int64 cp = x->nkid ? -1 : lp_tier0_codepoint(lp_pg_tier0(), lp_idmap_key(t, i));
-    if (cp >= 0) { uint8_t u[4]; appendBinaryStringInfo(out, (const char *)u, (int)lp_utf8_put((uint32)cp, u)); return; }
-    if(x->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_text: cyclic composition")));
-    x->rendering=true;
-    for(size_t k=0;k<x->nkid;k++)for(uint32 r=0;r<x->kid[k].run;r++)render(t,x->kid[k].node,out);
-    x->rendering=false;
-}
+typedef struct {size_t node,child;} SurfaceFrame;
 static bool text_surface(lp_idmap *t,size_t i){
-    check_stack_depth();CHECK_FOR_INTERRUPTS();TNode *x=lp_idmap_at(t,i);
-    if(x->opaque || x->tuple)return false;
-    if(x->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
-    if(x->text_state)return x->text_state==1;
-    if(!x->nkid){x->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,i))>=0 ? 1 : 2;return x->text_state==1;}
-    x->text_state=3;
-    for(size_t k=0;k<x->nkid;k++)if(!text_surface(t,x->kid[k].node)){x->text_state=2;return false;}
-    x->text_state=1;return true;
+    TNode *root=lp_idmap_at(t,i);
+    if(root->text_state==1 || root->text_state==2)return root->text_state==1;
+    if(root->opaque || root->tuple){root->text_state=2;return false;}
+    if(root->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
+    if(!root->nkid){root->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,i))>=0?1:2;return root->text_state==1;}
+    lp_vec(SurfaceFrame) stack={0};lp_push(&stack,((SurfaceFrame){i,0}));
+    while(stack.n){
+        CHECK_FOR_INTERRUPTS();SurfaceFrame *frame=stack.v+stack.n-1;
+        TNode *node=lp_idmap_at(t,frame->node);
+        if(node->text_state==1 || node->text_state==2){stack.n--;continue;}
+        if(node->opaque || node->tuple){node->text_state=2;continue;}
+        if(!node->nkid){
+            node->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,frame->node))>=0?1:2;continue;
+        }
+        node->text_state=3;
+        if(frame->child==node->nkid){node->text_state=1;continue;}
+        size_t child=node->kid[frame->child].node;TNode *next=lp_idmap_at(t,child);
+        if(next->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
+        if(next->text_state==2){node->text_state=2;continue;}
+        if(next->text_state==1){frame->child++;continue;}
+        lp_push(&stack,((SurfaceFrame){child,0}));
+    }
+    lp_vec_free(&stack);return ((TNode *)lp_idmap_at(t,i))->text_state==1;
 }
-static void render_label(lp_idmap *t,size_t i,StringInfo out){
-    check_stack_depth();CHECK_FOR_INTERRUPTS();TNode *x=lp_idmap_at(t,i);
-    if(!x->opaque && x->tuple){
-      if(x->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
-      x->rendering=true;appendStringInfoChar(out,'[');
-      for(size_t k=0;k<x->nkid;k++){
-        if(k)appendStringInfoString(out," · ");render_label(t,x->kid[k].node,out);
-        if(x->kid[k].run>1)appendStringInfo(out," × %u",x->kid[k].run);
-      }
-      appendStringInfoChar(out,']');x->rendering=false;
-    }else if(text_surface(t,i))render(t,i,out);
-    else{char hex[33];lp_id_hex(lp_idmap_key(t,i),hex);appendStringInfoString(out,hex);}
+typedef struct {size_t node,child;uint32 repeat,suffix;bool labels,entered;} RenderFrame;
+/* Exact text and display labels share the occurrence stack. Structural labels
+ * print a run once with its count; exact text emits every ordered occurrence.
+ * Neither DAG altitude nor output length consumes the backend's C stack. */
+static void render_tree(lp_idmap *t,size_t root,StringInfo out,bool labels){
+    lp_vec(RenderFrame) stack={0};lp_push(&stack,((RenderFrame){.node=root,.labels=labels}));
+    while(stack.n){
+        CHECK_FOR_INTERRUPTS();RenderFrame *frame=stack.v+stack.n-1;
+        TNode *node=lp_idmap_at(t,frame->node);
+        if(!frame->entered){
+            bool tuple=frame->labels && !node->opaque && node->tuple;
+            if(frame->labels && !tuple){
+                if(!text_surface(t,frame->node)){
+                    char hex[33];lp_id_hex(lp_idmap_key(t,frame->node),hex);appendStringInfoString(out,hex);stack.n--;continue;
+                }
+                frame->labels=false;
+            }
+            if(!frame->labels && !node->nkid){
+                int64 cp=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,frame->node));
+                if(cp>=0){uint8 u[4];appendBinaryStringInfo(out,(const char *)u,(int)lp_utf8_put((uint32)cp,u));}
+                stack.n--;continue;
+            }
+            if(node->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_text: cyclic composition")));
+            node->rendering=true;frame->entered=true;
+            if(frame->labels)appendStringInfoChar(out,'[');
+        }
+        if(frame->labels){
+            if(frame->suffix>1)appendStringInfo(out," × %u",frame->suffix);
+            frame->suffix=0;
+            if(frame->child<node->nkid){
+                if(frame->child)appendStringInfoString(out," · ");
+                TChild child=node->kid[frame->child++];frame->suffix=child.run;
+                lp_push(&stack,((RenderFrame){.node=child.node,.labels=true}));continue;
+            }
+            appendStringInfoChar(out,']');
+        }else{
+            if(!frame->repeat && frame->child<node->nkid)frame->repeat=node->kid[frame->child++].run;
+            if(frame->repeat){
+                size_t child=node->kid[frame->child-1].node;frame->repeat--;
+                lp_push(&stack,((RenderFrame){.node=child}));continue;
+            }
+            if(frame->child<node->nkid)continue;
+        }
+        node->rendering=false;stack.n--;
+    }
+    lp_vec_free(&stack);
 }
+static void render(lp_idmap *t,size_t i,StringInfo out){render_tree(t,i,out,false);}
+static void render_label(lp_idmap *t,size_t i,StringInfo out){render_tree(t,i,out,true);}
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
     StringInfoData out; initStringInfo(&out); MemoryContext keep = CurrentMemoryContext;

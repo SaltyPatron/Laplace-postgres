@@ -27,6 +27,7 @@
 #include "nodes/tidbitmap.h"
 #include "partitioning/partdesc.h"
 #include "partitioning/partbounds.h"
+#include "storage/bufmgr.h"
 #include <limits.h>
 
 typedef struct { Oid partition; lp_id id; int64 ordinal; } PresenceKey;
@@ -201,6 +202,34 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,in
     return found;
 }
 
+static bool container_matches(TupleTableSlot *slot,AttrNumber path,const lp_idmap *wanted)
+{
+    bool missing;Datum value=slot_getattr(slot,path,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native containment path is null")));
+    Geo geometry=geo_of(value);
+    for(size_t i=0;i<geometry.p.n;i++){
+        lp_id child=lp_path_id(geometry.p,i);if(lp_idmap_find(wanted,&child)>=0)return true;
+    }
+    return false;
+}
+static void container_remember(TupleTableSlot *slot,AttrNumber id,lp_idmap *parents)
+{
+    bool missing;Datum value=slot_getattr(slot,id,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native containment parent identity is null")));
+    lp_idmap_put(parents,(const lp_id *)DatumGetPointer(value),NULL);
+}
+/* A very large selection against a small relation is a dense set operation.
+ * Probe each stored path once instead of seeking every absent key in every
+ * GIN tree. Scale analyzed density to the current heap size, so growth after
+ * ANALYZE does not leave an obsolete small-table estimate. Unknown statistics
+ * retain the sparse indexed path. This does not change caller planner GUCs. */
+static bool container_dense(Relation table,size_t wanted)
+{
+    if(table->rd_rel->relpages<=0 || table->rd_rel->reltuples<0)return false;
+    double rows=table->rd_rel->reltuples*(double)RelationGetNumberOfBlocks(table)/table->rd_rel->relpages;
+    return (double)wanted>rows;
+}
+
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context)
 {
     if(!count)return;
@@ -224,6 +253,19 @@ void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path
             if(!table->rd_tableam || !table->rd_tableam->scan_bitmap_next_tuple)
                 ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native containment requires bitmap table access")));
             AttrNumber path=get_attnum(relation_id,"path"),id=get_attnum(relation_id,"entity");
+            if(container_dense(table,unique)){
+                if(!begin){
+                    TableScanDesc heap=table_beginscan(table,snapshot,0,NULL);
+                    TupleTableSlot *slot=table_slot_create(table,NULL);
+                    while(table_scan_getnextslot(heap,ForwardScanDirection,slot)){
+                        CHECK_FOR_INTERRUPTS();MemoryContext previous=MemoryContextSwitchTo(scratch);
+                        if(container_matches(slot,path,wanted))container_remember(slot,id,parents);
+                        MemoryContextSwitchTo(previous);MemoryContextReset(scratch);ExecClearTuple(slot);
+                    }
+                    ExecDropSingleTupleTableSlot(slot);table_endscan(heap);
+                }
+                table_close(table,NoLock);continue;
+            }
             int index_column;Oid operation;
             Relation index=container_index(table,path,array_type,&index_column,&operation);
             ScanKeyData key;
@@ -237,21 +279,9 @@ void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path
             TupleTableSlot *slot=table_slot_create(table,NULL);
             bool recheck;uint64 lossy=0,exact=0;
             while(table_scan_bitmap_next_tuple(heap,slot,&recheck,&lossy,&exact)){
-                CHECK_FOR_INTERRUPTS();bool missing;bool matches=!recheck;
+                CHECK_FOR_INTERRUPTS();
                 MemoryContext previous=MemoryContextSwitchTo(scratch);
-                if(recheck){
-                    Datum value=slot_getattr(slot,path,&missing);
-                    if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native GIN path is null")));
-                    Geo geometry=geo_of(value);
-                    for(size_t i=0;i<geometry.p.n && !matches;i++){
-                        lp_id child=lp_path_id(geometry.p,i);matches=lp_idmap_find(wanted,&child)>=0;
-                    }
-                }
-                if(matches){
-                    Datum value=slot_getattr(slot,id,&missing);
-                    if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native GIN parent identity is null")));
-                    lp_idmap_put(parents,(const lp_id *)DatumGetPointer(value),NULL);
-                }
+                if(!recheck || container_matches(slot,path,wanted))container_remember(slot,id,parents);
                 MemoryContextSwitchTo(previous);MemoryContextReset(scratch);ExecClearTuple(slot);
             }
             ExecDropSingleTupleTableSlot(slot);
