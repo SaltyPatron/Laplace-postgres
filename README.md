@@ -179,6 +179,11 @@ preserve duplicate requests. Exact text requires every path, while labels may
 retain the canonical ID when a realization is unavailable. Transfer windows
 bound working memory and do not cap admitted input or DAG depth.
 
+The executor receiver itself lives in `include/laplace_pg/executor.h`, exposed
+by the `laplace_pg_executor` CMake interface. Both the canonical module and the
+application extension compile this owner. Their adapters supply parameters and
+snapshot policy; neither maintains a separate portal/fetch implementation.
+
 Use typed data, a callback and its context where mechanics are shared. Keep
 storage authorization, missing-value policy and domain meaning explicit; a
 single mode flag must not silently exchange those contracts. SIMD selection

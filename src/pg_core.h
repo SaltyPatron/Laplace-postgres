@@ -10,6 +10,7 @@
 #include "utils/memutils.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
+#include "laplace_pg/executor.h"
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
 #include "laplace/highway.h"
@@ -29,7 +30,7 @@ char *lp_pg_sql(const char *sql);
 int lp_pg_execute(const char *sql,bool read_only,long count);
 int lp_pg_execute_args(const char *sql,int nargs,Oid *types,Datum *values,const char *nulls,bool read_only,long count);
 SPIPlanPtr lp_pg_prepare_cursor(const char *sql,int nargs,Oid *types,int options);
-typedef void (*lp_pg_row_visit)(TupleTableSlot *slot,void *context);
+typedef lp_pg_executor_visit lp_pg_row_visit;
 void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit,void *context);
 
 /* Complete ID-addressed path frontier. Native range routing and primary

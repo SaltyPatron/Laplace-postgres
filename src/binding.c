@@ -86,34 +86,7 @@ SPIPlanPtr lp_pg_prepare_cursor(const char *sql,int nargs,Oid *types,int options
     SPIPlanPtr result=SPI_prepare_cursor(bound,nargs,types,options);pfree(bound);return result;
 }
 
-typedef struct { DestReceiver receiver; lp_pg_row_visit visit; void *context; MemoryContext memory; uint64 rows; bool selected; } NativeReceiver;
-static bool native_receive(TupleTableSlot *slot,DestReceiver *receiver)
-{
-    NativeReceiver *native=(NativeReceiver *)receiver;
-    CHECK_FOR_INTERRUPTS();MemoryContext before=MemoryContextSwitchTo(native->memory);
-    native->visit(slot,native->context);
-    native->rows++;
-    MemoryContextSwitchTo(before);MemoryContextReset(native->memory);return true;
-}
-static void native_start(DestReceiver *receiver,int operation,TupleDesc descriptor)
-{
-    NativeReceiver *native=(NativeReceiver *)receiver;
-    if(operation!=CMD_SELECT)ereport(ERROR,(errmsg("Native set receiver requires a SELECT")));
-    native->selected=true;
-}
-static void native_end(DestReceiver *receiver) {}
 void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit,void *context)
 {
-    /* This is our receiver, not SPI's materialized tuple-table receiver. */
-    NativeReceiver receiver={.receiver={native_receive,native_start,native_end,native_end,DestNone},
-        .visit=visit,.context=context,.memory=AllocSetContextCreate(CurrentMemoryContext,"Native executor row",ALLOCSET_SMALL_SIZES)};
-    SPIExecuteOptions options={.params=parameters,.read_only=true,.must_return_tuples=true,.dest=&receiver.receiver};
-    int result=SPI_execute_plan_extended(plan,&options);
-    /* SPI labels a SELECT with a non-SPI DestNone receiver as UTILITY. The
-     * receiver verifies the command and independently counts every tuple. */
-    if((result!=SPI_OK_SELECT && result!=SPI_OK_UTILITY) || !receiver.selected)
-        ereport(ERROR,(errmsg("Native set executor failed: %s",SPI_result_code_string(result))));
-    if(SPI_processed!=receiver.rows)
-        ereport(ERROR,(errmsg("Native set executor row count does not match its receiver")));
-    MemoryContextDelete(receiver.memory);
+    lp_pg_execute_stream(plan,parameters,true,visit,context);
 }
