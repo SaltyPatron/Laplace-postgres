@@ -10,6 +10,10 @@ set(package "${build_root}/regress-package")
 set(output "${build_root}/regress-output")
 set(instance "${build_root}/regress-instance")
 file(MAKE_DIRECTORY "${package}/extension" "${output}")
+get_filename_component(module_directory "${MODULE}" DIRECTORY)
+get_filename_component(module_name "${MODULE}" NAME_WE)
+get_filename_component(module_extension "${MODULE}" LAST_EXT)
+configure_file("${MODULE}" "${module_directory}/${module_name}_peer${module_extension}" COPYONLY)
 # pg_regress feeds scripts on stdin, so psql's relative include has no script
 # directory. Keep the shared geometry fixture beside the driver's working dir.
 configure_file("${SOURCE}/tests/sql/geometry_cases.sql" "${build_root}/geometry_cases.sql" COPYONLY)
@@ -58,7 +62,7 @@ execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
-  schema mask geometry gin_path gist4d text_id projection attestation stage ordered function_bindings
+  schema mask geometry gin_path gist4d text_id projection attestation stage ordered container_frontier function_bindings
   WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
 endif()
 if(NOT result EQUAL 0)

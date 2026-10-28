@@ -85,8 +85,9 @@ Datum blake3_hash_extended(PG_FUNCTION_ARGS){ return hash_any_extended((const un
 /* ---------------------------------------------------------------- the perf-caches, mapped in this backend */
 static char *tier0_path = NULL, *flags_path = NULL, *highway_path = NULL;
 const lp_tier0_record *lp_pg_tier0(void){
-    const lp_tier0_record *t = lp_tier0_map(tier0_path);
-    if (!t) ereport(ERROR, (errmsg("laplace: cannot map tier 0 at \"%s\" (laplace.tier0)", tier0_path)));
+    const char *path=GetConfigOption("laplace.tier0",false,false);
+    const lp_tier0_record *t = lp_tier0_map(path);
+    if (!t) ereport(ERROR, (errmsg("laplace: cannot map tier 0 at \"%s\" (laplace.tier0)", path)));
     return t;
 }
 lp_text *lp_pg_text_context(void){
@@ -98,13 +99,15 @@ lp_text *lp_pg_text_context(void){
     return context;
 }
 const lp_layout *lp_pg_flags(void){
-    const lp_layout *l = lp_flags_map(flags_path);
-    if (!l) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", flags_path ? flags_path : lp_flags_path())));
+    const char *path=GetConfigOption("laplace.flags",false,false);
+    const lp_layout *l = lp_flags_map(path);
+    if (!l) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", path)));
     return l;
 }
 static const lp_highway *highway(void){
-    const lp_highway *h = lp_highway_map(highway_path);
-    if (!h) ereport(ERROR, (errmsg("laplace: cannot map the highway at \"%s\" (laplace.highway; generate it with: laplace highway)", highway_path)));
+    const char *path=GetConfigOption("laplace.highway",false,false);
+    const lp_highway *h = lp_highway_map(path);
+    if (!h) ereport(ERROR, (errmsg("laplace: cannot map the highway at \"%s\" (laplace.highway; generate it with: laplace highway)", path)));
     return h;
 }
 /* Native's working memory (its maps, arrays, buffers) comes from the transaction's memory: what a call holds is freed by
@@ -112,14 +115,17 @@ static const lp_highway *highway(void){
 static void *tx_grow(void *p, size_t n){ return p ? repalloc_huge(p, n) : MemoryContextAllocHuge(TopTransactionContext, n); }
 static void tx_release(void *p){ pfree(p); }
 void _PG_init(void);
+static void cache_setting(const char *name,const char *description,char **value,const char *initial){
+    /* Configuration belongs to the backend. Multiple loaded generations read
+     * that owner instead of redefining a setting or retaining a private copy. */
+    if(!GetConfigOption(name,true,false) || (GetConfigOptionFlags(name,true)&GUC_CUSTOM_PLACEHOLDER))
+        DefineCustomStringVariable(name,description,NULL,value,initial,PGC_SUSET,0,NULL,NULL,NULL);
+}
 void _PG_init(void){
     lp_allocator(tx_grow, tx_release);
-    DefineCustomStringVariable("laplace.tier0", "Path of the tier-0 perf-cache (1,112,064 scalar records, 64 bytes each).", NULL, &tier0_path,
-                               lp_tier0_path(), PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomStringVariable("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", NULL, &flags_path,
-                               lp_flags_path(), PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomStringVariable("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", NULL, &highway_path,
-                               lp_highway_path(), PGC_SUSET, 0, NULL, NULL, NULL);
+    cache_setting("laplace.tier0", "Path of the tier-0 perf-cache (1,112,064 scalar records, 64 bytes each).", &tier0_path,lp_tier0_path());
+    cache_setting("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", &flags_path,lp_flags_path());
+    cache_setting("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", &highway_path,lp_highway_path());
 }
 
 /* ---------------------------------------------------------------- identity */

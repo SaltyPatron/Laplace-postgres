@@ -22,7 +22,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not [LaplaceRegressionToken]::IsTokenRestricted($identity.Token)) {
     & $PgRegress "--bindir=$PgBin" "--inputdir=$InputRoot" "--outputdir=$BuildRoot/regress-output" `
         "--temp-instance=$BuildRoot/regress-instance" "--temp-config=$Config" `
-        --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace schema mask geometry gin_path gist4d text_id projection attestation stage ordered function_bindings
+        --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace schema mask geometry gin_path gist4d text_id projection attestation stage ordered container_frontier function_bindings
     exit $LASTEXITCODE
 }
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -71,7 +71,7 @@ try {
     & (Join-Path $PgBin 'psql.exe') @connection -d regression -v ON_ERROR_STOP=1 `
         -c 'CREATE EXTENSION postgis; CREATE EXTENSION laplace;'
     if ($LASTEXITCODE -ne 0) { throw 'Candidate extension installation failed.' }
-    foreach ($test in @('schema', 'mask', 'geometry', 'gin_path', 'gist4d', 'text_id', 'projection', 'attestation', 'stage', 'ordered', 'function_bindings')) {
+    foreach ($test in @('schema', 'mask', 'geometry', 'gin_path', 'gist4d', 'text_id', 'projection', 'attestation', 'stage', 'ordered', 'container_frontier', 'function_bindings')) {
         $actual = Join-Path $output "results/$test.out"
         & (Join-Path $PgBin 'psql.exe') @connection -d regression -a -v ON_ERROR_STOP=1 `
             -f (Join-Path $InputRoot "sql/$test.sql") *> $actual

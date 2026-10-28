@@ -31,3 +31,11 @@ DO $$ BEGIN
   END IF;
 END $$;
 RESET search_path;
+DO $$ DECLARE module text; BEGIN
+ SELECT probin||'_peer' INTO module FROM pg_proc WHERE oid='public.laplace_cp_id(integer)'::regprocedure;
+ EXECUTE format('CREATE FUNCTION pg_temp.peer_id(text) RETURNS public.blake3 AS %L,%L LANGUAGE C IMMUTABLE STRICT',module,'laplace_id');
+ EXECUTE format('CREATE FUNCTION pg_temp.peer_separators() RETURNS public.blake3[] AS %L,%L LANGUAGE C IMMUTABLE',module,'laplace_separator_ids');
+ IF pg_temp.peer_id('ab')<>public.laplace_id('ab') OR pg_temp.peer_separators()<>public.laplace_separator_ids() THEN
+  RAISE EXCEPTION 'loaded module generations disagree on backend-owned perf-cache configuration';
+ END IF;
+END $$;

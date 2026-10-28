@@ -79,6 +79,27 @@ and a multi-gigabyte external sort. Path/mask column privileges and the shared
 relation's RLS boundary are checked before direct access. Tuple detoasting is
 released as each carrier is consumed; graph state remains transaction-owned.
 
+Upward containment uses the canonical GIN indexes directly. PostgreSQL's bitmap
+table access applies MVCC visibility; lossy pages receive exact Native ID-set
+rechecks. Duplicate parent IDs are reduced before the shared primary-index
+reader visits them in ID order. Each partition's bitmap follows `work_mem`;
+array windows follow the same budget and PostgreSQL's representation limits.
+No planner setting or guessed array selectivity chooses a full physicality scan
+inside this reader. Parent/column ACLs, active RLS rejection, index validity and
+snapshot safety remain authoritative. Exact provenance rejects nonzero
+`gin_fuzzy_search_limit`; it cannot accept approximate index results.
+
+A 2026-10-27 read selected 10,000 claims from 20.3 million physicalities.
+The installed reader's first two frontiers each scanned all 256 physicality
+partitions. In one repeatable-read snapshot, the installed reader returned
+14,011 provenance rows in 67.24 seconds; direct GIN returned the identical
+complete-row digest in 45.54 seconds. This ran alongside ingest; it is a
+populated containment comparison, not an isolated whole-source throughput claim.
+
+Perf-cache settings have one backend owner. Loaded module generations consult
+that configuration without redefining its GUCs or keeping divergent private
+values. Regression coverage loads a second module against the same settings.
+
 A real ISO witness read on 2026-10-26 returned 93,441 series in 1.55 seconds
 with the candidate, versus 70.91 seconds through the previous containment path.
 A complete comparison of all returned columns found zero differences. The

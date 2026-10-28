@@ -319,13 +319,10 @@ static int by_attr_row(const void *a, const void *b)
 }
 
 typedef struct { PgDag *dag;lp_idmap *front,*next,*seen,*classes;PgVertices *vertices;int level; } PgUpward;
-static void pg_upward_row(TupleTableSlot *slot,void *context)
+static void pg_upward_path(const lp_id *key,Datum value,Datum mask,void *context)
 {
-    PgUpward *walk=context;bool missing;Datum value=slot_getattr(slot,1,&missing);
-    if(missing)ereport(ERROR,(errmsg("Native provenance parent has no identity")));
-    lp_id id=*(const lp_id *)DatumGetPointer(value);bool first;
+    PgUpward *walk=context;lp_id id=*key;bool first;(void)mask;
     lp_idmap_put(walk->seen,&id,&first);if(!first)return;
-    value=slot_getattr(slot,2,&missing);if(missing)ereport(ERROR,(errmsg("Native provenance parent has no path")));
     Geo geometry=geo_of(value);int count=(int)geometry.p.n;if(count<=0)return;
     lp_vec_reserve(walk->vertices,(size_t)count);lp_vertex *vertices=walk->vertices->v;
     if(lp_path_decode(geometry.p,vertices,(size_t)count)!=(size_t)count)return;
@@ -354,7 +351,6 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     Oid idelm = get_element_type(idarr);
     PgDag d = { lp_idmap_new(), {0}, {0} };
     lp_idmap *front = lp_idmap_new();
-    size_t window_ids = frontier_window_ids();
     if(roots && !known_witnesses){
         /* The downward API admits assertions by the child's carrier, not
          * solely by an incoming edge. Preserve that boundary in either
@@ -369,41 +365,16 @@ static void compute_attested_rows(const lp_id *claims, int n, Oid idarr, int wit
     }
     PgVertices vx = {0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
-    /* This is one indexed frontier inside a Native walk, not a whole-query
-     * parallel scan. Starting worker processes at every hop/window dominates
-     * sparse containment.
-     * Admit no parallel plan at this boundary. Keep the frontier as a parameter
-     * without PARAM_FLAG_CONST rather than embedding it in every partition. */
-    SPIPlanPtr upward = lp_pg_prepare_cursor(
-        "SELECT p.entity, p.path FROM @extschema@.physicality p "
-        "WHERE p.path OPERATOR(@extschema@.&&) $1 ORDER BY p.entity", 1, &idarr,
-        CURSOR_OPT_CUSTOM_PLAN);
-    if (!upward) ereport(ERROR, (errmsg("laplace_attested: upward plan failed")));
-    ParamListInfo frontier_params = makeParamList(1);
-    frontier_params->params[0].ptype = idarr;
-    frontier_params->params[0].isnull = false;
-    frontier_params->params[0].pflags = 0;
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         size_t count = lp_idmap_count(front);
         lp_idmap *next = lp_idmap_new();
         lp_idmap *seen = lp_idmap_new();
-        /* Bound each GIN search and its parameter/cache memory. A parent can
-         * match several windows: decode it once against the WHOLE frontier,
-         * retaining all of its edges without counting its testimony twice. */
-        for (size_t begin = 0; begin < count; begin += window_ids) {
-            size_t amount = count - begin; if (amount > window_ids) amount = window_ids;
-            ArrayType *window = id_array_of(idelm, lp_idmap_keys(front) + begin, (int)amount);
-            frontier_params->params[0].value = PointerGetDatum(window);
-            PgUpward walk={&d,front,next,seen,classes,&vx,lvl};
-            lp_pg_stream(upward,frontier_params,pg_upward_row,&walk);
-            pfree(window);
-        }
+        PgUpward walk={&d,front,next,seen,classes,&vx,lvl};
+        lp_pg_lookup_containers(lp_idmap_keys(front),count,false,pg_upward_path,&walk);
         lp_idmap_free(seen);
         lp_idmap_free(front);
         front = next;
     }
-    SPI_freeplan(upward);
-    pfree(frontier_params);
     lp_idmap_free(front);
     lp_vec_free(&vx);
     lp_idmap_free(classes);
