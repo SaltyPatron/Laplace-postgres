@@ -176,6 +176,9 @@ partition scans to share it. One idle set is retained until transaction end,
 and replaced sets are freed when their last reader releases them. No rows or
 snapshot-dependent answers are cached. Regression checks actual transaction heap-scan counters, exact dense and
 lossy results, and large inputs with matching keys in pending lists.
+Cold installation registers the complete support-method list before creating
+indexes. A same-backend custom-schema regression prevents index initialization
+from caching an incomplete list and silently treating set matches as one key.
 
 Upward provenance retains the complete requested ID frontier but creates DAG
 nodes only for actual assertion edges. Missing or unasserted operands cannot
