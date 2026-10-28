@@ -44,6 +44,20 @@ BEGIN
   RAISE EXCEPTION 'installed set binding failed';
  END IF;
  INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
+ -- Exercise large-set GIN in the backend that created the indexes, before
+ -- reconnecting can hide an incomplete cached operator-class support list.
+ UPDATE "native tenant".physicality SET path="gis tenant".ST_SetPoint(path,0,
+   "gis tenant".ST_MakePoint(
+     "gis tenant".ST_X("gis tenant".ST_PointN(path,1)),
+     "gis tenant".ST_Y("gis tenant".ST_PointN(path,1)),
+     "gis tenant".ST_Z("gis tenant".ST_PointN(path,1)),
+     "gis tenant".ST_M("gis tenant".ST_PointN(path,1))+1073741824));
+ IF (SELECT count(*) FROM "native tenant".laplace_attested(
+       ARRAY["native tenant".laplace_cp_id(97)] ||
+       ARRAY(SELECT pg_catalog.md5(i::text)::"native tenant".blake3 FROM pg_catalog.generate_series(1,600) i))
+       WHERE trunk OPERATOR("native tenant".=) id AND games=1 AND witness)<>1 THEN
+  RAISE EXCEPTION 'same-backend cold install lost exact GIN set membership';
+ END IF;
  IF (SELECT count(*) FROM "native tenant".laplace_ordered_pair_counts(NULL,1,1,ARRAY[id]))<>1
     OR pg_catalog.cardinality("native tenant".laplace_separator_ids())<>85 THEN
   RAISE EXCEPTION 'installed ordered structure binding failed';
