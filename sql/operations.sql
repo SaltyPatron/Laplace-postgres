@@ -275,6 +275,10 @@ END $$;
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_merge_stage(entities regclass, paths regclass, OUT entity_rows bigint, OUT physicality_rows bigint, OUT updated_rows bigint) RETURNS record
     LANGUAGE plpgsql
+    -- Reuse the partition-pruned FK lookup plan across the COPY window.
+    -- PostgreSQL restores the caller's policy on return or exception; Native
+    -- partition-directed enrichment still requests its own custom plans.
+    SET plan_cache_mode = force_generic_plan
 
     AS $_$
 DECLARE e text; p text; plan_name text; classified text; invalid boolean;

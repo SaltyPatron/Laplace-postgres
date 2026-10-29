@@ -3,7 +3,19 @@
 \pset tuples_only on
 SET client_min_messages = warning;
 \ir geometry_cases.sql
+-- Wide, repeated paths exercise the allocation bound and deduplication while
+-- endpoints still follow occurrence order, rather than sorted membership.
+INSERT INTO geometry_cases
+SELECT 'wide-repeated',laplace_path(array_agg(laplace_cp_id(97+(i%8)) ORDER BY i)),
+       ARRAY(SELECT laplace_cp_id(k) FROM generate_series(97,104) k)
+FROM generate_series(0,4096) i;
 CREATE INDEX geometry_cases_gin ON geometry_cases USING gin(path laplace_path_ops);
+DO $$ BEGIN
+ BEGIN
+  INSERT INTO geometry_cases VALUES('invalid-xy',ST_GeomFromText('POINT(1 2)'),'{}'::blake3[]);
+  RAISE EXCEPTION 'GIN extraction accepted a geometry missing ZM';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 DO $$
 DECLARE r record; wanted blake3; sequential text[]; indexed text[]; plan json; expression text;
 BEGIN

@@ -163,7 +163,7 @@ Datum laplace_path_ewkb(PG_FUNCTION_ARGS){
 
 /* PostGIS owns its private serialization. Ask its qualified EWKB exporter once
  * per value, then use Native's validated reader for every geometry family. */
-static bytea *path_ewkb(Datum geometry){
+static bytea *path_export(Datum geometry){
     static Oid exporter;static uint64 generation;
     uint64 current=lp_pg_binding_generation();
     if (!OidIsValid(exporter) || generation!=current) {
@@ -172,7 +172,10 @@ static bytea *path_ewkb(Datum geometry){
         exporter = LookupFuncName(list_make2(makeString(get_namespace_name(schema)), makeString("st_asewkb")), 1, &type, false);
         generation=current;
     }
-    bytea *ewkb = DatumGetByteaP(OidFunctionCall1(exporter, geometry));
+    return DatumGetByteaP(OidFunctionCall1(exporter, geometry));
+}
+static bytea *path_ewkb(Datum geometry){
+    bytea *ewkb = path_export(geometry);
     if (!lp_ewkb_visit((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), NULL, NULL, NULL))
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: expected a complete ZM geometry")));
     return ewkb;
@@ -1063,12 +1066,37 @@ static bool bool_all(const bool *check, int32 n){ for (int i = 0; i < n; i++) if
 static bool bool_any(const bool *check, int32 n){ for (int i = 0; i < n; i++) if (check[i]) return true; return false; }
 
 PG_FUNCTION_INFO_V1(laplace_gin_extract_value);
+typedef struct { lp_id *ids; size_t count, capacity; PathEnds ends; } GinPathKeys;
+static bool gin_path_span(void *context, const lp_ewkb_span *span){
+    GinPathKeys *keys = context;
+    if (span->count > keys->capacity - keys->count) return false;
+    for (size_t i = 0; i < span->count; i++) {
+        double vertex[4]; lp_ewkb_vertex(span, i, vertex);
+        lp_id *id = keys->ids + keys->count++;
+        lp_xyz_to_id(vertex, id);
+        if (!keys->ends.found) { keys->ends.first = *id; keys->ends.found = true; }
+        keys->ends.last = *id;
+    }
+    return true;
+}
 Datum laplace_gin_extract_value(PG_FUNCTION_ARGS){
-    int32 *n = (int32 *)PG_GETARG_POINTER(1); bytea *ewkb = path_ewkb(PG_GETARG_DATUM(0)); int m; lp_id *k = path_keys(ewkb, &m);
-    PathEnds ends = path_ends(ewkb);
+    int32 *n = (int32 *)PG_GETARG_POINTER(1);
+    bytea *ewkb = path_export(PG_GETARG_DATUM(0));
+    /* Every admitted ZM vertex occupies 32 bytes. The serialized byte bound
+     * allocates once without a counting walk; Native validates the complete
+     * geometry while collecting membership and endpoints in source order. */
+    size_t capacity = VARSIZE_ANY_EXHDR(ewkb) / 32;
+    if (capacity > MaxAllocSize / sizeof(lp_id) || capacity > INT_MAX - 2)
+        ereport(ERROR, (errmsg("laplace: geometry has too many vertices")));
+    GinPathKeys keys = {.ids = palloc(sizeof(lp_id) * (capacity ? capacity : 1)), .capacity = capacity};
+    if (!lp_ewkb_visit((const uint8 *)VARDATA_ANY(ewkb), VARSIZE_ANY_EXHDR(ewkb), gin_path_span, &keys, NULL))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: expected a complete ZM geometry")));
+    int m = (int)lp_ids_unique(keys.ids, keys.count); lp_id *k = keys.ids;
+    PathEnds ends = keys.ends;
     Datum *d = palloc(sizeof(Datum) * (m + 2));
     for (int i = 0; i < m; i++) d[i] = path_key(&k[i], PATH_MEMBER);
     if (ends.found) { d[m++] = path_key(&ends.first, PATH_FIRST); d[m++] = path_key(&ends.last, PATH_LAST); }
+    pfree(keys.ids); pfree(ewkb);
     *n = m; PG_RETURN_POINTER(d);
 }
 PG_FUNCTION_INFO_V1(laplace_gin_extract_query);

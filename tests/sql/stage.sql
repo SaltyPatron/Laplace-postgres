@@ -167,4 +167,24 @@ DO $$ DECLARE result record; BEGIN
     RAISE EXCEPTION 'metadata-only update changed content or lost its new role';
   END IF;
 END $$;
+-- The bulk publisher owns its FK plan policy, never the caller's session.
+-- PostgreSQL must restore even an explicitly selected caller policy after
+-- successful publication and after a rejected identity payload.
+DO $$ DECLARE original text:=current_setting('plan_cache_mode'); policy text; BEGIN
+ FOREACH policy IN ARRAY ARRAY['auto','force_custom_plan','force_generic_plan'] LOOP
+  PERFORM set_config('plan_cache_mode',policy,true);
+  PERFORM pg_temp.fill_stage();
+  PERFORM laplace_merge_stage('stage.merge_entities','stage.merge_paths');
+  IF current_setting('plan_cache_mode')<>policy THEN RAISE EXCEPTION 'bulk publication leaked its plan policy'; END IF;
+  PERFORM pg_temp.fill_stage();
+  UPDATE stage.merge_entities SET hilbert=hilbert+1;
+  BEGIN
+   PERFORM laplace_merge_stage('stage.merge_entities','stage.merge_paths');
+   RAISE EXCEPTION 'bulk publication accepted conflicting identity';
+  EXCEPTION WHEN check_violation THEN NULL; END;
+  IF current_setting('plan_cache_mode')<>policy THEN RAISE EXCEPTION 'failed publication leaked its plan policy'; END IF;
+  TRUNCATE stage.merge_entities,stage.merge_paths;
+ END LOOP;
+ PERFORM set_config('plan_cache_mode',original,true);
+END $$;
 ROLLBACK;
