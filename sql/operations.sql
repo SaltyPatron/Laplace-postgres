@@ -1,4 +1,10 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_constituents(ids @extschema@.blake3[],
+    OUT entity @extschema@.blake3, OUT ordinal integer, OUT child @extschema@.blake3,
+    OUT run_length integer, OUT flags bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_constituents';
+
 -- A load owns its private relations through a session lock on the control
 -- connection. Catalog comments retain that ownership after a client crash;
 -- neither a timer nor a currently idle writer proves a load is abandoned.

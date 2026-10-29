@@ -52,6 +52,14 @@ BEGIN
   -- identity, coordinate and packed path is made by the Native operators.
   FOR i IN 1..70 LOOP deep:=pg_temp.series_node(ARRAY[deep,bang]); END LOOP;
   repeated:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[3]));
+  IF (SELECT array_agg(child ORDER BY ordinal) FROM laplace_constituents(ARRAY[laplace_id('dog'),laplace_id('dog')]))
+       IS DISTINCT FROM ARRAY[laplace_cp_id(100),laplace_cp_id(111),laplace_cp_id(103)]
+     OR (SELECT array_agg(child ORDER BY ordinal) FROM laplace_constituents(ARRAY[repeated]))
+       IS DISTINCT FROM ARRAY[laplace_id('dog')]
+     OR (SELECT run_length FROM laplace_constituents(ARRAY[repeated]))<>3
+     OR EXISTS(SELECT FROM laplace_constituents(ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'Native constituent read changed IDs, order, RLE runs or set membership';
+  END IF;
   SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_text_batch(ARRAY[lambda,deep,chinese,deep,repeated]);
   IF actual IS DISTINCT FROM ARRAY['λ',expected,'中',expected,'dogdogdog']
      OR laplace_text(deep)<>expected

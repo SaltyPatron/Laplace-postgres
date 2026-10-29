@@ -27,6 +27,7 @@ laplace_centroid4d_step	false
 laplace_claims	true
 laplace_claims_each	true
 laplace_claim_preview	false
+laplace_constituents	false
 laplace_clean_stage	true
 laplace_codepoint	false
 laplace_compose	false

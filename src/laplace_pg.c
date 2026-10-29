@@ -826,6 +826,32 @@ Datum laplace_paths(PG_FUNCTION_ARGS){
     pfree(ids);PG_RETURN_NULL();
 }
 
+/* Ordered packed constituents of a set, decoded by the owner of the Native
+ * carrier. Generic PostGIS/legacy mantissa decoders do not share this layout. */
+static void constituent_output_row(const lp_id *id,Datum path,Datum mask,void *context){
+    PathOutput *output=context;Geo geometry=geo_of(path);lp_path p=geometry.p;
+    if(p.n>PG_INT32_MAX)ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("too many packed constituents")));
+    for(size_t i=0;i<p.n;i++){
+        CHECK_FOR_INTERRUPTS();lp_id child=lp_path_id(p,i);double m;
+        memcpy(&m,p.v+i*4*sizeof(double)+3*sizeof(double),sizeof m);
+        Datum values[]={id_datum(id),Int32GetDatum((int32)i+1),id_datum(&child),
+            Int32GetDatum((int32)lp_path_run(p,i)),Int64GetDatum((int64)lp_m_bits(m))};
+        bool nulls[]={false,false,false,false,false};
+        set_put(output->call,output->rows,output->descriptor,values,nulls);
+    }
+}
+PG_FUNCTION_INFO_V1(laplace_constituents);
+Datum laplace_constituents(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_constituents",&descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);lp_idmap *unique=lp_idmap_new();
+    PG_TRY();{
+        for(int i=0;i<count;i++)lp_idmap_put(unique,ids+i,NULL);
+        PathOutput output={fcinfo,rows,descriptor};
+        lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),false,constituent_output_row,&output);
+    }PG_FINALLY();{lp_idmap_free(unique);}PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
+}
+
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
  * a run, and what follows the run in each, counted. A segment held by more than fan observations is a hub, reached and
