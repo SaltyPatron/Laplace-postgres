@@ -102,6 +102,10 @@ the ordinal to associate results with inputs. The active caller snapshot,
 parent/column privileges and RLS boundary apply. Clients never need partition
 names or extra connections for these reads.
 
+Partition bounds route keys, and PostgreSQL's tuple-conversion map projects
+child storage into the parent's declared columns. Renaming or reordering a
+partition's physical columns cannot change the returned ID, tier or carrier.
+
 Containment frontiers, explicit root/claim selections and series-carrier
 validation reuse that primary-key kernel. Only compact ID keys are sorted;
 Native visits their range indexes in ID order and consumes paths directly.
@@ -125,6 +129,16 @@ No planner setting or unknown SPI-array selectivity determines access.
 Parent/column ACLs, active RLS rejection, index validity and
 snapshot safety remain authoritative. Exact provenance rejects nonzero
 `gin_fuzzy_search_limit`; it cannot accept approximate index results.
+
+`laplace_containers(parts, bits)` uses that same GIN/primary-key owner for
+all-member reads, with mask filtering and original physicality carriers.
+Its GIN nominations use all requested keys. When an input spans several array
+windows, candidate paths are rechecked against the complete set before their
+IDs are merged. Duplicate keys retain set semantics. Unstored basis children
+use the zero floor, so a missing `entity` row cannot turn a tier comparison
+into NULL and hide a valid parent. The operator performs no SPI query and
+uses the caller's snapshot and access policy. Native ID maps are released on
+both successful reads and PostgreSQL errors.
 
 A 2026-10-27 read selected 10,000 claims from 20.3 million physicalities.
 The installed reader's first two frontiers each scanned all 256 physicality

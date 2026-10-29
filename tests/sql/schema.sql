@@ -48,6 +48,10 @@ BEGIN
     OR (SELECT count(*) FROM "native tenant".laplace_physicalities(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed stored-row namespace or ordinal binding failed';
  END IF;
+ IF (SELECT count(*) FROM "native tenant".laplace_containers(
+       ARRAY["native tenant".laplace_cp_id(97)],'{}'::smallint[]))<>1 THEN
+  RAISE EXCEPTION 'installed Native all-member binding lost its virtual basis';
+ END IF;
  INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
  -- Exercise large-set GIN in the backend that created the indexes, before
  -- reconnecting can hide an incomplete cached operator-class support list.

@@ -33,7 +33,7 @@ laplace_codepoint	false
 laplace_compose	false
 laplace_confidence	false
 laplace_contained_series	true
-laplace_containers	true
+laplace_containers	false
 laplace_coord_ewkb	false
 laplace_couple	true
 laplace_cp_coord_ewkb	false

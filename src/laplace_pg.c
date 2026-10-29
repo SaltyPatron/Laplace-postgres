@@ -3,7 +3,7 @@
  * Standard geometry types stay as they are; these functions add what Laplace needs next to what PostGIS provides.
  * They read PostGIS's serialized geometry directly (a LINESTRING ZM's vertices are 32-byte X, Y, Z, M blocks, the same
  * block a Laplace-Native path is), and call Laplace-Native for everything: every reading of a path, every map, every
- * centroid. What is here is only the fmgr glue and the set access through SPI.
+ * centroid. This module owns fmgr glue, Native indexed sets and coarse SPI bridges.
  *
  * An ID is a BLAKE3 hash, 128 bits. It has a type of its own, blake3: 16 fixed bytes, written as 32 hexadecimal
  * digits, ordered and compared as bytes. */
@@ -787,21 +787,6 @@ static Kept each_kept = { "laplace_claims_each",
     "WHERE p.tier > COALESCE(e.tier,CASE WHEN @extschema@.laplace_codepoint(u.id) IS NOT NULL THEN 0 END) "
     "AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] AND @extschema@.laplace_mask_has_all(p.mask, $3) AND NOT @extschema@.laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL, 0 };
 SET_FN(laplace_claims_each, each_kept)
-/* laplace_containers(parts): every path that holds all of the parts, claims and observations alike. A path holds its
- * direct constituents, so what holds the parts sits above the highest of them, at no fixed distance: every tier above
- * is read, by the IDs held. */
-static Kept containers_kept = { "laplace_containers",
-    "SELECT p.entity, p.path, p.tier, p.mask FROM @extschema@.physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1 AND p.mask OPERATOR(@extschema@.?&) $2", 2, NULL, 0 };
-/* With no bits asked for, the mask takes no part: "any of no bits" would send the index over every row. */
-static Kept containers_any_kept = { "laplace_containers",
-    "SELECT p.entity, p.path, p.tier, p.mask FROM @extschema@.physicality p "
-    "WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1", 1, NULL, 0 };
-PG_FUNCTION_INFO_V1(laplace_containers);
-Datum laplace_containers(PG_FUNCTION_ARGS){
-    ArrayType *bits = PG_GETARG_ARRAYTYPE_P(1);
-    set_run(fcinfo, ArrayGetNItems(ARR_NDIM(bits), ARR_DIMS(bits)) ? &containers_kept : &containers_any_kept); PG_RETURN_NULL();
-}
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by
  * the next vertex of that path: what fills the gap after it. */
 static Kept fills_kept = { "laplace_fills",

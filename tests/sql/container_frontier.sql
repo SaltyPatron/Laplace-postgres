@@ -36,6 +36,10 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  IF expected<2000 OR found<>expected OR (SELECT count(*) FROM public.laplace_attested(ARRAY[public.laplace_cp_id(65)]))<>expected THEN
   RAISE EXCEPTION 'dense GIN frontier lost true matches or admitted lossy false positives: %',found;
  END IF;
+ SELECT count(*) INTO found FROM public.laplace_containers(ARRAY[public.laplace_cp_id(65)],'{}'::smallint[]);
+ IF found<>expected THEN
+  RAISE EXCEPTION 'all-key container projection lost dense exact matches: %',found;
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';
@@ -63,6 +67,10 @@ DO $$ DECLARE before_scans bigint; after_scans bigint; found bigint; selected oi
  SELECT coalesce(sum(seq_scan),0) INTO before_scans FROM pg_stat_xact_all_tables WHERE relid=ANY(selected);
  SELECT count(*) INTO found FROM public.laplace_attested(ARRAY(
    SELECT public.laplace_cp_id(i) FROM generate_series(100000,100499) i));
+ IF EXISTS(SELECT FROM public.laplace_containers(ARRAY(
+   SELECT public.laplace_cp_id(i) FROM generate_series(100000,100499) i),'{}'::smallint[])) THEN
+  RAISE EXCEPTION 'sparse all-key projection admitted absent children';
+ END IF;
  SELECT coalesce(sum(seq_scan),0) INTO after_scans FROM pg_stat_xact_all_tables WHERE relid=ANY(selected);
  IF found<>0 OR after_scans<>before_scans THEN
   RAISE EXCEPTION 'sparse global selection scanned physicality heaps: rows %, scans %',found,after_scans-before_scans;
