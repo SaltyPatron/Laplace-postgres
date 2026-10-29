@@ -511,8 +511,19 @@ static void text_frontier_row(const lp_id *id,Datum path,Datum mask,void *contex
     bool tuple=(carrier&front->tuple)!=0,opaque=!tuple && (carrier&front->opaque)!=0;
     bool claim=(carrier&front->claim)!=0;
     bool inspect=claim && front->inspect && lp_idmap_find(front->inspect,id)>=0;
-    if(opaque && !inspect){TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;}
     Geo geometry=geo_of(path);lp_path p=geometry.p;
+    /* A row role is not an exclusive modality. The same scalar composition
+     * can also have been used as a record or claim (for example, "en").
+     * Its actual Unicode surface remains readable in every containing path. */
+    if(opaque && p.n){
+        bool scalar_text=true;
+        for(size_t i=0;i<p.n;i++){
+            lp_id child=lp_path_id(p,i);
+            if(lp_tier0_codepoint(lp_pg_tier0(),&child)<0){scalar_text=false;break;}
+        }
+        if(scalar_text)opaque=false;
+    }
+    if(opaque && !inspect){TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;}
     TChild *kid=MemoryContextAlloc(front->keep,sizeof(TChild)*(p.n?p.n:1));
     for(size_t i=0;i<p.n;i++){lp_id child=lp_path_id(p,i);kid[i]=(TChild){tnode(front->nodes,&child),lp_path_run(p,i)};}
     TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));

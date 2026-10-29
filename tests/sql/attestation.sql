@@ -68,6 +68,17 @@ BEGIN
                                   package::text,'00000000000000000000000000000000',expected] THEN
     RAISE EXCEPTION 'Native labels changed tuple structure, runs or selected identities';
   END IF;
+  -- Shared content can serve several contextual roles. None of those roles
+  -- may turn a scalar text surface, or its containing text, into an opaque id.
+  PERFORM pg_temp.series_node(ARRAY[laplace_cp_id(50),laplace_cp_id(53),laplace_cp_id(53)],'claim');
+  UPDATE physicality SET mask=mask | laplace_mask_slot('kind','record') | laplace_mask_slot('kind','file')
+    WHERE entity=laplace_id('255');
+  preview_joint:=pg_temp.series_node(ARRAY[laplace_id('255'),bang]);
+  SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_labels(ARRAY[laplace_id('255'),preview_joint]);
+  IF actual IS DISTINCT FROM ARRAY['255','255!']
+     OR (SELECT content FROM laplace_labels(ARRAY[package]))<>package::text THEN
+    RAISE EXCEPTION 'contextual row roles hid a shared Unicode surface or expanded opaque packaging';
+  END IF;
   preview_claim:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')],'claim');
   preview_joint:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[4]),'claim');
   preview_binary:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('noun')],'claim');
