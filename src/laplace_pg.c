@@ -764,32 +764,7 @@ Datum laplace_claim_preview(PG_FUNCTION_ARGS){
     pfree(ids);PG_RETURN_NULL();
 }
 
-/* ---------------------------------------------------------------- the web: what tugs back when a strand is pulled
- * A claim is content like any other, hashed over its parts. A tier is a floor: what holds an entity sits above it, at
- * whatever tier its own recipe composed it, so the claims that hold an entity are found by the ID they hold, among the
- * paths above the entity's tier (only the tiers at and below are pruned), that the consensus knows. */
-/* laplace_claims(parts, fan, bits, refuse): the claims holding every one of the parts, none refused, with the consensus
- * on each: at most fan of them, the first fan by ID (a LIMIT alone keeps whatever the scan met first, which differs
- * between two installs of the same content). A claim sits above its highest part, at no fixed distance: every tier above is read, by
- * the IDs held. */
-static Kept claims_kept = { "laplace_claims",
-    "SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity "
-    "WHERE p.tier > (SELECT max(COALESCE(e.tier,CASE WHEN @extschema@.laplace_codepoint(u.id) IS NOT NULL THEN 0 END)) "
-    "FROM pg_catalog.unnest($1) u(id) LEFT JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id) "
-    "AND p.path OPERATOR(@extschema@.@>) $1 AND p.mask OPERATOR(@extschema@.?&) $3 AND NOT @extschema@.laplace_middle_any(p.path, $4) ORDER BY p.entity LIMIT $2", 4, NULL, 0 };
-SET_FN(laplace_claims, claims_kept)
-/* laplace_claims_each(ids, fan, bits, refuse): for each of a set of entities, the claims holding it, none refused: one
- * call for a whole level of a walk. At most fan an entity, whichever the scan meets first: a caller asks for one more
- * than its fan and treats an entity that returns more than the fan as a hub, reached and never crossed, so what it
- * uses is every claim of the entity or none of them. i is the entity's place in the set. The entity is a rare key (an observation, a
- * claim), so the path alone is the index condition and the bits are a check on the rows found: the kind bit's posting
- * list is every claim. */
-static Kept each_kept = { "laplace_claims_each",
-    "SELECT u.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) LEFT JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
-    "CROSS JOIN LATERAL (SELECT p.entity, p.path, s.rating, s.deviation, s.volatility, s.matches FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity "
-    "WHERE p.tier > COALESCE(e.tier,CASE WHEN @extschema@.laplace_codepoint(u.id) IS NOT NULL THEN 0 END) "
-    "AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] AND @extschema@.laplace_mask_has_all(p.mask, $3) AND NOT @extschema@.laplace_middle_any(p.path, $4) LIMIT $2) c", 4, NULL, 0 };
-SET_FN(laplace_claims_each, each_kept)
+/* Claim set reads share the indexed Native owner in enrichment.c. */
 /* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by
  * the next vertex of that path: what fills the gap after it. */
 static Kept fills_kept = { "laplace_fills",

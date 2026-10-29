@@ -24,8 +24,8 @@ laplace_box4d_in	false
 laplace_box4d_out	false
 laplace_centroid4d_final	false
 laplace_centroid4d_step	false
-laplace_claims	true
-laplace_claims_each	true
+laplace_claims	false
+laplace_claims_each	false
 laplace_claim_preview	false
 laplace_constituents	false
 laplace_clean_stage	true

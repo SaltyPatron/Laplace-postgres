@@ -115,6 +115,13 @@ no arbitrary subset. A single work_mem-bounded spool holds tentative results,
 spilling through PostgreSQL when needed. No per-row or per-partition SPI is
 used, no extra connections are opened, and no planner settings are changed.
 
+`laplace_claims` and `laplace_claims_each` use that same GIN/primary-key kernel
+for scored responders. Native applies mask, middle-refusal and tier rules,
+reads consensus as an exact ID set, then elects responders in ID order.
+Qualification precedes the per-input fan; NULL fan returns the complete set.
+Duplicate input ordinals, compressed runs and 64-bit counts are preserved.
+The functions perform no SPI planning over the partitioned relations.
+
 Partition bounds route keys, and PostgreSQL's tuple-conversion map projects
 child storage into the parent's declared columns. Renaming or reordering a
 partition's physical columns cannot change the returned ID, tier or carrier.

@@ -59,8 +59,8 @@ static Oid enrichment_partition(Oid target, PartitionKey key, PartitionDesc part
 /* Shared indexed membership kernel for client frontiers and the final flat
  * overlap verification. Neither path reads coordinates to establish identity. */
 typedef void (*NativeKeyVisit)(TupleTableSlot *slot,const PresenceKey *key,void *context);
-static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,size_t count,
-                         NativeKeyVisit visit,void *context)
+static void indexed_keys_until(Relation parent,const char *column,PresenceKey *keys,size_t count,
+                               NativeKeyVisit visit,void *context,const bool *done)
 {
     Oid target=RelationGetRelid(parent);
     AttrNumber attribute=get_attnum(target,column);
@@ -72,7 +72,7 @@ static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,si
     for(size_t i=0;i<count;i++)keys[i].partition=enrichment_partition(target,key,partitions,PointerGetDatum(&keys[i].id));
     lp_sort(keys,(size_t)count,sizeof(*keys),presence_order);
     Oid native_id=get_atttype(target,attribute);
-    for(size_t begin=0;begin<count;){
+    for(size_t begin=0;begin<count && (!done || !*done);){
         CHECK_FOR_INTERRUPTS();size_t end=begin+1;
         while(end<count && keys[end].partition==keys[begin].partition)end++;
         /* The PostgreSQL array representation bounds one index search, not
@@ -97,7 +97,7 @@ static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,si
         IndexScanDesc scan=index_beginscan(table,index,GetActiveSnapshot(),NULL,1,0);
         index_rescan(scan,&scan_key,1,NULL,0);
         TupleTableSlot *slot=table_slot_create(table,NULL);size_t at=begin;
-        while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+        while((!done || !*done) && index_getnext_slot(scan,ForwardScanDirection,slot)){
             CHECK_FOR_INTERRUPTS();bool missing;
             Datum found=slot_getattr(slot,stored_attribute,&missing);
             if(missing)ereport(ERROR,(errmsg("Native ID reader: null primary ID")));
@@ -114,6 +114,11 @@ static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,si
         if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
         index_close(index,NoLock);table_close(table,NoLock);begin=end;
     }
+}
+static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,size_t count,
+                         NativeKeyVisit visit,void *context)
+{
+    indexed_keys_until(parent,column,keys,count,visit,context,NULL);
 }
 
 typedef struct { FunctionCallInfo fcinfo; Tuplestorestate *output; TupleDesc descriptor; } PresenceOutput;
@@ -389,6 +394,17 @@ typedef struct {
     PresenceOutput output;AttrNumber path,tier,mask;int floor;lp_mask bits;
     MemoryContext tuple_context;
 } ContainerOutput;
+static bool read_mask_bits(ArrayType *array,lp_mask *mask)
+{
+    Datum *bits;bool *missing;int count;bool possible=true;*mask=0;
+    deconstruct_array(array,INT2OID,2,true,TYPALIGN_SHORT,&bits,&missing,&count);
+    for(int i=0;i<count;i++){
+        if(missing[i])ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace: mask bit arrays cannot contain nulls")));
+        int bit=DatumGetInt16(bits[i]);
+        if(bit<0 || bit>=64)possible=false;else *mask|=UINT64_C(1)<<bit;
+    }
+    if(bits)pfree(bits);if(missing)pfree(missing);return possible;
+}
 static void container_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
     ContainerOutput *out=context;bool missing;
@@ -413,16 +429,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
     out.output.output=set_begin(fcinfo,"laplace_containers",&out.output.descriptor);
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
     if(!count){pfree(ids);PG_RETURN_NULL();}
-    Datum *bits;bool *missing;int nbits;
-    deconstruct_array(PG_GETARG_ARRAYTYPE_P(1),INT2OID,2,true,TYPALIGN_SHORT,&bits,&missing,&nbits);
-    bool impossible=false;
-    for(int i=0;i<nbits;i++){
-        if(missing[i])ereport(ERROR,(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),errmsg("laplace: mask bit arrays cannot contain nulls")));
-        int bit=DatumGetInt16(bits[i]);
-        if(bit<0 || bit>=64)impossible=true;else out.bits|=UINT64_C(1)<<bit;
-    }
-    if(bits)pfree(bits);if(missing)pfree(missing);
-    if(impossible){pfree(ids);PG_RETURN_NULL();}
+    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(1),&out.bits)){pfree(ids);PG_RETURN_NULL();}
     out.floor=frontier_tier(ids,count);
     const char *selected[]={"entity","path","tier","mask"},*column;Oid target=lp_pg_relation("physicality");
     Relation parent=read_parent(target,&column,selected,lengthof(selected));
@@ -548,6 +555,133 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
 }
 
 PG_FUNCTION_INFO_V1(laplace_present_ids);
+/* Claim selection is another projection of the same GIN/primary-key
+ * frontier. Qualification precedes the caller's fan: masks, middle refusals,
+ * tier and a real standing must all survive. ID order makes bounded results
+ * independent of heap order; per-input duplicates retain their ordinals. */
+typedef struct {uint64 epoch,sent;int head,floor;} ClaimKey;
+typedef struct {bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
+typedef struct {
+    PresenceOutput output;lp_idmap *wanted,*parents;lp_id *refuse;int nrefuse,*links;
+    bool each,done;uint64 limit,sent,saturated,epoch;int floor;lp_mask bits;
+    AttrNumber id,path,tier,mask,standing[4];MemoryContext tuple_context;
+} ClaimRead;
+static void claim_key_tier(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    ClaimRead *read=context;bool missing;
+    Datum value=slot_getattr(slot,read->tier,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native claim selector tier is null")));
+    ((ClaimKey *)lp_idmap_at(read->wanted,(size_t)key->ordinal-1))->floor=DatumGetInt16(value);
+}
+static bool claim_nominate(TupleTableSlot *slot,void *context)
+{
+    ClaimRead *read=context;bool missing;Datum value=slot_getattr(slot,read->mask,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native claim mask is null")));
+    if((lp_pg_mask_native(value)&read->bits)!=read->bits)return true;
+    value=slot_getattr(slot,read->tier,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native claim tier is null")));
+    int tier=DatumGetInt16(value);if(!read->each && tier<=read->floor)return true;
+    value=slot_getattr(slot,read->path,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native claim path is null")));
+    Geo path=geo_of(value);
+    if(lp_path_middle_any(path.p,read->refuse,(size_t)read->nrefuse))return true;
+    if(read->each){
+        bool eligible=false;
+        for(size_t i=0;i<path.p.n;i++){
+            lp_id id=lp_path_id(path.p,i);int64 at=lp_idmap_find(read->wanted,&id);
+            if(at>=0 && tier>((ClaimKey *)lp_idmap_at(read->wanted,(size_t)at))->floor){eligible=true;break;}
+        }
+        if(!eligible)return true;
+    }
+    value=slot_getattr(slot,read->id,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native claim identity is null")));
+    bool fresh;size_t at=lp_idmap_put(read->parents,(const lp_id *)DatumGetPointer(value),&fresh);
+    if(fresh)memset(lp_idmap_at(read->parents,at),0,sizeof(ClaimStanding));
+    return true;
+}
+static void claim_standing(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    ClaimRead *read=context;ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
+    Datum values[4];
+    for(int i=0;i<4;i++){bool missing;values[i]=slot_getattr(slot,read->standing[i],&missing);if(missing)ereport(ERROR,(errmsg("Native claim standing is null")));}
+    *standing=(ClaimStanding){true,DatumGetFloat8(values[0]),DatumGetFloat8(values[1]),DatumGetFloat8(values[2]),DatumGetInt64(values[3])};
+}
+static void claim_carrier(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    ClaimRead *read=context;const ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
+    MemoryContext previous=MemoryContextSwitchTo(read->tuple_context);bool missing;
+    Datum path=slot_getattr(slot,read->path,&missing);if(missing)ereport(ERROR,(errmsg("Native claim carrier is null")));
+    Datum values[]={0,PointerGetDatum(&key->id),path,Float8GetDatum(standing->rating),Float8GetDatum(standing->deviation),Float8GetDatum(standing->volatility),Int64GetDatum(standing->matches)};
+    bool nulls[lengthof(values)]={false};
+    if(!read->each){
+        set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values+1,nulls+1);
+        read->done=++read->sent>=read->limit;
+    }else{
+        Datum tier=slot_getattr(slot,read->tier,&missing);if(missing)ereport(ERROR,(errmsg("Native claim carrier tier is null")));
+        Geo geometry=geo_of(path);
+        if(++read->epoch==0){for(size_t i=0;i<lp_idmap_count(read->wanted);i++)((ClaimKey *)lp_idmap_at(read->wanted,i))->epoch=0;read->epoch=1;}
+        for(size_t i=0;i<geometry.p.n;i++){
+            lp_id id=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(read->wanted,&id);if(at<0)continue;
+            ClaimKey *part=lp_idmap_at(read->wanted,(size_t)at);
+            if(part->epoch==read->epoch || part->sent>=read->limit || DatumGetInt16(tier)<=part->floor)continue;
+            part->epoch=read->epoch;
+            for(int input=part->head;input>=0;input=read->links[input]){
+                values[0]=Int64GetDatum((int64)input+1);set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);
+            }
+            if(++part->sent==read->limit)read->saturated++;
+        }
+        read->done=read->saturated==lp_idmap_count(read->wanted);
+    }
+    MemoryContextSwitchTo(previous);MemoryContextReset(read->tuple_context);
+}
+static Datum read_claims(FunctionCallInfo fcinfo,bool each)
+{
+    ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX};
+    read.output.output=set_begin(fcinfo,each?"laplace_claims_each":"laplace_claims",&read.output.descriptor);
+    if(PG_ARGISNULL(0)||PG_ARGISNULL(2)||PG_ARGISNULL(3))return (Datum)0;
+    if(!PG_ARGISNULL(1)){
+        int64 limit=PG_GETARG_INT64(1);
+        if(limit<0)ereport(ERROR,(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),errmsg("Native claim fan must not be negative")));
+        read.limit=(uint64)limit;if(!limit)return (Datum)0;
+    }
+    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&read.bits))return (Datum)0;
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    read.refuse=ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
+    if(!count){pfree(ids);pfree(read.refuse);return (Datum)0;}
+    read.wanted=lp_idmap_sized(sizeof(ClaimKey));read.parents=lp_idmap_sized(sizeof(ClaimStanding));
+    read.links=palloc_extended((Size)count*sizeof(int),MCXT_ALLOC_HUGE);
+    PG_TRY();{
+        for(int i=count-1;i>=0;i--){bool fresh;size_t at=lp_idmap_put(read.wanted,ids+i,&fresh);ClaimKey *part=lp_idmap_at(read.wanted,at);
+            if(fresh){memset(part,0,sizeof(*part));part->head=-1;}read.links[i]=part->head;part->head=i;}
+        const char *column,*entity_columns[]={"id","tier"};Oid target=lp_pg_relation("entity");
+        Relation entities=read_parent(target,&column,entity_columns,lengthof(entity_columns));
+        size_t n=lp_idmap_count(read.wanted);PresenceKey *keys=palloc_extended(n*sizeof(*keys),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.wanted,i),.ordinal=(int64)i+1};
+        read.tier=get_attnum(target,"tier");indexed_keys(entities,column,keys,n,claim_key_tier,&read);
+        table_close(entities,NoLock);pfree(keys);
+        for(size_t i=0;i<n;i++)read.floor=Max(read.floor,((ClaimKey *)lp_idmap_at(read.wanted,i))->floor);
+        const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
+        Relation paths=read_parent(target,&column,path_columns,lengthof(path_columns));
+        read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
+        scan_container_rows(paths,column,read.wanted,each?3:7,NULL,claim_nominate,&read);
+        n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
+        const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
+        Relation standings=read_parent(target,&column,standing_columns,lengthof(standing_columns));
+        for(int i=0;i<4;i++)read.standing[i]=get_attnum(target,standing_columns[i+1]);
+        indexed_keys(standings,column,keys,n,claim_standing,&read);table_close(standings,NoLock);
+        size_t known=0;for(size_t i=0;i<n;i++)if(((ClaimStanding *)lp_idmap_at(read.parents,(size_t)keys[i].ordinal-1))->known)keys[known++]=keys[i];
+        read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
+        indexed_keys_until(paths,"entity",keys,known,claim_carrier,&read,&read.done);
+        MemoryContextDelete(read.tuple_context);pfree(keys);table_close(paths,NoLock);
+    }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.parents);}PG_END_TRY();
+    pfree(ids);pfree(read.refuse);pfree(read.links);return (Datum)0;
+}
+PG_FUNCTION_INFO_V1(laplace_claims);
+Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}
+PG_FUNCTION_INFO_V1(laplace_claims_each);
+Datum laplace_claims_each(PG_FUNCTION_ARGS){return read_claims(fcinfo,true);}
+
 static void present_bitmap_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
     ((bool *)context)[key->ordinal-1]=true;
