@@ -261,6 +261,46 @@ BEGIN
 END $$;
 -- Private computation shares the real Native solver without publishing an
 -- unregistered source or retaining a consensus bucket lock during streaming.
+SAVEPOINT private_observation_windows;
+CREATE UNLOGGED TABLE stage.window_totals (
+  LIKE stage.attestation_test INCLUDING DEFAULTS,
+  wins double precision NOT NULL,
+  UNIQUE NULLS NOT DISTINCT (claim,witness,lineage),
+  CHECK(games>0 AND games<=9007199254740992 AND wins>=0 AND wins<=games)
+);
+CREATE UNLOGGED TABLE stage.window_delta (LIKE stage.window_totals INCLUDING DEFAULTS);
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        w blake3 := (SELECT id FROM series_sources WHERE name='one');
+        ancestry blake3 := (SELECT id FROM series_sources WHERE name='two');
+        before_rows text; before_locks bigint;
+BEGIN
+  SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) INTO before_rows FROM consensus c;
+  SELECT count(*) INTO before_locks FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory';
+  INSERT INTO stage.window_delta VALUES(a,w,NULL,3,0,0.85,1.5),(a,w,ancestry,1,0,0.4,1);
+  IF laplace_accumulate_series('stage.window_totals','stage.window_delta')<>2 THEN
+    RAISE EXCEPTION 'private observations did not admit each dependence scope';
+  END IF;
+  TRUNCATE stage.window_delta;
+  INSERT INTO stage.window_delta VALUES(a,w,NULL,4,0,0.85,2);
+  PERFORM laplace_accumulate_series('stage.window_totals','stage.window_delta');
+  IF (SELECT count(*) FROM stage.window_totals)<>2
+     OR NOT EXISTS(SELECT FROM stage.window_totals WHERE lineage IS NULL AND games=7 AND wins=3.5 AND score=0.5)
+     OR NOT EXISTS(SELECT FROM stage.window_totals WHERE lineage IS NOT NULL AND games=1 AND wins=1 AND score=1)
+     OR before_rows IS DISTINCT FROM (SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) FROM consensus c)
+     OR before_locks<>(SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory') THEN
+    RAISE EXCEPTION 'private windows changed carried totals, public standings or consensus locks';
+  END IF;
+  BEGIN
+    PERFORM laplace_accumulate_series('public.consensus','stage.window_delta');
+    RAISE EXCEPTION 'private accumulator accepted public state';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_accumulate_series('stage.window_totals','stage.window_totals');
+    RAISE EXCEPTION 'private accumulator accepted its own output as input';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
+ROLLBACK TO private_observation_windows;
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
         b blake3 := (SELECT id FROM series_claims WHERE name = 'b');

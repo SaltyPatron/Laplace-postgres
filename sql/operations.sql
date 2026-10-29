@@ -71,6 +71,34 @@ BEGIN
   END LOOP;
 END $$;
 
+-- Additive observations belong to the private load. No public standing or
+-- consensus bucket lock is touched before its canonical witness is registered.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_accumulate_series(pending regclass, delta regclass) RETURNS bigint
+    LANGUAGE plpgsql
+    AS $$
+DECLARE accumulated text; incoming text; affected bigint;
+BEGIN
+  SELECT format('%I.%I',n.nspname,c.relname) INTO accumulated
+  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.oid=pending AND n.nspname='stage' AND c.relpersistence='u' AND c.relkind='r';
+  SELECT format('%I.%I',n.nspname,c.relname) INTO incoming
+  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.oid=delta AND n.nspname='stage' AND c.relpersistence='u' AND c.relkind='r';
+  IF accumulated IS NULL OR incoming IS NULL OR pending=delta THEN
+    RAISE EXCEPTION 'laplace_accumulate_series requires distinct UNLOGGED stage tables' USING ERRCODE='22023';
+  END IF;
+  -- Preserve the carried numerator across windows. Reconstructing it from a
+  -- rounded mean on each update would make results depend on batch boundaries.
+  EXECUTE format('WITH applied AS (
+    INSERT INTO %1$s AS p (claim,witness,lineage,games,score,trust,wins)
+    SELECT claim,witness,lineage,games,wins/games,trust,wins FROM %2$s
+    ON CONFLICT (claim,witness,lineage) DO UPDATE
+      SET games=p.games+excluded.games,wins=p.wins+excluded.wins,
+          score=(p.wins+excluded.wins)/(p.games+excluded.games),trust=excluded.trust
+    RETURNING claim) SELECT count(*) FROM applied',accumulated,incoming) INTO affected;
+  RETURN affected;
+END $$;
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_apply_series(pending regclass, delta regclass) RETURNS bigint
     LANGUAGE plpgsql
 
