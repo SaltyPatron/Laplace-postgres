@@ -477,6 +477,66 @@ BEGIN
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF result IS DISTINCT FROM (SELECT s FROM series_folded s) THEN RAISE EXCEPTION 'containment handoff changed the standing'; END IF;
 END $$;
+-- Royalties use the standing solver's actual profile curvature. Source
+-- counts and records remain testimony even when reliability supplies no information.
+SAVEPOINT fisher_attribution;
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        b blake3 := (SELECT id FROM series_claims WHERE name='b');
+        one_root blake3 := (SELECT id FROM series_sources WHERE name='one');
+        two_root blake3 := (SELECT id FROM series_sources WHERE name='two');
+        three_root blake3 := (SELECT id FROM series_sources WHERE name='three');
+        standing record; actual double precision; expected double precision; shares jsonb;
+BEGIN
+  SELECT * INTO standing FROM laplace_series(ARRAY[one_root,two_root,one_root],
+    ARRAY[1000,1000,1000]::bigint[],ARRAY[1,1,1]::float8[],ARRAY[0.85,0.85,0.85]::float8[]);
+  expected := (173.7178/standing.deviation)^2-1/((350/173.7178)^2+standing.volatility^2);
+  SELECT sum(fisher_weight) INTO actual FROM laplace_source_attribution(ARRAY[a]);
+  IF abs(actual-expected)>1e-10 OR actual<=0 THEN
+    RAISE EXCEPTION 'attribution and standing posterior precision differ: % vs %',actual,expected;
+  END IF;
+  IF (SELECT sum(share_bp) FROM laplace_source_attribution(ARRAY[a,b,a]))<>10000
+     OR EXISTS(SELECT FROM laplace_source_attribution(ARRAY[a,b]) WHERE claims_touched<>2 OR games<>1003)
+     OR EXISTS((SELECT * FROM laplace_source_attribution(ARRAY[b,a,a]) EXCEPT ALL SELECT * FROM laplace_source_attribution(ARRAY[a,b]))
+       UNION ALL (SELECT * FROM laplace_source_attribution(ARRAY[a,b]) EXCEPT ALL SELECT * FROM laplace_source_attribution(ARRAY[b,a,a])))
+     OR (SELECT share_bp FROM laplace_source_attribution(ARRAY[a]) WHERE source_id=two_root)
+       < 1.8*(SELECT share_bp FROM laplace_source_attribution(ARRAY[a]) WHERE source_id=one_root) THEN
+    RAISE EXCEPTION 'shared lineage inflated precision, duplicated claims, or changed exact settlement';
+  END IF;
+  SELECT * INTO standing FROM laplace_series(ARRAY[two_root],ARRAY[1000]::bigint[],ARRAY[1]::float8[],ARRAY[0.85]::float8[]);
+  IF NOT EXISTS(SELECT FROM laplace_source_standings(ARRAY[a,a],ARRAY[two_root])
+      WHERE claim=a AND float8send(rating)=float8send(standing.rating)
+        AND float8send(deviation)=float8send(standing.deviation)
+        AND float8send(volatility)=float8send(standing.volatility) AND matches=1000)
+     OR (SELECT count(*) FROM laplace_source_standings(ARRAY[a,a],ARRAY[two_root]))<>1
+     OR EXISTS(SELECT FROM laplace_source_standings(ARRAY[a],ARRAY[laplace_id('absent scope')])) THEN
+    RAISE EXCEPTION 'typed source standings changed Native solving, missing scope or claim-set membership';
+  END IF;
+  expected := (173.7178/standing.deviation)^2-1/((350/173.7178)^2+standing.volatility^2);
+  IF (SELECT count(*) FROM laplace_source_attribution(ARRAY[a],ARRAY[two_root,two_root])
+        WHERE source_id=two_root AND share_bp=10000 AND abs(fisher_weight-expected)<1e-10)<>1
+     OR EXISTS(SELECT FROM laplace_source_attribution(ARRAY[a],ARRAY[laplace_id('absent scope')]))
+     OR EXISTS(SELECT FROM laplace_source_attribution(ARRAY[]::blake3[])) THEN
+    RAISE EXCEPTION 'source scope was applied after solving, or empty/missing selection acquired evidence';
+  END IF;
+  SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) INTO shares FROM laplace_source_attribution(ARRAY[a]) r;
+  UPDATE witness SET trust=-0.85;
+  IF (SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) FROM laplace_source_attribution(ARRAY[a]) r) IS DISTINCT FROM shares THEN
+    RAISE EXCEPTION 'signed trust lost attribution or changed symmetric information';
+  END IF;
+  UPDATE witness SET trust=0;
+  IF (SELECT count(*) FROM laplace_source_attribution(ARRAY[a]) WHERE share_bp=0 AND fisher_weight=0 AND games=1000)<>3
+     OR (SELECT count(*) FROM laplace_attribution(ARRAY[a]) WHERE share_bp=0 AND games=1000)<>3 THEN
+    RAISE EXCEPTION 'uninformative sources lost testimony or acquired royalties';
+  END IF;
+  UPDATE witness SET lineage=CASE WHEN id=one_root THEN two_root WHEN id=two_root THEN one_root ELSE lineage END;
+  BEGIN
+    PERFORM laplace_source_attribution(ARRAY[a]);
+    RAISE EXCEPTION 'attribution accepted cyclic lineage';
+  EXCEPTION WHEN null_value_not_allowed THEN NULL; END;
+END $$;
+ROLLBACK TO fisher_attribution;
+RELEASE fisher_attribution;
 -- Two-hop lineage, then a cycle: transitive copies fold; cycles fail atomically.
 UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE id = (SELECT id FROM series_sources WHERE name = 'two');
 UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE id = (SELECT id FROM series_sources WHERE name = 'three');

@@ -37,6 +37,10 @@ void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit
  * indexes retain ascending ID order without sorting geometry in SQL. */
 typedef void (*lp_pg_path_visit)(const lp_id *id,Datum path,Datum mask,void *context);
 void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context);
+/* Witness metadata uses the same snapshot/ACL/primary-index owner. A missing
+ * lineage is NULL; missing witness IDs produce no callback. */
+typedef void (*lp_pg_witness_visit)(const lp_id *id,const lp_id *lineage,double trust,void *context);
+void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_witness_visit visit,void *context);
 /* Complete direct-container frontier through canonical GIN indexes, with
  * PostgreSQL bitmap visibility/lossy rechecks and ascending parent-ID visits. */
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context);

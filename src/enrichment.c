@@ -65,10 +65,10 @@ static void indexed_keys_until(Relation parent,const char *column,PresenceKey *k
     Oid target=RelationGetRelid(parent);
     AttrNumber attribute=get_attnum(target,column);
     PartitionKey key=RelationGetPartitionKey(parent);
-    if(!key || key->strategy!=PARTITION_STRATEGY_RANGE || key->partnatts!=1
-        || key->partattrs[0]!=attribute)
+    if((key && (key->strategy!=PARTITION_STRATEGY_RANGE || key->partnatts!=1
+        || key->partattrs[0]!=attribute)) || (!key && parent->rd_rel->relkind!=RELKIND_RELATION))
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native presence requires canonical ID range partitions")));
-    PartitionDesc partitions=RelationGetPartitionDesc(parent,true);
+    PartitionDesc partitions=key?RelationGetPartitionDesc(parent,true):NULL;
     for(size_t i=0;i<count;i++)keys[i].partition=enrichment_partition(target,key,partitions,PointerGetDatum(&keys[i].id));
     lp_sort(keys,(size_t)count,sizeof(*keys),presence_order);
     Oid native_id=get_atttype(target,attribute);
@@ -84,7 +84,7 @@ static void indexed_keys_until(Relation parent,const char *column,PresenceKey *k
         TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
         TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
         Oid primary=RelationGetPrimaryKeyIndex(table,false);
-        if(!OidIsValid(primary))ereport(ERROR,(errmsg("Native ID reader: partition has no primary index")));
+        if(!OidIsValid(primary))ereport(ERROR,(errmsg("Native ID reader: relation has no primary index")));
         Relation index=index_open(primary,AccessShareLock);
         Datum *values=palloc((Size)(end-begin)*sizeof(Datum));
         for(size_t i=begin;i<end;i++)values[i-begin]=PointerGetDatum(&keys[i].id);
@@ -140,7 +140,8 @@ static Relation read_parent(Oid target,const char **column,const char *const *se
     Oid schema=lp_pg_schema();
     bool paths=target==get_relname_relid("physicality",schema);
     bool standings=target==get_relname_relid("consensus",schema);
-    if(!paths && !standings && target!=get_relname_relid("entity",schema))
+    bool witness=target==get_relname_relid("witness",schema);
+    if(!paths && !standings && !witness && target!=get_relname_relid("entity",schema))
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native ID target must be an installed canonical relation")));
     *column=paths?"entity":standings?"claim":"id";
     Relation parent=table_open(target,AccessShareLock);
@@ -230,6 +231,30 @@ void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visi
         AllocSetContextCreate(CurrentMemoryContext,"Native path frontier tuple",ALLOCSET_DEFAULT_SIZES)};
     indexed_keys(parent,column,keys,count,path_frontier_visit,&front);
     MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
+}
+
+typedef struct {lp_pg_witness_visit visit;void *context;AttrNumber lineage,trust;} WitnessFrontier;
+static void witness_frontier_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    WitnessFrontier *front=context;bool lineage_null=true,trust_null;
+    Datum lineage=front->lineage>0?slot_getattr(slot,front->lineage,&lineage_null):(Datum)0;
+    Datum trust=slot_getattr(slot,front->trust,&trust_null);
+    if(trust_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native witness frontier: null trust")));
+    front->visit(&key->id,lineage_null?NULL:(const lp_id *)DatumGetPointer(lineage),DatumGetFloat8(trust),front->context);
+}
+void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_witness_visit visit,void *context)
+{
+    if(!count)return;
+    Oid target=lp_pg_relation("witness");const char *column;const char *selected[]={"id","trust","lineage"};
+    Relation parent=read_parent(target,&column,selected,lineage?3:2);
+    WitnessFrontier front={visit,context,lineage?get_attnum(target,"lineage"):InvalidAttrNumber,get_attnum(target,"trust")};
+    size_t window=frontier_window_ids();
+    for(size_t at=0;at<count;){
+        size_t amount=Min(window,count-at);PresenceKey *keys=palloc(amount*sizeof *keys);
+        for(size_t i=0;i<amount;i++)keys[i]=(PresenceKey){.id=ids[at+i],.ordinal=(int64)(at+i)+1};
+        indexed_keys(parent,column,keys,amount,witness_frontier_visit,&front);pfree(keys);at+=amount;
+    }
+    table_close(parent,NoLock);
 }
 
 /* GIN is the retained containment access contract, just as the primary index

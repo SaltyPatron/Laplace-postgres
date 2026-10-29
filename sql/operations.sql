@@ -1,4 +1,20 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_source_standings(claims @extschema@.blake3[],
+    scope @extschema@.blake3[] DEFAULT '{}', OUT claim @extschema@.blake3,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_source_standings';
+COMMENT ON FUNCTION @extschema@.laplace_source_standings(@extschema@.blake3[],@extschema@.blake3[])
+    IS 'Solve distinct selected claim standings from actual containment testimony and registered/explicit dependence roots. Empty scope selects all sources. A source scope is a typed input applied before solving, without session state or shadow tables.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_source_attribution(claims @extschema@.blake3[],
+    scope @extschema@.blake3[] DEFAULT '{}', OUT source_id @extschema@.blake3,
+    OUT claims_touched bigint, OUT games bigint, OUT fisher_weight double precision,
+    OUT share_bp integer) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_source_attribution';
+COMMENT ON FUNCTION @extschema@.laplace_source_attribution(@extschema@.blake3[],@extschema@.blake3[])
+    IS 'Source royalties across distinct selected claims, from the same rooted posterior as standings. Empty scope selects all witnesses; otherwise scope is applied before solving. Dependence-root information saturates and is distributed by actual root observations. Positive information totals exactly 10000 basis points, with source-ID ties; zero information receives zero shares.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[],
     required @extschema@.blake3[] DEFAULT '{}', per_part boolean DEFAULT false,
     floor smallint DEFAULT -1, cap bigint DEFAULT -1, kinds smallint DEFAULT 3,
