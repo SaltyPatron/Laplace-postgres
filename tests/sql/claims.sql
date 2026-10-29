@@ -37,6 +37,30 @@ BEGIN
  OR EXISTS(SELECT FROM laplace_claims(ARRAY[a,b],NULL,ARRAY[63::smallint],'{}')) THEN
   RAISE EXCEPTION 'Native middle/RLE refusal or mask qualification occurred after fan';
  END IF;
+ -- Directed readers must qualify each input endpoint, not merely the parent
+ -- nominated for a different input or a middle occurrence.
+ IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint))<>8
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint) WHERE i NOT IN(1,3))
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',2::smallint))<>4
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',2::smallint) WHERE i<>4)
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint))<>12
+ OR (SELECT count(*) FROM laplace_claims_each(keys,1,bits,'{}',1::smallint))<>2
+ OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[c],NULL,bits,'{}',3::smallint))
+ OR (SELECT count(*) FROM laplace_claims_each(ARRAY[c],NULL,bits,'{}',0::smallint))<>1
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',NULL::smallint)) THEN
+  RAISE EXCEPTION 'Native endpoint selection lost ordinals, fan, direction or confused middle membership';
+ END IF;
+ IF EXISTS((SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}')
+            EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint))
+           UNION ALL (SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint)
+            EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}'))) THEN
+  RAISE EXCEPTION 'Native directed overload changed complete membership results';
+ END IF;
+ BEGIN
+  PERFORM * FROM laplace_claims_each(keys,NULL,bits,'{}',4::smallint);
+  RAISE EXCEPTION 'invalid endpoint was accepted';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL;
+ END;
  IF EXISTS(SELECT FROM laplace_claims('{}'::blake3[],NULL,bits,'{}'))
  OR EXISTS(SELECT FROM laplace_claims_each(NULL,NULL,bits,'{}'))
  OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,NULL,'{}')) THEN

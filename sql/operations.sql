@@ -1,4 +1,13 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
+    fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
+    OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 1024 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_claims_each';
+COMMENT ON FUNCTION @extschema@.laplace_claims_each(@extschema@.blake3[],bigint,smallint[],@extschema@.blake3[],smallint)
+    IS 'Native scored claims per input occurrence. endpoint: 0 any position, 1 first, 2 last, 3 either. Directed probes use existing GIN first/last postings with exact lossy rechecks; masks, refusals, tier and standing qualify before fan. No index rebuild is needed.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_source_standings(claims @extschema@.blake3[],
     scope @extschema@.blake3[] DEFAULT '{}', OUT claim @extschema@.blake3,
     OUT rating double precision, OUT deviation double precision, OUT volatility double precision,

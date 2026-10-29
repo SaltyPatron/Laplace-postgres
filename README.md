@@ -321,3 +321,12 @@ destinations. `LAPLACE_PG_MODULE_PATHNAME` selects its installed module binding;
 the default remains `$libdir/laplace`. The monorepo builds and installs this
 canonical target with its consumers, including the generated baseline and
 upgrade scripts. It does not depend on a separately installed extension version.
+
+The five-argument `laplace_claims_each(ids, fan, bits, refuse, endpoint)` adds
+first (`1`), last (`2`), or either (`3`) endpoint selection; `0` preserves the
+four-argument membership behavior. Both signatures share one Native reader.
+Endpoint selection unions existing GIN first/last postings in bounded windows,
+then qualifies masks, tier, refusal and actual standings before the per-input
+fan. Duplicate request ordinals and exact lossy bitmap rechecks are preserved.
+The 1.49 baseline and direct development update add this operation without
+rewriting data or rebuilding indexes.

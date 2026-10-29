@@ -45,6 +45,14 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  OR (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)],'{}',true,-1::smallint,expected-1) WHERE hub)<>1 THEN
   RAISE EXCEPTION 'holder projection lost dense exact matches or cap classification';
  END IF;
+ -- Reuse the same deliberately lossy heap for directed scored claim access.
+ INSERT INTO public.consensus(claim,rating,deviation,volatility,matches)
+ SELECT id,1550,60,0.06,1 FROM dense_expected;
+ IF (SELECT count(*) FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65),public.laplace_cp_id(65)],NULL,'{}','{}',1::smallint))<>2*expected
+ OR EXISTS(SELECT FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,'{}','{}',2::smallint))
+ OR (SELECT count(*) FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,'{}','{}',3::smallint))<>expected THEN
+  RAISE EXCEPTION 'directed claims lost dense endpoint matches or admitted lossy false positives';
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';
