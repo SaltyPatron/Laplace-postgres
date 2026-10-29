@@ -22,8 +22,8 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38/1.39/1.40-to-1.41 development
-transitions from one update template. The three installable scripts are generated under the build's
+CMake includes it in both the baseline and the in-place 1.38–1.41-to-1.42 development
+transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
 `CREATE EXTENSION laplace SCHEMA chosen_schema` binds the native substrate to
@@ -33,6 +33,16 @@ and plans after catalog changes. Ordinary functions do not set `search_path`.
 Parsed SQL adapters bind references at definition time. A dedicated database
 may use `public`; installation alongside unrelated tables uses a chosen schema.
 Functional API schemas remain separate from the storage namespace.
+
+Private ingestion tables carry a load ownership marker installed by
+`laplace_stage_own(token, tables)`, using the `lp_<purpose>_<token>[_<lane>]`
+private-table convention. The token identifies the load operation; it is not
+a content or witness identity. The owning control connection retains a
+PostgreSQL session advisory lock across COPY transactions. A new ingest or
+`laplace-ops clean` calls `laplace_stage_retire()` to reclaim marked tables only
+after that connection exits. Idle live loads remain protected, and unmarked
+staging tables are preserved. Table creation and ownership registration commit
+together; normal successful publication removes the tables in its transaction.
 
 `CREATE EXTENSION laplace` makes the four tables (`entity`, `physicality`, `witness`, `consensus`), their partitions, their indexes and the lookups, as PostGIS makes `spatial_ref_sys`; their data goes with a dump. `physicality.mask` holds what a row is and the types it holds, indexed with the path's constituents in one GIN (`laplace_path_ops`, `laplace_mask_ops`). The highway (`laplace.highway`) gives a type's slot, bit and mappings in place. `laplace_schema_indexes()` makes every index again if one was dropped.
 

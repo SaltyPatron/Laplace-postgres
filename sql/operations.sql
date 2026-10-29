@@ -1,4 +1,70 @@
 -- Current operation definitions, shared by cold install and development update.
+-- A load owns its private relations through a session lock on the control
+-- connection. Catalog comments retain that ownership after a client crash;
+-- neither a timer nor a currently idle writer proves a load is abandoned.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_own(load_token bigint, objects regclass[]) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE object record; owner_pid integer := pg_backend_pid();
+BEGIN
+  IF load_token IS NULL OR load_token<=0 OR cardinality(objects)=0 OR objects IS NULL OR EXISTS (
+    SELECT FROM unnest(objects) supplied(id)
+    LEFT JOIN pg_class c ON c.oid=supplied.id
+    LEFT JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE c.oid IS NULL OR n.nspname<>'stage' OR c.relkind<>'r' OR c.relpersistence<>'u'
+      OR NOT pg_has_role(c.relowner,'USAGE')
+      OR c.relname !~ ('^lp_[a-z][a-z0-9_]*_' || load_token || '(_[0-9]+)?$')
+      OR obj_description(c.oid,'pg_class') IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'laplace_stage_own requires unclaimed private load tables owned by the caller' USING ERRCODE='22023';
+  END IF;
+  PERFORM pg_advisory_lock(1279348804,owner_pid);
+  BEGIN
+    FOR object IN SELECT DISTINCT c.oid,c.relname FROM unnest(objects) supplied(id)
+      JOIN pg_class c ON c.oid=supplied.id ORDER BY c.oid
+    LOOP
+      EXECUTE format('COMMENT ON TABLE stage.%I IS %L',object.relname,
+        format('laplace:stage-load:1:%s:%s',owner_pid,load_token));
+    END LOOP;
+  EXCEPTION WHEN OTHERS THEN
+    PERFORM pg_advisory_unlock(1279348804,owner_pid);
+    RAISE;
+  END;
+END $$;
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_retire()
+    RETURNS TABLE (load_token bigint, relations bigint, allocated_bytes bigint)
+    LANGUAGE plpgsql
+    AS $$
+DECLARE abandoned record; targets text; owner_pid integer;
+BEGIN
+  FOR abandoned IN
+    SELECT DISTINCT description FROM pg_description d JOIN pg_class c ON c.oid=d.objoid
+    JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE d.classoid='pg_class'::regclass AND d.objsubid=0 AND n.nspname='stage'
+      AND c.relkind='r' AND c.relpersistence='u' AND pg_has_role(c.relowner,'USAGE')
+      AND d.description ~ '^laplace:stage-load:1:[1-9][0-9]*:[1-9][0-9]*$'
+    ORDER BY description
+  LOOP
+    owner_pid := split_part(abandoned.description,':',4)::integer;
+    load_token := split_part(abandoned.description,':',5)::bigint;
+    -- PostgreSQL session locks survive transaction boundaries and disappear
+    -- on disconnect. Skip our own owner too: advisory locks are reentrant.
+    IF owner_pid=pg_backend_pid() OR NOT pg_try_advisory_xact_lock(1279348804,owner_pid) THEN CONTINUE; END IF;
+    SELECT string_agg(format('stage.%I',c.relname),',' ORDER BY c.oid),count(*),sum(pg_total_relation_size(c.oid))
+      INTO targets,relations,allocated_bytes
+    FROM pg_description d JOIN pg_class c ON c.oid=d.objoid JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE d.classoid='pg_class'::regclass AND d.objsubid=0 AND d.description=abandoned.description
+      AND n.nspname='stage' AND c.relkind='r' AND c.relpersistence='u' AND pg_has_role(c.relowner,'USAGE')
+      AND c.relname ~ ('^lp_[a-z][a-z0-9_]*_' || load_token || '(_[0-9]+)?$');
+    IF targets IS NOT NULL THEN
+      -- No CASCADE: an unexpected dependency preserves the whole transaction.
+      EXECUTE 'DROP TABLE ' || targets;
+      RETURN NEXT;
+    END IF;
+  END LOOP;
+END $$;
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_apply_series(pending regclass, delta regclass) RETURNS bigint
     LANGUAGE plpgsql
 
