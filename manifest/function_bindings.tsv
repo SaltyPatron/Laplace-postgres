@@ -98,6 +98,8 @@ laplace_path4d_gist_union	false
 laplace_path4d_key_in	false
 laplace_path4d_key_out	false
 laplace_paths	false
+laplace_entities	false
+laplace_physicalities	false
 laplace_point4d_distance	false
 laplace_point4d_gist_compress	false
 laplace_point4d_gist_consistent	false

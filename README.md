@@ -22,7 +22,7 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.43-to-1.44 development
+CMake includes it in both the baseline and the in-place 1.38–1.44-to-1.45 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -91,6 +91,16 @@ primary-key indexes, returning stored IDs and their original ordinals,
 including duplicate input occurrences. It checks parent-column SELECT
 permissions and rejects active row-level security. Virtual Tier-0 membership
 remains the client's perf-cache responsibility.
+
+`laplace_entities(ids)` and `laplace_physicalities(ids)` project complete stored
+rows through this same primary-key kernel. They return one row per stored input
+occurrence with its one-based request ordinal; missing IDs have no row. Empty
+requests return no rows and NULL members are rejected. Entity rows retain tier,
+coordinate, Hilbert address and mask; physicality rows retain tier, Hilbert
+address, the exact ordered/RLE carrier and mask. Row order is unspecified: use
+the ordinal to associate results with inputs. The active caller snapshot,
+parent/column privileges and RLS boundary apply. Clients never need partition
+names or extra connections for these reads.
 
 Containment frontiers, explicit root/claim selections and series-carrier
 validation reuse that primary-key kernel. Only compact ID keys are sorted;

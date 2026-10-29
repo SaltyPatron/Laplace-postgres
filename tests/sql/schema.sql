@@ -43,6 +43,11 @@ BEGIN
     OR (SELECT count(*) FROM "native tenant".laplace_present_ids(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed set binding failed';
  END IF;
+ IF (SELECT pg_catalog.array_agg(ordinal ORDER BY ordinal)
+       FROM "native tenant".laplace_entities(ARRAY[id,id])) IS DISTINCT FROM ARRAY[1,2]::bigint[]
+    OR (SELECT count(*) FROM "native tenant".laplace_physicalities(ARRAY[id,id]))<>2 THEN
+  RAISE EXCEPTION 'installed stored-row namespace or ordinal binding failed';
+ END IF;
  INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
  -- Exercise large-set GIN in the backend that created the indexes, before
  -- reconnecting can hide an incomplete cached operator-class support list.

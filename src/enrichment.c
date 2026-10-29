@@ -123,7 +123,7 @@ static void presence_keys(FunctionCallInfo fcinfo,Tuplestorestate *output,TupleD
     indexed_keys(parent,column,keys,(size_t)count,presence_visit,&out);
 }
 
-static Relation presence_parent(Oid target,const char **column,int columns)
+static Relation read_parent(Oid target,const char **column,const char *const *selected,int columns)
 {
     Oid schema=lp_pg_schema();
     bool paths=target==get_relname_relid("physicality",schema);
@@ -136,7 +136,6 @@ static Relation presence_parent(Oid target,const char **column,int columns)
     /* Apply PostgreSQL's parent/column privileges directly. Planning a dummy
      * SELECT for every frontier added an avoidable SQL executor boundary. */
     if(pg_class_aclcheck(target,GetUserId(),ACL_SELECT)!=ACLCHECK_OK){
-        const char *selected[]={*column,"path","mask"};
         int count=columns;
         for(int i=0;i<count;i++){
             AclResult allowed=pg_attribute_aclcheck(target,get_attnum(target,selected[i]),GetUserId(),ACL_SELECT);
@@ -147,6 +146,47 @@ static Relation presence_parent(Oid target,const char **column,int columns)
     List *children=find_all_inheritors(target,AccessShareLock,NULL);list_free(children);
     return parent;
 }
+static Relation presence_parent(Oid target,const char **column,int columns)
+{
+    const char *selected[]={target==lp_pg_relation("physicality")?"entity":"id","path","mask"};
+    return read_parent(target,column,selected,columns);
+}
+
+/* Exact stored rows, addressed by the same ID kernel as presence and DAG
+ * frontiers. Ordinals belong to the request, including duplicate IDs; absent
+ * IDs have no row. Tier-0 cache entries remain virtual until admitted. */
+typedef struct {
+    PresenceOutput output;AttrNumber attributes[6];int columns;
+} StoredRows;
+static void stored_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    StoredRows *out=context;Datum values[7];bool nulls[7]={false};
+    values[0]=Int64GetDatum(key->ordinal);
+    for(int i=0;i<out->columns;i++)values[i+1]=slot_getattr(slot,out->attributes[i],&nulls[i+1]);
+    set_put(out->output.fcinfo,out->output.output,out->output.descriptor,values,nulls);
+}
+static Datum stored_rows(FunctionCallInfo fcinfo,bool paths)
+{
+    const char *entities[]={"id","tier","coord","hilbert","mask"};
+    const char *physicalities[]={"entity","tier","hilbert","path","mask"};
+    const char *const *selected=paths?physicalities:entities;
+    const char *name=paths?"laplace_physicalities":"laplace_entities";
+    StoredRows out={.columns=5};out.output.fcinfo=fcinfo;
+    out.output.output=set_begin(fcinfo,name,&out.output.descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    if(!count){pfree(ids);return (Datum)0;}
+    Oid target=lp_pg_relation(paths?"physicality":"entity");const char *column;
+    Relation parent=read_parent(target,&column,selected,out.columns);
+    for(int i=0;i<out.columns;i++)out.attributes[i]=get_attnum(target,selected[i]);
+    PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
+    for(int i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
+    indexed_keys(parent,column,keys,(size_t)count,stored_row,&out);
+    pfree(keys);pfree(ids);table_close(parent,NoLock);return (Datum)0;
+}
+PG_FUNCTION_INFO_V1(laplace_entities);
+Datum laplace_entities(PG_FUNCTION_ARGS){return stored_rows(fcinfo,false);}
+PG_FUNCTION_INFO_V1(laplace_physicalities);
+Datum laplace_physicalities(PG_FUNCTION_ARGS){return stored_rows(fcinfo,true);}
 
 typedef struct {
     lp_pg_path_visit visit;void *context;AttrNumber path,mask;MemoryContext tuple_context;

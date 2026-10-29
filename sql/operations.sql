@@ -1,4 +1,15 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_entities(ids @extschema@.blake3[],
+    OUT ordinal bigint, OUT id @extschema@.blake3, OUT tier smallint,
+    OUT coord @extschema:postgis@.geometry, OUT hilbert bigint, OUT mask bit) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_entities';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_physicalities(ids @extschema@.blake3[],
+    OUT ordinal bigint, OUT entity @extschema@.blake3, OUT tier smallint,
+    OUT hilbert bigint, OUT path @extschema:postgis@.geometry, OUT mask bit) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_physicalities';
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_constituents(ids @extschema@.blake3[],
     OUT entity @extschema@.blake3, OUT ordinal integer, OUT child @extschema@.blake3,
     OUT run_length integer, OUT flags bigint) RETURNS SETOF record
