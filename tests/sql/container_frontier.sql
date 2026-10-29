@@ -40,6 +40,11 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  IF found<>expected THEN
   RAISE EXCEPTION 'all-key container projection lost dense exact matches: %',found;
  END IF;
+ IF (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)]))<>expected
+ OR (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)],'{}',true,-1::smallint,expected))<>expected
+ OR (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)],'{}',true,-1::smallint,expected-1) WHERE hub)<>1 THEN
+  RAISE EXCEPTION 'holder projection lost dense exact matches or cap classification';
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';

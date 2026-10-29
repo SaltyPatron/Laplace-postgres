@@ -22,7 +22,7 @@ Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.44-to-1.45 development
+CMake includes it in both the baseline and the in-place 1.38–1.45-to-1.46 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -101,6 +101,19 @@ address, the exact ordered/RLE carrier and mask. Row order is unspecified: use
 the ordinal to associate results with inputs. The active caller snapshot,
 parent/column privileges and RLS boundary apply. Clients never need partition
 names or extra connections for these reads.
+`laplace_standings(ids)` uses the same indexed kernel and request ordinals
+for rating, deviation, volatility and signed 64-bit match counts.
+
+`laplace_holders(parts, required, per_part, floor, cap, kinds)` performs direct
+overlap containment in the same Native GIN owner. `required` adds all-member
+conditions. Union mode emits each parent once with ordinal zero; per-part mode
+retains one-based input ordinals, including duplicates. `floor` is exclusive;
+`kinds` selects claims (1), observations (2), or both (3). With `cap=-1` the
+sets are complete. A nonnegative cap is per input and kind: equality returns
+the complete set; overflow emits one `hub=true` row with a null carrier and
+no arbitrary subset. A single work_mem-bounded spool holds tentative results,
+spilling through PostgreSQL when needed. No per-row or per-partition SPI is
+used, no extra connections are opened, and no planner settings are changed.
 
 Partition bounds route keys, and PostgreSQL's tuple-conversion map projects
 child storage into the parent's declared columns. Renaming or reordering a

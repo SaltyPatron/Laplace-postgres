@@ -134,3 +134,5 @@ laplace_within4d	false
 laplace_separator_ids	false
 laplace_ordered_pair_counts	true
 laplace_gin_compare_partial	false
+laplace_holders	false
+laplace_standings	false

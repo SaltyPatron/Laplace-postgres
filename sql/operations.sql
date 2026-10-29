@@ -1,4 +1,19 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[],
+    required @extschema@.blake3[] DEFAULT '{}', per_part boolean DEFAULT false,
+    floor smallint DEFAULT -1, cap bigint DEFAULT -1, kinds smallint DEFAULT 3,
+    OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
+    OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_holders';
+COMMENT ON FUNCTION @extschema@.laplace_holders(@extschema@.blake3[],@extschema@.blake3[],boolean,smallint,bigint,smallint)
+    IS 'Exact direct overlap containment, optionally requiring every required ID. Union mode uses ordinal 0; per-part mode preserves duplicate request ordinals. floor is exclusive; kinds 1=claims, 2=observations, 3=both. cap=-1 returns complete sets. A nonnegative per-part cap classifies each kind separately: overflow returns one hub row (null carrier), never an arbitrary subset. All-key containment is laplace_containers.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_standings(ids @extschema@.blake3[],
+    OUT ordinal bigint, OUT claim @extschema@.blake3, OUT rating double precision,
+    OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_standings';
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_entities(ids @extschema@.blake3[],
     OUT ordinal bigint, OUT id @extschema@.blake3, OUT tier smallint,
     OUT coord @extschema:postgis@.geometry, OUT hilbert bigint, OUT mask bit) RETURNS SETOF record

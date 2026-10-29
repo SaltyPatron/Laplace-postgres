@@ -115,6 +115,7 @@ DO $$ DECLARE child regclass; bounds text; BEGIN
  EXECUTE 'ALTER TABLE physicality ATTACH PARTITION reordered_path_range '||bounds;
  ALTER TABLE physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(entity) REFERENCES entity(id);
  IF (SELECT count(*) FROM laplace_physicalities(ARRAY[laplace_id('abb')]))<>1
+ OR (SELECT count(*) FROM laplace_holders(ARRAY[laplace_cp_id(97)],'{}',true))<>1
  OR (SELECT count(*) FROM laplace_containers(ARRAY[laplace_cp_id(97)],'{}'::smallint[]))<>1 THEN
   RAISE EXCEPTION 'Native physicality projection used child physical attribute positions';
  END IF;
@@ -138,6 +139,8 @@ SELECT laplace_compose(w.ids),e.tier,e.hilbert,laplace_path(w.ids)
 FROM wide_container w JOIN entity e ON e.id=laplace_compose(w.ids);
 DO $$ DECLARE ids blake3[]:=(SELECT w.ids FROM wide_container w); BEGIN
  IF (SELECT count(*) FROM laplace_containers(ids,'{}'::smallint[]))<>1
+ OR (SELECT count(*) FROM laplace_holders(ids))<>1
+ OR (SELECT count(*) FROM laplace_holders(ids,'{}',true))<>cardinality(ids)
  OR EXISTS(SELECT FROM laplace_containers(ids||ARRAY[laplace_cp_id(12000)],'{}'::smallint[])) THEN
   RAISE EXCEPTION 'windowed all-key containment lost a complete match or admitted a partial match';
  END IF;

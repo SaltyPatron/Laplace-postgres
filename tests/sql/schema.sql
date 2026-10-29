@@ -52,6 +52,13 @@ BEGIN
        ARRAY["native tenant".laplace_cp_id(97)],'{}'::smallint[]))<>1 THEN
   RAISE EXCEPTION 'installed Native all-member binding lost its virtual basis';
  END IF;
+ IF (SELECT count(*) FROM "native tenant".laplace_holders(
+       ARRAY["native tenant".laplace_cp_id(97)],'{}',true))<>1
+    OR (SELECT count(*) FROM "native tenant".laplace_holders(
+       ARRAY["native tenant".laplace_cp_id(97)],'{}',true,-1::smallint,0))<>1
+    OR EXISTS(SELECT FROM "native tenant".laplace_standings(ARRAY[id,id])) THEN
+  RAISE EXCEPTION 'installed Native holders/standings binding changed';
+ END IF;
  INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
  -- Exercise large-set GIN in the backend that created the indexes, before
  -- reconnecting can hide an incomplete cached operator-class support list.
