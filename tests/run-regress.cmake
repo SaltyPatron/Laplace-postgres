@@ -6,6 +6,12 @@ foreach(required PG_REGRESS PG_BINDIR MODULE SOURCE BUILD TIER0)
   endif()
 endforeach()
 file(REAL_PATH "${BUILD}" build_root)
+# A build has one private cluster and one expected-output directory. Serialize
+# their owner before pg_regress can remove/reinitialize its --temp-instance.
+file(LOCK "${build_root}/regress.lock" GUARD PROCESS TIMEOUT 60 RESULT_VARIABLE ownership)
+if(NOT ownership STREQUAL "0")
+  message(FATAL_ERROR "Another regression owns this build's private cluster: ${ownership}")
+endif()
 set(package "${build_root}/regress-package")
 set(output "${build_root}/regress-output")
 set(instance "${build_root}/regress-instance")
