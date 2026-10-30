@@ -26,9 +26,9 @@
 /* ---- provenance by containment and basis-point royalty attribution (laplace_attested, laplace_attribution)
  * Walks indexed frontiers from claims to their trunks and witnesses. */
 #define PG_NONE ((size_t)-1)
-typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t in_next;
+typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position; uint8_t claim, rec; size_t next;
                  lp_id dependence; double dependence_trust; uint8_t has_dependence; } PgEdge;
-typedef struct { lp_id id; int nparents; size_t in_head; uint8_t file, claim; } PgWNode;
+typedef struct { lp_id id; int nparents; uint8_t file, claim; } PgWNode;
 typedef lp_vec(PgWNode) PgWNodes;
 typedef lp_vec(PgEdge)  PgEdges;
 typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
@@ -55,7 +55,7 @@ static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
     bool fresh = false;
     size_t i = lp_idmap_put(d->m, id, &fresh);
     if (fresh) {
-        PgWNode w = { .id=*id, .in_head=PG_NONE };
+        PgWNode w = { .id=*id };
         lp_push(&d->n, w);
     }
     if (fresh_out) *fresh_out = fresh ? 1 : 0;
@@ -64,49 +64,57 @@ static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
 
 static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
 {
-    size_t k = d->e.n;
-    PgEdge e = { .p=p,.c=c,.times=v->run,.outcome=v->outcome,.spare=v->spare,.position=v->position,.in_next=d->n.v[c].in_head };
+    PgEdge e = { .p=p,.c=c,.times=v->run,.outcome=v->outcome,.spare=v->spare,.position=v->position,.next=PG_NONE };
     lp_push(&d->e, e);
-    d->n.v[c].in_head = k;
     d->n.v[c].nparents++;
-    return &d->e.v[k];
+    return &d->e.v[d->e.n-1];
 }
 
-typedef struct { size_t *head, *link, *order, n; } PgDown;
+typedef struct { size_t *head, *order, n; } PgDown;
+
+static void *pg_down_array(size_t count,size_t width,bool zero)
+{
+    count=Max(count,(size_t)1);
+    if(count>MaxAllocHugeSize/width)
+        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("laplace containment workspace exceeds addressable memory")));
+    return palloc_extended(count*width,MCXT_ALLOC_HUGE|(zero?MCXT_ALLOC_ZERO:0));
+}
 
 /* Source roots share one containment DAG. Its adjacency and topological order
  * do not depend on which root is being counted; prepare them once, rather than
  * rebuilding both over the entire estate for each witness. */
-static PgDown pg_down_prepare(const PgDag *d)
+static PgDown pg_down_prepare(PgDag *d)
 {
     size_t n = d->n.n;
-    int *indeg = palloc0((n ? n : 1) * sizeof(int));
-    size_t *head = palloc((n ? n : 1) * sizeof(size_t));
-    size_t *link = palloc((d->e.n ? d->e.n : 1) * sizeof(size_t));
+    int *indeg = pg_down_array(n,sizeof *indeg,true);
+    size_t *head = pg_down_array(n,sizeof *head,false);
     for (size_t i = 0; i < n; i++) head[i] = PG_NONE;
     for (size_t k = 0; k < d->e.n; k++) {
-        link[k] = head[d->e.v[k].p];
+        /* Incoming adjacency is never consumed. Reuse the edge's own link
+         * for downward traversal rather than allocate another word per edge.
+         * Civil Comments alone has over 290 million containment edges. */
+        d->e.v[k].next = head[d->e.v[k].p];
         head[d->e.v[k].p] = k;
         indeg[d->e.v[k].c]++;
     }
-    size_t *q = palloc((n ? n : 1) * sizeof(size_t)), qh = 0, qt = 0;
+    size_t *q = pg_down_array(n,sizeof *q,false), qh = 0, qt = 0;
     for (size_t i = 0; i < n; i++) if (!indeg[i]) q[qt++] = i;
     while (qh < qt) {
         if (!(qh & 4095)) CHECK_FOR_INTERRUPTS();
         size_t p = q[qh++];
-        for (size_t k = head[p]; k != PG_NONE; k = link[k]) {
+        for (size_t k = head[p]; k != PG_NONE; k = d->e.v[k].next) {
             size_t c = d->e.v[k].c;
             if (!--indeg[c]) q[qt++] = c;
         }
     }
     pfree(indeg);
-    return (PgDown){head,link,q,qt};
+    return (PgDown){head,q,qt};
 }
 
 static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
 {
     size_t n = d->n.n;
-    double *cnt = palloc0((n ? n : 1) * sizeof(double));
+    double *cnt = pg_down_array(n,sizeof *cnt,true);
     cnt[top] = 1.0;
     for (size_t i = 0; i < walk->n; i++) {
         if (!(i & 4095)) CHECK_FOR_INTERRUPTS();
@@ -114,7 +122,7 @@ static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
         /* Topology is already established, so an unreachable parent needs no
          * edge arithmetic. Reachable additions retain their original order. */
         if (cnt[p] == 0) continue;
-        for (size_t k = walk->head[p]; k != PG_NONE; k = walk->link[k])
+        for (size_t k = walk->head[p]; k != PG_NONE; k = d->e.v[k].next)
             cnt[d->e.v[k].c] += cnt[p] * (double)d->e.v[k].times;
     }
     return cnt;
@@ -122,7 +130,7 @@ static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
 
 static void pg_down_free(PgDown *walk)
 {
-    pfree(walk->head); pfree(walk->link); pfree(walk->order);
+    pfree(walk->head); pfree(walk->order);
 }
 
 static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_claim)
