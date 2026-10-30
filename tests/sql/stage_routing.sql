@@ -1,7 +1,13 @@
 \set ECHO none
 \pset format unaligned
 \pset tuples_only on
+SET client_min_messages=warning;
 BEGIN;
+\if :{?writer}
+\else
+SELECT 'laplace_routing_'||pg_backend_pid() AS writer \gset
+CREATE ROLE :"writer";
+\endif
 SET LOCAL work_mem = '64kB';
 SELECT laplace_ensure_stage();
 CREATE TEMP TABLE routing_words AS

@@ -40,6 +40,7 @@ string(REGEX REPLACE "\\.(dll|so|dylib)$" "" module_path "${module_path}")
 string(REPLACE "'" "''" module_path "${module_path}")
 string(REGEX REPLACE "module_pathname = '[^']*'" "module_pathname = '${module_path}'" control "${control}")
 file(WRITE "${package}/extension/laplace.control" "${control}")
+file(STRINGS "${SOURCE}/tests/regression_cases.txt" regression_cases)
 if(WIN32)
   set(separator ";")
 else()
@@ -68,7 +69,7 @@ execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
-  schema mask geometry gin_path gist4d text_id realization_depth projection attestation stage ordered container_frontier frontier_runtime function_bindings
+  ${regression_cases}
   WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 150)
 endif()
 # Stop a private server even when the driver times out before its own teardown.

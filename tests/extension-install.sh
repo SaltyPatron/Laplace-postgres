@@ -83,26 +83,29 @@ DO $$ DECLARE selected regclass; BEGIN
     TRUNCATE public.physicality_00;
     RAISE EXCEPTION 'ingestion unexpectedly has canonical-table TRUNCATE';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-  SELECT i.indexrelid INTO STRICT selected FROM pg_index i
+  FOR selected IN SELECT i.indexrelid FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
-    WHERE i.indrelid='public.physicality_00'::regclass AND a.amname='gin';
+    WHERE i.indrelid='public.physicality_00'::regclass AND a.amname='gin' LOOP
   BEGIN
     PERFORM pg_catalog.gin_clean_pending_list(selected);
     RAISE EXCEPTION 'runtime unexpectedly owns the index';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   PERFORM public.laplace_clean_pending_list(selected);
+  END LOOP;
+  IF NOT FOUND THEN RAISE EXCEPTION 'canonical GIN maintenance fixture is missing'; END IF;
   PERFORM public.laplace_clean_stage('stage.candidate_maintenance_keys');
   BEGIN
     PERFORM public.laplace_clean_stage('stage.candidate_unwritable_keys');
     RAISE EXCEPTION 'stage routing bypassed index maintenance privileges';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
-  SELECT i.indexrelid INTO STRICT selected FROM pg_index i
+  FOR selected IN SELECT i.indexrelid FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
-    WHERE i.indrelid='public.physicality_01'::regclass AND a.amname='gin';
+    WHERE i.indrelid='public.physicality_01'::regclass AND a.amname='gin' LOOP
   BEGIN
     PERFORM public.laplace_clean_pending_list(selected);
     RAISE EXCEPTION 'unwritable Laplace index maintenance was permitted';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  END LOOP;
   BEGIN
     PERFORM public.laplace_clean_pending_list('public.candidate_unrelated_gin'::regclass);
     RAISE EXCEPTION 'unrelated index maintenance was permitted';

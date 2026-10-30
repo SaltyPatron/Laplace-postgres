@@ -1,3 +1,7 @@
+\set ECHO none
+\pset format unaligned
+\pset tuples_only on
+SET client_min_messages=warning;
 -- The same complete containment sets serve CLI, MCP and managed consumers.
 BEGIN;
 CREATE TEMP TABLE holder_fixture(label text,id blake3,claim boolean);
@@ -22,7 +26,7 @@ BEGIN
  OR EXISTS(SELECT FROM laplace_holders(keys) WHERE ordinal<>0 OR hub)
  OR (SELECT count(*) FROM laplace_holders(keys,ARRAY[c]))<>2
  OR (SELECT count(*) FROM laplace_holders(keys,'{}',true))<>9
- OR (SELECT count(*) FROM laplace_holders(keys,'{}',false,1::smallint))<>0 THEN
+ OR (SELECT count(*) FROM laplace_holders(keys,'{}',false,laplace_tier('ab')::smallint))<>0 THEN
   RAISE EXCEPTION 'Native union/per-part/required/floor containment changed';
  END IF;
  -- Equality at the boundary is complete. Overflow emits a hub marker for

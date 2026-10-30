@@ -2,6 +2,7 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
+BEGIN;
 
 DO $$
 DECLARE
@@ -122,4 +123,5 @@ BEGIN
 END $$;
 RESET enable_seqscan;
 
+ROLLBACK;
 SELECT 'mask: 64-bit packing, enum filtering, set merges, global IDs and GIN passed';

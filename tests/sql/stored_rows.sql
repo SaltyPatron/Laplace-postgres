@@ -1,3 +1,7 @@
+\set ECHO none
+\pset format unaligned
+\pset tuples_only on
+SET client_min_messages=warning;
 -- Request positions, exact content and access policy are shared by every
 -- client of the native set reader; partition names are not part of its API.
 BEGIN;
@@ -102,7 +106,7 @@ DO $$ DECLARE child regclass; bounds text; BEGIN
    ADD CONSTRAINT entity_mask_valid CHECK(laplace_mask_valid(mask));
  EXECUTE 'ALTER TABLE entity ATTACH PARTITION reordered_entity_range '||bounds;
  IF (SELECT count(*) FROM laplace_entities(ARRAY[laplace_id('abb')]))<>1
- OR (SELECT tier FROM laplace_entities(ARRAY[laplace_id('abb')]))<>1 THEN
+ OR (SELECT tier FROM laplace_entities(ARRAY[laplace_id('abb')]))<>laplace_tier('abb') THEN
   RAISE EXCEPTION 'Native entity projection used child physical attribute positions';
  END IF;
  SELECT pg_get_expr(relpartbound,oid) INTO STRICT bounds FROM pg_class WHERE oid='renamed_path_range'::regclass;
@@ -118,6 +122,12 @@ DO $$ DECLARE child regclass; bounds text; BEGIN
  OR (SELECT count(*) FROM laplace_holders(ARRAY[laplace_cp_id(97)],'{}',true))<>1
  OR (SELECT count(*) FROM laplace_containers(ARRAY[laplace_cp_id(97)],'{}'::smallint[]))<>1 THEN
   RAISE EXCEPTION 'Native physicality projection used child physical attribute positions';
+ END IF;
+ UPDATE physicality SET path=ST_SetPoint(path,0,
+   ST_MakePoint(ST_X(ST_PointN(path,1)),ST_Y(ST_PointN(path,1)),ST_Z(ST_PointN(path,1)),1073741825))
+ WHERE entity=laplace_id('abb');
+ IF (SELECT count(*) FROM laplace_attested(ARRAY[laplace_cp_id(97)]))<>1 THEN
+  RAISE EXCEPTION 'Native assertion index used parent physical attribute positions';
  END IF;
 END $$;
 ROLLBACK;

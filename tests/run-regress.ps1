@@ -9,6 +9,7 @@ param(
     [Parameter(Mandatory)][string]$Config
 )
 $ErrorActionPreference = 'Stop'
+$cases=@(Get-Content -LiteralPath (Join-Path $InputRoot 'regression_cases.txt'))
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -22,7 +23,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not [LaplaceRegressionToken]::IsTokenRestricted($identity.Token)) {
     & $PgRegress "--bindir=$PgBin" "--inputdir=$InputRoot" "--outputdir=$BuildRoot/regress-output" `
         "--temp-instance=$BuildRoot/regress-instance" "--temp-config=$Config" `
-        --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace schema mask geometry gin_path gist4d text_id realization_depth projection attestation stage ordered container_frontier frontier_runtime function_bindings
+        --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace @cases
     exit $LASTEXITCODE
 }
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -71,7 +72,7 @@ try {
     & (Join-Path $PgBin 'psql.exe') @connection -d regression -v ON_ERROR_STOP=1 `
         -c 'CREATE EXTENSION postgis; CREATE EXTENSION laplace;'
     if ($LASTEXITCODE -ne 0) { throw 'Candidate extension installation failed.' }
-    foreach ($test in @('schema', 'mask', 'geometry', 'gin_path', 'gist4d', 'text_id', 'realization_depth', 'projection', 'attestation', 'stage', 'ordered', 'container_frontier', 'frontier_runtime', 'function_bindings')) {
+    foreach ($test in $cases) {
         $actual = Join-Path $output "results/$test.out"
         & (Join-Path $PgBin 'psql.exe') @connection -d regression -a -v ON_ERROR_STOP=1 `
             -f (Join-Path $InputRoot "sql/$test.sql") *> $actual

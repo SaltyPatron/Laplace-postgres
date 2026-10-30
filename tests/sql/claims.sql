@@ -1,3 +1,7 @@
+\set ECHO none
+\pset format unaligned
+\pset tuples_only on
+SET client_min_messages=warning;
 -- Selected claims share Native set access, including qualification before fan.
 BEGIN;
 CREATE TEMP TABLE selected_claim_fixture AS
