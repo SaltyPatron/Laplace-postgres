@@ -36,5 +36,30 @@ DO $$ DECLARE found bigint; BEGIN
   ARRAY[laplace_cp_id(102)] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,105000) i));
  IF found<>17000 THEN RAISE EXCEPTION 'dense frontier lost true matches or repeated a transfer window: %',found; END IF;
 END $$;
+-- One real parent introduces a large member dictionary. Sparse exact seeks
+-- must union matches across every transfer window and emit this parent once.
+-- Build its ID, coordinate and Hilbert key through the Native composition API.
+DO $$
+DECLARE ids blake3[]; coords geometry[]; parent blake3; path geometry;
+        projection record; child_tier smallint; index_id oid; found bigint;
+BEGIN
+ SELECT array_agg(e.id ORDER BY e.id),array_agg(e.coord ORDER BY e.id),max(e.tier)
+ INTO ids,coords,child_tier FROM frontier_words w JOIN public.entity e ON e.id=laplace_id(w.content);
+ parent:=laplace_compose(ids); path:=laplace_path(ids);
+ SELECT * INTO projection FROM laplace_project_path(parent,path,ids,coords);
+ INSERT INTO public.entity(id,tier,coord,hilbert)
+ VALUES(parent,child_tier+1,ST_GeomFromEWKB(projection.coord_ewkb),projection.hilbert);
+ INSERT INTO public.physicality(entity,tier,hilbert,path)
+ VALUES(parent,child_tier+1,projection.hilbert,path);
+ FOR index_id IN SELECT i.indexrelid FROM pg_catalog.pg_index i
+   JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+   JOIN pg_catalog.pg_am a ON a.oid=c.relam
+   WHERE i.indrelid=(SELECT tableoid FROM public.physicality WHERE entity=parent) AND a.amname='gin'
+ LOOP PERFORM public.laplace_clean_pending_list(index_id::regclass); END LOOP;
+ SELECT count(*) INTO found FROM public.laplace_holders(
+   ids[1:513] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i)) h
+ WHERE h.entity=parent;
+ IF found<>1 THEN RAISE EXCEPTION 'sparse frontier lost or repeated its canonical parent: %',found; END IF;
+END $$;
 ROLLBACK;
 SELECT 'frontier runtime: complete traversal over 17000 canonical paths passed';

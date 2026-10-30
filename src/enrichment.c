@@ -332,51 +332,59 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     List *relations=find_all_inheritors(RelationGetRelid(parent),NoLock,NULL);
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
-    size_t window=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
+    size_t budget=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
     size_t nrequired=required?lp_idmap_count(required):0;
-    ArrayType *required_keys=nrequired?id_array_of(element,lp_idmap_keys(required),(int)(required_any?nrequired:Min(window,nrequired))):NULL;
+    ArrayType *required_keys=nrequired?id_array_of(element,lp_idmap_keys(required),(int)(required_any?nrequired:Min(budget,nrequired))):NULL;
     Datum mask_values[64];int nbits=0;
     for(int bit=0;bit<64;bit++)if(bits&(UINT64_C(1)<<bit))mask_values[nbits++]=Int16GetDatum((int16)bit);
     ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
-    for(size_t begin=0;begin<unique && proceed;begin+=window){
-        size_t amount=Min(window,unique-begin);
-        ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
-        foreach_oid(relation_id,relations){
-            CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,NoLock);
-            if(table->rd_rel->relkind==RELKIND_PARTITIONED_TABLE){table_close(table,NoLock);continue;}
-            if(!table->rd_tableam || !table->rd_tableam->scan_bitmap_next_tuple)
-                ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native containment requires bitmap table access")));
-            AttrNumber path=get_attnum(relation_id,"path");
-            TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
-            TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
-            int index_column;Oid operation;
-            Oid operand=endpoint?element:array_type;
-            StrategyNumber nomination=endpoint?((endpoint&1)?8:9):strategy;
-            Relation index=container_index(table,path,operand,nomination,&index_column,&operation);
-            ScanKeyData key[3];int nkeys=required_keys?2:1;
-            ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
-            if(required_keys){
-                StrategyNumber selection=required_any?3:7;
-                Oid operation=get_opfamily_member(index->rd_opfamily[index_column-1],get_atttype(relation_id,path),array_type,selection);
-                if(!OidIsValid(operation))ereport(ERROR,(errmsg("Native required membership needs its GIN operation")));
-                ScanKeyEntryInitialize(key+1,0,index_column,selection,array_type,index->rd_indcollation[index_column-1],get_opcode(operation),PointerGetDatum(required_keys));
-            }
-            /* The canonical GIN index already stores path AND mask. Push
-             * positive carrier bits into that same access method: filtering
-             * after the heap fetched every text parent defeats the index. A
-             * caller-owned path-only index remains a correct fallback. */
-            if(mask_keys){
-                AttrNumber mask=get_attnum(relation_id,"mask");
-                for(int i=0;i<index->rd_index->indnkeyatts;i++)if(index->rd_index->indkey.values[i]==mask){
-                    Oid op=get_opfamily_member(index->rd_opfamily[i],get_atttype(relation_id,mask),INT2ARRAYOID,2);
-                    if(OidIsValid(op)){
-                        ScanKeyEntryInitialize(key+nkeys++,0,i+1,2,INT2ARRAYOID,index->rd_indcollation[i],get_opcode(op),PointerGetDatum(mask_keys));
-                        break;
-                    }
+    foreach_oid(relation_id,relations){
+        CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,NoLock);
+        if(table->rd_rel->relkind==RELKIND_PARTITIONED_TABLE){table_close(table,NoLock);continue;}
+        if(!table->rd_tableam || !table->rd_tableam->scan_bitmap_next_tuple)
+            ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native containment requires bitmap table access")));
+        AttrNumber path=get_attnum(relation_id,"path");
+        TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
+        TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
+        int index_column;Oid operation;
+        Oid operand=endpoint?element:array_type;
+        StrategyNumber nomination=endpoint?((endpoint&1)?8:9):strategy;
+        Relation index=container_index(table,path,operand,nomination,&index_column,&operation);
+        size_t window=budget;
+        if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
+            GinStatsData stats;ginGetStats(index,&stats);
+            /* A small dictionary is cheaper to stream than millions of absent
+             * seeks. A sparse set in a larger dictionary uses exact postings.
+             * Stale statistics change cost only; both paths recheck all IDs. */
+            if(stats.nEntries>0 && (uint64)stats.nEntries>unique)
+                window=gin_exact_window_ids();
+        }
+        ScanKeyData key[3];int nkeys=required_keys?2:1;
+        ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,(Datum)0);
+        if(required_keys){
+            StrategyNumber selection=required_any?3:7;
+            Oid operation=get_opfamily_member(index->rd_opfamily[index_column-1],get_atttype(relation_id,path),array_type,selection);
+            if(!OidIsValid(operation))ereport(ERROR,(errmsg("Native required membership needs its GIN operation")));
+            ScanKeyEntryInitialize(key+1,0,index_column,selection,array_type,index->rd_indcollation[index_column-1],get_opcode(operation),PointerGetDatum(required_keys));
+        }
+        /* The canonical GIN index already stores path AND mask. Push
+         * positive carrier bits into that same access method: filtering
+         * after the heap fetched every text parent defeats the index. A
+         * caller-owned path-only index remains a correct fallback. */
+        if(mask_keys){
+            AttrNumber mask=get_attnum(relation_id,"mask");
+            for(int i=0;i<index->rd_index->indnkeyatts;i++)if(index->rd_index->indkey.values[i]==mask){
+                Oid op=get_opfamily_member(index->rd_opfamily[i],get_atttype(relation_id,mask),INT2ARRAYOID,2);
+                if(OidIsValid(op)){
+                    ScanKeyEntryInitialize(key+nkeys++,0,i+1,2,INT2ARRAYOID,index->rd_indcollation[i],get_opcode(op),PointerGetDatum(mask_keys));
+                    break;
                 }
             }
-            IndexScanDesc scan=index_beginscan_bitmap(index,snapshot,NULL,nkeys);
-            TIDBitmap *bitmap=tbm_create((Size)work_mem*1024,NULL);
+        }
+        IndexScanDesc scan=index_beginscan_bitmap(index,snapshot,NULL,nkeys);
+        TIDBitmap *bitmap=tbm_create((Size)work_mem*1024,NULL);
+        for(size_t begin=0;begin<unique;begin+=window){
+            size_t amount=Min(window,unique-begin);
             if(endpoint){
                 for(int end=0;end<2;end++)if(endpoint&(1<<end)){
                     StrategyNumber directed=8+end;
@@ -388,29 +396,32 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
                         index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);
                     }
                 }
-            }else{index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);}
-            TableScanDesc heap=table_beginscan_bm(table,snapshot,0,NULL);
-            heap->st.rs_tbmiterator=tbm_begin_iterate(bitmap,NULL,InvalidDsaPointer);
-            TupleTableSlot *slot=table_slot_create(table,NULL);
-            bool recheck;uint64 lossy=0,exact=0;
-            while(table_scan_bitmap_next_tuple(heap,slot,&recheck,&lossy,&exact)){
-                CHECK_FOR_INTERRUPTS();
-                MemoryContext previous=MemoryContextSwitchTo(scratch);
-                if(endpoint?(!recheck || container_endpoint_matches(slot,path,wanted,endpoint)):
-                   ((!recheck && (strategy==3 || amount==unique)) || container_matches(slot,path,wanted,strategy==7,&epoch))){
-                    TupleTableSlot *row=conversion?execute_attr_map_slot(conversion->attrMap,slot,projected):slot;
-                    proceed=visit(row,context);if(projected)ExecClearTuple(projected);
-                }
-                MemoryContextSwitchTo(previous);MemoryContextReset(scratch);ExecClearTuple(slot);
-                if(!proceed)break;
+            }else{
+                ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
+                ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
+                index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);pfree(keys);
             }
-            ExecDropSingleTupleTableSlot(slot);
-            if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
-            tbm_end_iterate(&heap->st.rs_tbmiterator);table_endscan(heap);
-            tbm_free(bitmap);index_endscan(scan);index_close(index,NoLock);table_close(table,NoLock);
+        }
+        TableScanDesc heap=table_beginscan_bm(table,snapshot,0,NULL);
+        heap->st.rs_tbmiterator=tbm_begin_iterate(bitmap,NULL,InvalidDsaPointer);
+        TupleTableSlot *slot=table_slot_create(table,NULL);
+        bool recheck;uint64 lossy=0,exact=0;
+        while(table_scan_bitmap_next_tuple(heap,slot,&recheck,&lossy,&exact)){
+            CHECK_FOR_INTERRUPTS();
+            MemoryContext previous=MemoryContextSwitchTo(scratch);
+            if(endpoint?(!recheck || container_endpoint_matches(slot,path,wanted,endpoint)):
+               ((!recheck && (strategy==3 || unique<=window)) || container_matches(slot,path,wanted,strategy==7,&epoch))){
+                TupleTableSlot *row=conversion?execute_attr_map_slot(conversion->attrMap,slot,projected):slot;
+                proceed=visit(row,context);if(projected)ExecClearTuple(projected);
+            }
+            MemoryContextSwitchTo(previous);MemoryContextReset(scratch);ExecClearTuple(slot);
             if(!proceed)break;
         }
-        pfree(keys);
+        ExecDropSingleTupleTableSlot(slot);
+        if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
+        tbm_end_iterate(&heap->st.rs_tbmiterator);table_endscan(heap);
+        tbm_free(bitmap);index_endscan(scan);index_close(index,NoLock);table_close(table,NoLock);
+        if(!proceed)break;
     }
     if(required_keys)pfree(required_keys);if(mask_keys)pfree(mask_keys);MemoryContextDelete(scratch);list_free(relations);
 }
@@ -1048,6 +1059,8 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
  * Route copied IDs through the same Native partition bounds as enrichment;
  * neither scan public paths again nor sweep unrelated destination indexes. */
 PG_FUNCTION_INFO_V1(laplace_clean_stage);
+PG_FUNCTION_INFO_V1(laplace_stage_partitions);
+PG_FUNCTION_INFO_V1(laplace_clean_partitions);
 typedef struct { Oid target;Relation parent;HTAB *touched; } CleanStage;
 static void clean_stage_row(TupleTableSlot *slot,void *context)
 {
@@ -1056,9 +1069,9 @@ static void clean_stage_row(TupleTableSlot *slot,void *context)
     Oid partition=enrichment_partition(stage->target,RelationGetPartitionKey(stage->parent),RelationGetPartitionDesc(stage->parent,true),id);
     hash_search(stage->touched,&partition,HASH_ENTER,NULL);
 }
-Datum laplace_clean_stage(PG_FUNCTION_ARGS)
+static ArrayType *stage_partition_ids(Oid input)
 {
-    Oid input = PG_GETARG_OID(0);
+    MemoryContext caller=CurrentMemoryContext;
     Relation stage = table_open(input, AccessShareLock);
     Oid target = lp_pg_relation("physicality");
     Relation parent = table_open(target, AccessShareLock);
@@ -1087,10 +1100,34 @@ Datum laplace_clean_stage(PG_FUNCTION_ARGS)
     if (!plan) ereport(ERROR, (errmsg("laplace_clean_stage: selection plan failed")));
     CleanStage scan={target,parent,touched};lp_pg_stream(plan,NULL,clean_stage_row,&scan);SPI_freeplan(plan);
     int count = hash_get_num_entries(touched), at = 0;
-    Datum *values = palloc(sizeof(Datum) * Max(count, 1));
+    Datum *values = MemoryContextAlloc(caller,sizeof(Datum) * Max(count, 1));
     HASH_SEQ_STATUS entries; hash_seq_init(&entries, touched); Oid *partition;
     while ((partition = hash_seq_search(&entries))) values[at++] = ObjectIdGetDatum(*partition);
-    ArrayType *ids = construct_array(values, count, OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+    hash_destroy(touched);SPI_finish();
+    table_close(stage, NoLock);table_close(parent, NoLock);
+    pfree(source);pfree(selection);
+    ArrayType *ids=construct_array(values,count,OIDOID,sizeof(Oid),true,TYPALIGN_INT);
+    pfree(values);return ids;
+}
+
+/* Deferred merges return storage identities, never assumptions about a hash
+ * prefix or partition count. The same restricted authority drains the union
+ * once all child waves in a working window have committed. */
+static int64 clean_partition_ids(ArrayType *ids)
+{
+    Relation parent=table_open(lp_pg_relation("physicality"),AccessShareLock);
+    PartitionDesc parts=RelationGetPartitionDesc(parent,true);
+    HASHCTL control={.keysize=sizeof(Oid),.entrysize=sizeof(Oid)};
+    HTAB *allowed=hash_create("Native maintenance partitions",Max(parts->nparts,1),&control,HASH_ELEM|HASH_BLOBS);
+    for(int i=0;i<parts->nparts;i++)hash_search(allowed,&parts->oids[i],HASH_ENTER,NULL);
+    ArrayIterator iterator=array_create_iterator(ids,0,NULL);Datum item;bool missing;
+    while(array_iterate(iterator,&item,&missing)){
+        Oid partition=missing?InvalidOid:DatumGetObjectId(item);
+        if(missing || !hash_search(allowed,&partition,HASH_FIND,NULL))
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_clean_partitions requires Native physicality partitions")));
+    }
+    array_free_iterator(iterator);hash_destroy(allowed);
+    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_clean_partitions: SPI_connect")));
     Oid type = OIDARRAYOID; Datum parameter = PointerGetDatum(ids);
     if (lp_pg_execute_args("SELECT @extschema@.laplace_clean_pending_list(i.indexrelid)"
         " FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid"
@@ -1103,8 +1140,22 @@ Datum laplace_clean_stage(PG_FUNCTION_ARGS)
         Datum pages = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
         if (!missing) cleaned += DatumGetInt64(pages);
     }
-    SPI_freetuptable(SPI_tuptable); pfree(ids); pfree(values); hash_destroy(touched);
-    SPI_finish(); table_close(stage, NoLock); table_close(parent, NoLock);
-    pfree(source); pfree(selection);
-    PG_RETURN_INT64(cleaned);
+    SPI_freetuptable(SPI_tuptable);SPI_finish();table_close(parent,NoLock);
+    return cleaned;
+}
+
+Datum laplace_stage_partitions(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_ARRAYTYPE_P(stage_partition_ids(PG_GETARG_OID(0)));
+}
+
+Datum laplace_clean_partitions(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_INT64(clean_partition_ids(PG_GETARG_ARRAYTYPE_P(0)));
+}
+
+Datum laplace_clean_stage(PG_FUNCTION_ARGS)
+{
+    ArrayType *ids=stage_partition_ids(PG_GETARG_OID(0));
+    int64 cleaned=clean_partition_ids(ids);pfree(ids);PG_RETURN_INT64(cleaned);
 }

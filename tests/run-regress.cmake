@@ -62,15 +62,31 @@ if(WIN32)
   execute_process(COMMAND "${pwsh}" -NoLogo -NoProfile -File "${SOURCE}/tests/run-regress.ps1"
     -PgRegress "${PG_REGRESS}" -PgBin "${PG_BINDIR}" -InputRoot "${SOURCE}/tests"
     -BuildRoot "${build_root}" -Config "${config}"
-    WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
+    WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 150)
 else()
 execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
   schema mask geometry gin_path gist4d text_id realization_depth projection attestation stage ordered container_frontier frontier_runtime function_bindings
-  WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result)
+  WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 150)
 endif()
+# Stop a private server even when the driver times out before its own teardown.
+# Both paths are fixed children of this verified build root; installed clusters
+# and another build's servers are outside this operation's ownership.
+foreach(data "${instance}/data" "${build_root}/regress-inherited-instance")
+  cmake_path(IS_PREFIX build_root "${data}" NORMALIZE contained)
+  if(NOT contained)
+    message(FATAL_ERROR "Private regression server escaped its build root")
+  endif()
+  if(EXISTS "${data}/postmaster.pid")
+    execute_process(COMMAND "${PG_BINDIR}/pg_ctl" -D "${data}" -m fast -w stop
+      RESULT_VARIABLE stopped OUTPUT_VARIABLE stop_output ERROR_VARIABLE stop_error TIMEOUT 15)
+    if(NOT stopped EQUAL 0)
+      message(STATUS "Private regression stop: ${stop_output}${stop_error}")
+    endif()
+  endif()
+endforeach()
 if(NOT result EQUAL 0)
   foreach(log "${output}/regression.diffs" "${output}/log/initdb.log" "${output}/log/postmaster.log")
     if(EXISTS "${log}")

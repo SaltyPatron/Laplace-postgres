@@ -62,6 +62,15 @@ static inline size_t frontier_window_ids(void)
     size_t budget_ids = bytes > overhead ? (size_t)((bytes - overhead) / per_id) : 0;
     return Max((size_t)1, Min(budget_ids, array_ids));
 }
+/* The generic overlap operator can stream large membership ranges. Sparse
+ * stored-ID frontiers need exact entry seeks instead: their random BLAKE3
+ * bounds otherwise cover almost the whole GIN dictionary. Keep transfer
+ * windows below that operator's range-switch boundary, without limiting IDs. */
+#define LP_PG_GIN_RANGE_IDS (BLCKSZ / sizeof(lp_id))
+static inline size_t gin_exact_window_ids(void)
+{
+    return Min(frontier_window_ids(), LP_PG_GIN_RANGE_IDS - 1);
+}
 
 static inline Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
 

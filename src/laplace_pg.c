@@ -1086,7 +1086,7 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
     ArrayType *array=PG_GETARG_ARRAYTYPE_P(0);
     /* A page of identity operands selects a streamed key range. This changes
      * access mechanics only; all input IDs and exact endpoint roles remain. */
-    if(st==LP_STRAT_OVERLAPS && ArrayGetNItems(ARR_NDIM(array),ARR_DIMS(array))>=BLCKSZ/(int)sizeof(lp_id)){
+    if(st==LP_STRAT_OVERLAPS && (size_t)ArrayGetNItems(ARR_NDIM(array),ARR_DIMS(array))>=LP_PG_GIN_RANGE_IDS){
         PathOverlapSet *set=path_overlap_acquire(array);
         if(!lp_idmap_count(set->ids)){*n=0;PG_RETURN_POINTER(NULL);}
         bool **partial=(bool **)PG_GETARG_POINTER(3);*partial=palloc(sizeof(bool));(*partial)[0]=true;
