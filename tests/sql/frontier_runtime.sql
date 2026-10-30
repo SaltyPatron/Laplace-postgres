@@ -41,16 +41,21 @@ END $$;
 -- Build its ID, coordinate and Hilbert key through the Native composition API.
 DO $$
 DECLARE ids blake3[]; coords geometry[]; parent blake3; path geometry;
-        projection record; child_tier smallint; index_id oid; found bigint; memory text;
+        projection record; child_tier smallint; index_id oid; found bigint; memory text; endpoint smallint;
 BEGIN
  SELECT array_agg(e.id ORDER BY e.id),array_agg(e.coord ORDER BY e.id),max(e.tier)
  INTO ids,coords,child_tier FROM frontier_words w JOIN public.entity e ON e.id=laplace_id(w.content);
  parent:=laplace_compose(ids); path:=laplace_path(ids);
+ path:=ST_SetPoint(path,0,ST_MakePoint(ST_X(ST_PointN(path,1)),ST_Y(ST_PointN(path,1)),
+   ST_Z(ST_PointN(path,1)),ST_M(ST_PointN(path,1))+1073741824));
  SELECT * INTO projection FROM laplace_project_path(parent,path,ids,coords);
  INSERT INTO public.entity(id,tier,coord,hilbert)
  VALUES(parent,child_tier+1,ST_GeomFromEWKB(projection.coord_ewkb),projection.hilbert);
- INSERT INTO public.physicality(entity,tier,hilbert,path)
- VALUES(parent,child_tier+1,projection.hilbert,path);
+ INSERT INTO public.physicality(entity,tier,hilbert,path,mask)
+ VALUES(parent,child_tier+1,projection.hilbert,path,laplace_mask_slot('kind','claim'));
+ INSERT INTO public.consensus
+ SELECT parent,s.rating,s.deviation,s.volatility,s.matches FROM laplace_series(
+   ARRAY[laplace_cp_id(102)],ARRAY[1::bigint],ARRAY[1::float8],ARRAY[1::float8]) s;
  FOR index_id IN SELECT i.indexrelid FROM pg_catalog.pg_index i
    JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
    JOIN pg_catalog.pg_am a ON a.oid=c.relam
@@ -62,6 +67,14 @@ BEGIN
      ids[1:513] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i)) h
    WHERE h.entity=parent;
    IF found<>1 THEN RAISE EXCEPTION 'sparse frontier lost or repeated its canonical parent under %: %',memory,found; END IF;
+   FOR endpoint IN 1..3 LOOP
+     SELECT count(*) INTO found FROM public.laplace_claims_each(
+       ids[1:513] || ids[17000:17000] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i),
+       NULL::bigint,'{}'::smallint[],'{}'::blake3[],endpoint::smallint) c WHERE c.entity=parent;
+     IF found<>(CASE WHEN endpoint=3 THEN 2 ELSE 1 END) THEN
+       RAISE EXCEPTION 'endpoint set changed input ordinals under %, direction %: %',memory,endpoint,found;
+     END IF;
+   END LOOP;
  END LOOP;
 END $$;
 ROLLBACK;

@@ -392,14 +392,10 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             size_t amount=Min(window,unique-begin);
             if(endpoint){
                 for(int end=0;end<2;end++)if(endpoint&(1<<end)){
-                    StrategyNumber directed=8+end;
-                    Oid op=get_opfamily_member(index->rd_opfamily[index_column-1],get_atttype(relation_id,path),element,directed);
-                    if(!OidIsValid(op))ereport(ERROR,(errmsg("Native containment requires the endpoint GIN operation")));
-                    for(size_t i=0;i<amount;i++){
-                        ScanKeyEntryInitialize(key,0,index_column,directed,element,index->rd_indcollation[index_column-1],get_opcode(op),
-                            PointerGetDatum(lp_idmap_key(wanted,begin+i)));
-                        index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);
-                    }
+                    ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
+                    ScanKeyEntryInitialize(key,0,index_column,end?LP_PG_GIN_LAST_ANY:LP_PG_GIN_FIRST_ANY,array_type,
+                        index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
+                    index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);pfree(keys);
                 }
             }else{
                 ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
