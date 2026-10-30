@@ -1,4 +1,8 @@
 -- Current operation definitions, shared by cold install and development update.
+-- Distinct metrics retain their own exact access paths. Tier is a key prefix,
+-- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
+CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity(tier,hilbert,id);
+CREATE INDEX IF NOT EXISTS entity_angular ON @extschema@.entity USING gist(coord @extschema@.laplace_angular4d_ops);
 CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
     fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
     middle_any @extschema@.blake3[], arity bigint DEFAULT 0, OUT i bigint, OUT entity @extschema@.blake3,
