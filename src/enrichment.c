@@ -323,7 +323,7 @@ static bool container_endpoint_matches(TupleTableSlot *slot,AttrNumber path,lp_i
  * Array windows are transport bounds; lossy rechecks use the complete set. */
 typedef bool (*ContainerVisit)(TupleTableSlot *slot,void *context);
 static void scan_container_rows(Relation parent,const char *column,lp_idmap *wanted,StrategyNumber strategy,
-                                 lp_idmap *required,int endpoint,ContainerVisit visit,void *context)
+                                 lp_idmap *required,int endpoint,lp_mask bits,ContainerVisit visit,void *context)
 {
     if(GinFuzzySearchLimit)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native containment requires exact GIN search (gin_fuzzy_search_limit=0)")));
@@ -335,6 +335,9 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     size_t window=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
     size_t nrequired=required?lp_idmap_count(required):0;
     ArrayType *required_keys=nrequired?id_array_of(element,lp_idmap_keys(required),(int)Min(window,nrequired)):NULL;
+    Datum mask_values[64];int nbits=0;
+    for(int bit=0;bit<64;bit++)if(bits&(UINT64_C(1)<<bit))mask_values[nbits++]=Int16GetDatum((int16)bit);
+    ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
     for(size_t begin=0;begin<unique && proceed;begin+=window){
         size_t amount=Min(window,unique-begin);
         ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
@@ -350,12 +353,26 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             Oid operand=endpoint?element:array_type;
             StrategyNumber nomination=endpoint?((endpoint&1)?8:9):strategy;
             Relation index=container_index(table,path,operand,nomination,&index_column,&operation);
-            ScanKeyData key[2];int nkeys=required_keys?2:1;
+            ScanKeyData key[3];int nkeys=required_keys?2:1;
             ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
             if(required_keys){
                 Oid all=get_opfamily_member(index->rd_opfamily[index_column-1],get_atttype(relation_id,path),array_type,7);
                 if(!OidIsValid(all))ereport(ERROR,(errmsg("Native required membership needs the all-member GIN operation")));
                 ScanKeyEntryInitialize(key+1,0,index_column,7,array_type,index->rd_indcollation[index_column-1],get_opcode(all),PointerGetDatum(required_keys));
+            }
+            /* The canonical GIN index already stores path AND mask. Push
+             * positive carrier bits into that same access method: filtering
+             * after the heap fetched every text parent defeats the index. A
+             * caller-owned path-only index remains a correct fallback. */
+            if(mask_keys){
+                AttrNumber mask=get_attnum(relation_id,"mask");
+                for(int i=0;i<index->rd_index->indnkeyatts;i++)if(index->rd_index->indkey.values[i]==mask){
+                    Oid op=get_opfamily_member(index->rd_opfamily[i],get_atttype(relation_id,mask),INT2ARRAYOID,2);
+                    if(OidIsValid(op)){
+                        ScanKeyEntryInitialize(key+nkeys++,0,i+1,2,INT2ARRAYOID,index->rd_indcollation[i],get_opcode(op),PointerGetDatum(mask_keys));
+                        break;
+                    }
+                }
             }
             IndexScanDesc scan=index_beginscan_bitmap(index,snapshot,NULL,nkeys);
             TIDBitmap *bitmap=tbm_create((Size)work_mem*1024,NULL);
@@ -394,17 +411,17 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         }
         pfree(keys);
     }
-    if(required_keys)pfree(required_keys);MemoryContextDelete(scratch);list_free(relations);
+    if(required_keys)pfree(required_keys);if(mask_keys)pfree(mask_keys);MemoryContextDelete(scratch);list_free(relations);
 }
 typedef struct {AttrNumber id;lp_idmap *parents;} ContainerParents;
 static bool container_parent(TupleTableSlot *slot,void *context)
 {
     ContainerParents *out=context;container_remember(slot,out->id,out->parents);return true;
 }
-static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy)
+static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits)
 {
     ContainerParents out={get_attnum(RelationGetRelid(parent),"entity"),parents};
-    scan_container_rows(parent,column,wanted,strategy,NULL,0,container_parent,&out);
+    scan_container_rows(parent,column,wanted,strategy,NULL,0,bits,container_parent,&out);
 }
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context)
 {
@@ -413,7 +430,7 @@ void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path
     lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_new();
     PG_TRY();{
         for(size_t i=0;i<count;i++)lp_idmap_put(wanted,ids+i,NULL);
-        scan_containers(parent,column,wanted,parents,3);table_close(parent,NoLock);
+        scan_containers(parent,column,wanted,parents,3,0);table_close(parent,NoLock);
         lp_pg_lookup_paths(lp_idmap_keys(parents),lp_idmap_count(parents),masks,visit,context);
     }PG_FINALLY();{lp_idmap_free(wanted);lp_idmap_free(parents);}PG_END_TRY();
 }
@@ -490,7 +507,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
             bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);
             if(fresh)*(uint64 *)lp_idmap_at(wanted,at)=0;
         }
-        scan_containers(parent,column,wanted,parents,7);
+        scan_containers(parent,column,wanted,parents,7,out.bits);
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended((found?found:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
@@ -581,7 +598,7 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
             read.links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        scan_container_rows(parent,column,read.wanted,3,read.required,0,holder_row,&read);
+        scan_container_rows(parent,column,read.wanted,3,read.required,0,read.kinds==1?UINT64_C(1):0,holder_row,&read);
         if(read.pending){
             TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
             tuplestore_rescan(read.pending);
@@ -720,7 +737,7 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
         Relation paths=read_parent(target,&column,path_columns,lengthof(path_columns));
         read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
-        scan_container_rows(paths,column,read.wanted,each?3:7,NULL,read.endpoint,claim_nominate,&read);
+        scan_container_rows(paths,column,read.wanted,each?3:7,NULL,read.endpoint,read.bits,claim_nominate,&read);
         n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
         const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");

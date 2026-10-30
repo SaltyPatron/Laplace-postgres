@@ -330,3 +330,8 @@ then qualifies masks, tier, refusal and actual standings before the per-input
 fan. Duplicate request ordinals and exact lossy bitmap rechecks are preserved.
 The 1.49 baseline and direct development update add this operation without
 rewriting data or rebuilding indexes.
+
+Positive carrier-mask requirements join path and endpoint keys inside the existing
+multicolumn GIN scan. Claims, all-member containers and claim-only holder probes
+therefore intersect postings before fetching heap rows. Exact carrier checks
+remain authoritative for lossy pages and caller-owned path-only indexes.

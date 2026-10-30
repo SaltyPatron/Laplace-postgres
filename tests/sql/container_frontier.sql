@@ -53,6 +53,14 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  OR (SELECT count(*) FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,'{}','{}',3::smallint))<>expected THEN
   RAISE EXCEPTION 'directed claims lost dense endpoint matches or admitted lossy false positives';
  END IF;
+ UPDATE public.physicality p SET mask=public.laplace_mask_slot('kind','claim')
+ FROM dense_expected e WHERE p.entity=e.id AND e.i%4=0;
+ SELECT count(*) INTO expected FROM dense_expected WHERE i%4=0;
+ IF (SELECT count(*) FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,ARRAY[0::smallint],'{}',1::smallint))<>expected
+ OR (SELECT count(*) FROM public.laplace_containers(ARRAY[public.laplace_cp_id(65)],ARRAY[0::smallint]))<>expected
+ OR (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)],'{}',true,-1::smallint,-1::bigint,1::smallint))<>expected THEN
+  RAISE EXCEPTION 'shared indexed mask nomination changed exact claims, containers or holders';
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';
