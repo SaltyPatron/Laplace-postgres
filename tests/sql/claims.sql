@@ -61,6 +61,29 @@ BEGIN
   RAISE EXCEPTION 'invalid endpoint was accepted';
  EXCEPTION WHEN invalid_parameter_value THEN NULL;
  END;
+ IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c]))<>3
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c,laplace_cp_id(100)]))<>6
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[b]))<>3
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[a]))
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,'{}'::blake3[]))
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL::blake3[]))<>12
+ OR (SELECT count(*) FROM laplace_claims_each(keys,1,bits,'{}',1::smallint,ARRAY[c]))<>2
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,
+        ARRAY(SELECT laplace_cp_id(i) FROM generate_series(1000,1600) i)||ARRAY[c]))<>3 THEN
+  RAISE EXCEPTION 'Native indexed middle selection lost union, endpoint/RLE qualification, complete operand windows or fan';
+ END IF;
+ IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,3))<>9
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,2))<>3
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,NULL))<>12
+ OR (SELECT count(*) FROM laplace_claims_each(keys,1,bits,'{}',1::smallint,ARRAY[b],3))<>2
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,4)) THEN
+  RAISE EXCEPTION 'Native logical arity selection lost RLE spans, input ordinals, complete shape or fan qualification';
+ END IF;
+ BEGIN
+  PERFORM * FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,-1);
+  RAISE EXCEPTION 'negative arity was accepted';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL;
+ END;
  IF EXISTS(SELECT FROM laplace_claims('{}'::blake3[],NULL,bits,'{}'))
  OR EXISTS(SELECT FROM laplace_claims_each(NULL,NULL,bits,'{}'))
  OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,NULL,'{}')) THEN

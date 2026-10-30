@@ -23,6 +23,22 @@ DO $$ BEGIN
       AND (p.prosqlbody IS NULL OR EXISTS(SELECT FROM unnest(p.proconfig) s WHERE s LIKE 'search_path=%'))
   ) THEN RAISE EXCEPTION 'SQL adapters still bind names or set scope at each call'; END IF;
 END $$;
+-- A loaded predecessor and its callers can remain alive during an in-place
+-- update. Rebinding must preserve the function identity and all other metadata.
+DO $$ DECLARE module text; before_oid oid; before_meta jsonb; BEGIN
+ SELECT probin,oid,to_jsonb(p)-'probin'-'proconfig' INTO module,before_oid,before_meta
+ FROM pg_proc p WHERE oid='public.laplace_id(text)'::regprocedure;
+ EXECUTE format('CREATE OR REPLACE FUNCTION public.laplace_id(text) RETURNS public.blake3 AS %L,%L LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE',module||'_peer','laplace_id');
+ PERFORM public.laplace_id('loaded predecessor');
+ PERFORM public.laplace_restore_function_bindings();
+ IF NOT EXISTS(SELECT FROM pg_proc p WHERE oid=before_oid AND probin=module
+     AND to_jsonb(p)-'probin'-'proconfig'=before_meta) THEN
+   RAISE EXCEPTION 'module activation changed a function identity or attributes';
+ END IF;
+ IF public.laplace_id('loaded predecessor') IS NULL THEN
+   RAISE EXCEPTION 'rebound function failed in a backend that loaded its predecessor';
+ END IF;
+END $$;
 SET search_path=pg_catalog,pg_temp;
 DO $$ BEGIN
   IF public.ST_AsEWKB(public.laplace_coord('A')) IS DISTINCT FROM public.laplace_coord_ewkb('A')

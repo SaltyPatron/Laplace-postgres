@@ -61,6 +61,9 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  OR (SELECT count(*) FROM public.laplace_holders(ARRAY[public.laplace_cp_id(65)],'{}',true,-1::smallint,-1::bigint,1::smallint))<>expected THEN
   RAISE EXCEPTION 'shared indexed mask nomination changed exact claims, containers or holders';
  END IF;
+ IF EXISTS(SELECT FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,ARRAY[0::smallint],'{}',1::smallint,ARRAY[public.laplace_cp_id(65)])) THEN
+  RAISE EXCEPTION 'lossy required-member nomination confused an endpoint with a middle member';
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';

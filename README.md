@@ -18,11 +18,18 @@ On Windows (icx, against an icx-built PostgreSQL), `cmake --install` also puts t
 
 Change the extension through versioned upgrade scripts (`ALTER EXTENSION laplace UPDATE`, which `laplace deploy` runs), never by dropping it: indexes such as the GIN container index depend on its functions.
 
+The linked module is also published as `laplace_<content hash>.dll` / `.so`.
+The generated control file selects that generation, and the in-place update
+rebinds existing C functions without changing their OIDs, attributes or indexes.
+This lets long-lived PostgreSQL backends load the new implementation after an
+update. Package the generated control file alongside its matching module;
+the stable `laplace` library remains available for predecessor installations.
+
 ## The schema
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.45-to-1.46 development
+CMake includes it in both the baseline and the in-place 1.38–1.49-to-1.50 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -335,3 +342,17 @@ Positive carrier-mask requirements join path and endpoint keys inside the existi
 multicolumn GIN scan. Claims, all-member containers and claim-only holder probes
 therefore intersect postings before fetching heap rows. Exact carrier checks
 remain authoritative for lossy pages and caller-owned path-only indexes.
+
+The six-argument `laplace_claims_each(..., endpoint, middle_any)` additionally
+requires one of the supplied IDs in the path's logical middle. SQL NULL leaves
+that constraint open; an empty array selects nothing. The existing GIN postings
+intersect endpoint, required-member and positive carrier-mask keys together;
+Native rechecks actual middle membership (including RLE) before the caller's fan.
+The 1.50 baseline and direct installed-development transition add this overload
+without rewriting retained data or indexes; the four- and five-argument ABIs remain.
+
+An optional final `arity bigint` selects the exact logical constituent count,
+including RLE repetitions; zero or SQL NULL leaves shape unconstrained. This
+qualification runs before primary-key standing acquisition, not after all
+matching carriers have crossed into a SQL function result. Binary-relation
+projections pass `3`; n-ary and value-claim consumers retain their existing shape.

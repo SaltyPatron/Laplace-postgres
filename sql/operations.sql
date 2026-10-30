@@ -1,6 +1,14 @@
 -- Current operation definitions, shared by cold install and development update.
 CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
     fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
+    middle_any @extschema@.blake3[], arity bigint DEFAULT 0, OUT i bigint, OUT entity @extschema@.blake3,
+    OUT path @extschema:postgis@.geometry, OUT rating double precision,
+    OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 1024 PARALLEL SAFE AS 'MODULE_PATHNAME','laplace_claims_each';
+COMMENT ON FUNCTION @extschema@.laplace_claims_each(@extschema@.blake3[],bigint,smallint[],@extschema@.blake3[],smallint,@extschema@.blake3[],bigint)
+    IS 'The shared Native claim selector with a positive middle-member set: NULL is unconstrained, an empty set selects nothing. GIN intersects endpoint, positive mask and any required member before heap reads; Exact arity is optional (0 or NULL selects every shape); middle/RLE/arity qualification precedes standing fetch and fan. No index rebuild is needed.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
+    fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
     OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
     OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
     OUT matches bigint) RETURNS SETOF record
