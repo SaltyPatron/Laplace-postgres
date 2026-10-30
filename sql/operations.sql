@@ -1,4 +1,6 @@
 -- Current operation definitions, shared by cold install and development update.
+COMMENT ON FUNCTION @extschema@.laplace_path_has_roles(@extschema:postgis@.geometry,smallint)
+    IS 'Whether a canonical POINT/LINESTRING ZM path has any vertex whose stored said role is selected by the 8-bit mask. Bit 0 selects ordinary content; bits 1/2 select CLAIM/RECORD. Reads actual edge metadata, without expanding RLE runs or consulting child masks.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry) RETURNS @extschema@.blake3[]
     AS 'MODULE_PATHNAME','laplace_path_parts' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry)
@@ -531,7 +533,12 @@ BEGIN
   -- 32 MB a partition: a search scans the pending list, so it spills around a batch instead of holding a source.
   -- 4 MB spilled every few thousand paths (full-page images). 256 MB held the list until the source ended.
   CREATE INDEX IF NOT EXISTS physicality_paths ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops, mask @extschema@.laplace_mask_ops) WITH (gin_pending_list_limit = 32768);
+  -- Assertion lookup has a different population from ordinary content lookup.
+  -- PostgreSQL owns this canonical index's visibility, updates, WAL and rebuild.
+  CREATE INDEX IF NOT EXISTS physicality_assertions ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops)
+    WITH (gin_pending_list_limit = 32768) WHERE @extschema@.laplace_path_has_roles(path,6::smallint);
 END $$;
+SELECT @extschema@.laplace_schema_indexes();
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_restore_function_bindings() RETURNS void
 AS 'MODULE_PATHNAME','laplace_restore_function_bindings' LANGUAGE C VOLATILE PARALLEL UNSAFE;

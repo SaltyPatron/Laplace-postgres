@@ -9,7 +9,7 @@ SELECT laplace_id(word) AS id, laplace_tier(word) AS tier,
   laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(word,'') c)) AS path
 FROM unnest(ARRAY['dog','cat','ant']) word;
 INSERT INTO projection_expected
-SELECT laplace_compose(parts),2,point,
+SELECT laplace_compose(parts),greatest(laplace_tier('dog'),laplace_tier('cat'))+1,point,
   laplace_hilbert4(point) # '-9223372036854775808'::bigint,laplace_path(parts)
 FROM (SELECT ARRAY[laplace_id('dog'),laplace_id('dog'),laplace_id('cat')] AS parts,
   ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(p) FROM unnest(ARRAY[
@@ -20,9 +20,9 @@ SELECT id,tier,CASE WHEN id=laplace_id('ant') THEN coord ELSE ST_MakePoint(0,0,0
 INSERT INTO public.physicality(entity,tier,hilbert,path,mask)
 SELECT id,tier,CASE WHEN id=laplace_id('ant') THEN hilbert ELSE 0 END,path,
   laplace_mask_slot('kind','tuple') FROM projection_expected;
-INSERT INTO public.witness(id,trust) SELECT id,0.5 FROM projection_expected WHERE tier=2;
+INSERT INTO public.witness(id,trust) SELECT id,0.5 FROM projection_expected WHERE ST_NPoints(path)=2;
 INSERT INTO public.consensus(claim,rating,deviation,volatility,matches)
-SELECT id,0.2,0.5,0.06,3 FROM projection_expected WHERE tier=2;
+SELECT id,0.2,0.5,0.06,3 FROM projection_expected WHERE ST_NPoints(path)=2;
 CREATE TEMP TABLE projection_before AS SELECT
   (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM public.entity e) AS entities,
   (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) AS paths,
@@ -31,7 +31,7 @@ CREATE TEMP TABLE projection_before AS SELECT
   (SELECT jsonb_agg(to_jsonb(w) ORDER BY id) FROM public.witness w) AS witnesses,
   (SELECT jsonb_agg(to_jsonb(c) ORDER BY claim) FROM public.consensus c) AS consensus;
 DO $$ DECLARE changes record; BEGIN
-  IF NOT EXISTS(SELECT FROM projection_expected WHERE tier=2 AND ST_NPoints(path)=2 AND laplace_path_length(path)=3) THEN
+  IF NOT EXISTS(SELECT FROM projection_expected WHERE ST_NPoints(path)=2 AND laplace_path_length(path)=3) THEN
     RAISE EXCEPTION 'fixture did not retain actual run-compressed path';
   END IF;
   SELECT * INTO changes FROM laplace_recoordinate();
@@ -66,17 +66,17 @@ CREATE TEMP TABLE projection_repaired AS SELECT
   (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) AS paths;
 DO $$ DECLARE missing blake3:=laplace_id('unrecorded projection child'); parent blake3; BEGIN
   BEGIN
-    UPDATE public.physicality SET path=laplace_path(ARRAY[laplace_id('dog'),laplace_id('cat'),laplace_id('cat')]) WHERE tier=2;
+    UPDATE public.physicality SET path=laplace_path(ARRAY[laplace_id('dog'),laplace_id('cat'),laplace_id('cat')]) WHERE ST_NPoints(path)=2;
     PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'invalid stored identity accepted';
   EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN
     parent:=laplace_compose(ARRAY[laplace_id('dog'),missing]);
-    INSERT INTO public.entity(id,tier,coord,hilbert) VALUES(parent,2,ST_MakePoint(0,0,0,0),0);
-    INSERT INTO public.physicality(entity,tier,hilbert,path) VALUES(parent,2,0,laplace_path(ARRAY[laplace_id('dog'),missing]));
+    INSERT INTO public.entity(id,tier,coord,hilbert) VALUES(parent,laplace_tier('dog')+1,ST_MakePoint(0,0,0,0),0);
+    INSERT INTO public.physicality(entity,tier,hilbert,path) VALUES(parent,laplace_tier('dog')+1,0,laplace_path(ARRAY[laplace_id('dog'),missing]));
     PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'missing child accepted';
   EXCEPTION WHEN foreign_key_violation THEN NULL; END;
   BEGIN
-    UPDATE public.entity SET tier=2 WHERE id=laplace_id('dog');
+    UPDATE public.entity SET tier=(SELECT max(tier) FROM projection_expected) WHERE id=laplace_id('dog');
     PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'invalid topology accepted';
   EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN

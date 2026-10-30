@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.58-to-1.59 development
+CMake includes it in both the baseline and the in-place 1.38–1.59-to-1.60 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -66,7 +66,14 @@ Provenance is containment (`LP_SAID_RECORD`, `LP_SAID_CLAIM` vertices under each
 `laplace_source_standings(claims blake3[], scope blake3[] DEFAULT '{}')` exposes that same selected-source solve directly to path/query consumers, returning one standing per distinct witnessed claim.
 
 `laplace_testimony(claims blake3[], sources blake3[] DEFAULT NULL)` reads the
-stored assertion face through the same indexed containment DAG. Each row keeps
+stored assertion face through the same indexed containment DAG. The first
+frontier uses `physicality_assertions`, a partial GIN over canonical paths with
+actual CLAIM/RECORD vertices. Higher frontiers use `physicality_paths`. Both
+indexes are maintained by PostgreSQL in the writing transaction, including
+annotation updates and rollback. Install and upgrade build the assertion index
+before exposing the new reader; `laplace_schema_indexes()` restores it during
+index repair. The initial populated upgrade reads physicality once to build
+the additional index. Each row keeps
 the claim, registered corpus witness, containing record, zero-based logical
 record slot, exact bigint observation/token counts, score, source position,
 effective trust and declared dependence class. Outcomes are `2` confirm, `1`

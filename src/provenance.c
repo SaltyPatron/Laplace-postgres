@@ -405,7 +405,7 @@ static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int
         lp_idmap *next = lp_idmap_new();
         lp_idmap *seen = lp_idmap_new();
         PgUpward walk={&d,front,next,seen,classes,&vx,lvl,testimony?&ordinals:NULL};
-        lp_pg_lookup_containers(lp_idmap_keys(front),count,false,pg_upward_path,&walk);
+        lp_pg_lookup_containers(lp_idmap_keys(front),count,false,lvl==0,pg_upward_path,&walk);
         elog(DEBUG1,"Native containment: level %d; selected %zu; next %zu; nodes %zu; edges %zu",
              lvl,count,lp_idmap_count(next),d.n.n,d.e.n);
         lp_idmap_free(seen);

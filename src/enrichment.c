@@ -15,6 +15,8 @@
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
 #include "executor/executor.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_func.h"
 #include "utils/builtins.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
@@ -306,7 +308,7 @@ void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_wit
 /* GIN is the retained containment access contract, just as the primary index
  * is the retained identity access contract above. Unknown SPI array sizes can
  * otherwise make the planner scan every physicality at each sparse DAG hop. */
-static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,int *column,Oid *operation)
+static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,List *predicate,int *column,Oid *operation)
 {
     List *indexes=RelationGetIndexList(table);Relation found=NULL;
     foreach_oid(index_id,indexes){
@@ -314,7 +316,7 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,St
         if(index->rd_rel->relam==GIN_AM_OID && index->rd_index->indisvalid &&
            index->rd_index->indisready && index->rd_index->indislive &&
            (!index->rd_index->indcheckxmin || TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),TransactionXmin)) &&
-           RelationGetIndexPredicate(index)==NIL){
+           equal(RelationGetIndexPredicate(index),predicate)){
             for(int i=0;i<index->rd_index->indnkeyatts;i++)if(index->rd_index->indkey.values[i]==path){
                 Oid op=get_opfamily_member(index->rd_opfamily[i],get_atttype(RelationGetRelid(table),path),array_type,strategy);
                 if(OidIsValid(op)){*column=i+1;*operation=get_opcode(op);found=index;break;}
@@ -325,7 +327,7 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,St
     }
     list_free(indexes);
     if(!found)ereport(ERROR,(errcode(ERRCODE_UNDEFINED_OBJECT),
-        errmsg("Native containment requires a complete GIN path index on %s",RelationGetRelationName(table))));
+        errmsg("Native containment requires a complete %sGIN path index on %s",predicate?"assertion ":"",RelationGetRelationName(table))));
     return found;
 }
 
@@ -370,12 +372,17 @@ static bool container_endpoint_matches(TupleTableSlot *slot,AttrNumber path,lp_i
  * Array windows are transport bounds; lossy rechecks use the complete set. */
 typedef bool (*ContainerVisit)(TupleTableSlot *slot,void *context);
 static void scan_container_rows(Relation parent,const char *column,lp_idmap *wanted,StrategyNumber strategy,
-                                 lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,ContainerVisit visit,void *context)
+                                 lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,bool assertions,ContainerVisit visit,void *context)
 {
     if(GinFuzzySearchLimit)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native containment requires exact GIN search (gin_fuzzy_search_limit=0)")));
     Oid element=get_atttype(RelationGetRelid(parent),get_attnum(RelationGetRelid(parent),column));
     Oid array_type=get_array_type(element);
+    Oid assertion_function=InvalidOid;
+    if(assertions){
+        Oid arguments[]={get_atttype(RelationGetRelid(parent),get_attnum(RelationGetRelid(parent),"path")),INT2OID};
+        assertion_function=LookupFuncName(list_make2(makeString(get_namespace_name(lp_pg_schema())),makeString("laplace_path_has_roles")),2,arguments,false);
+    }
     List *relations=find_all_inheritors(RelationGetRelid(parent),NoLock,NULL);
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
@@ -402,7 +409,13 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         int index_column;Oid operation;
         Oid operand=endpoint?element:array_type;
         StrategyNumber nomination=endpoint?((endpoint&1)?8:9):strategy;
-        Relation index=container_index(table,path,operand,nomination,&index_column,&operation);
+        List *predicate=NIL;
+        if(assertions){
+            Expr *roles=(Expr *)makeConst(INT2OID,-1,InvalidOid,sizeof(int16),Int16GetDatum((1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD)),false,true);
+            predicate=list_make1(makeFuncExpr(assertion_function,BOOLOID,
+                list_make2(makeVar(1,path,get_atttype(relation_id,path),-1,InvalidOid,0),roles),InvalidOid,InvalidOid,COERCE_EXPLICIT_CALL));
+        }
+        Relation index=container_index(table,path,operand,nomination,predicate,&index_column,&operation);
         size_t window=budget;
         if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
             GinStatsData stats;ginGetStats(index,&stats);
@@ -473,8 +486,14 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         while(table_scan_bitmap_next_tuple(heap,slot,&recheck,&lossy,&exact)){
             CHECK_FOR_INTERRUPTS();
             MemoryContext previous=MemoryContextSwitchTo(scratch);
-            if(endpoint?(!recheck || container_endpoint_matches(slot,path,wanted,endpoint)):
-               ((!recheck && (strategy==3 || unique<=window)) || container_matches(slot,path,wanted,strategy==7,&epoch))){
+            bool selected=true;
+            if(assertions && recheck){
+                bool missing;Datum stored=slot_getattr(slot,path,&missing);
+                if(missing)ereport(ERROR,(errmsg("Native assertion path is null")));
+                selected=lp_pg_path_has_roles(stored,(1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD));
+            }
+            if(selected && (endpoint?(!recheck || container_endpoint_matches(slot,path,wanted,endpoint)):
+               ((!recheck && (strategy==3 || unique<=window)) || container_matches(slot,path,wanted,strategy==7,&epoch)))){
                 slot->tts_tableOid=relation_id;
                 TupleTableSlot *row=conversion?execute_attr_map_slot(conversion->attrMap,slot,projected):slot;
                 if(projected){row->tts_tableOid=relation_id;row->tts_tid=slot->tts_tid;}
@@ -487,6 +506,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
         tbm_end_iterate(&heap->st.rs_tbmiterator);table_endscan(heap);
         tbm_free(bitmap);index_endscan(scan);index_close(index,NoLock);table_close(table,NoLock);
+        if(predicate)list_free_deep(predicate);
         if(!proceed)break;
     }
     if(required_keys)pfree(required_keys);if(mask_keys)pfree(mask_keys);MemoryContextDelete(scratch);list_free(relations);
@@ -496,19 +516,19 @@ static bool container_parent(TupleTableSlot *slot,void *context)
 {
     ContainerParents *out=context;container_remember(slot,out->id,out->parents);return true;
 }
-static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits)
+static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits,bool assertions)
 {
     ContainerParents out={get_attnum(RelationGetRelid(parent),"entity"),parents};
-    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,container_parent,&out);
+    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,assertions,container_parent,&out);
 }
-void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context)
+void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool assertions,lp_pg_path_visit visit,void *context)
 {
     if(!count)return;
     const char *column;Relation parent=presence_parent(lp_pg_relation("physicality"),&column,masks?3:2);
     lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_sized(sizeof(CarrierLocation));
     PG_TRY();{
         for(size_t i=0;i<count;i++)lp_idmap_put(wanted,ids+i,NULL);
-        scan_containers(parent,column,wanted,parents,3,0);
+        scan_containers(parent,column,wanted,parents,3,0,assertions);
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended(Max(found,(size_t)1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
@@ -592,7 +612,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
             bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);
             if(fresh)*(uint64 *)lp_idmap_at(wanted,at)=0;
         }
-        scan_containers(parent,column,wanted,parents,7,out.bits);
+        scan_containers(parent,column,wanted,parents,7,out.bits,false);
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended((found?found:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
@@ -683,7 +703,7 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
             read.links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        scan_container_rows(parent,column,read.wanted,3,read.required,false,0,NULL,read.kinds==1?UINT64_C(1):0,holder_row,&read);
+        scan_container_rows(parent,column,read.wanted,3,read.required,false,0,NULL,read.kinds==1?UINT64_C(1):0,false,holder_row,&read);
         if(read.pending){
             TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
             tuplestore_rescan(read.pending);
@@ -850,7 +870,7 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
         Relation paths=read_parent(target,&column,path_columns,lengthof(path_columns));
         read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
-        scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.opposite,read.bits,claim_nominate,&read);
+        scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.opposite,read.bits,false,claim_nominate,&read);
         n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
         const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");

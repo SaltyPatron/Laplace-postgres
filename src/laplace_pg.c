@@ -964,6 +964,23 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
 #define LP_STRAT_FIRST 8           /* path ^@ blake3 */
 #define LP_STRAT_LAST 9            /* path @^ blake3 */
 enum { PATH_MEMBER, PATH_FIRST, PATH_LAST };
+/* Roles are edge metadata, never entity identity. This predicate deliberately
+ * reads the stored M values rather than inferring roles from a child's mask. */
+bool lp_pg_path_has_roles(Datum path,uint8 roles){
+    Geo geometry=geo_of(path);
+    for(size_t i=0;i<geometry.p.n;i++){
+        double m;memcpy(&m,geometry.p.v+(4*i+3)*sizeof(double),sizeof m);
+        if(roles&(1u<<lp_m_said(m)))return true;
+    }
+    return false;
+}
+PG_FUNCTION_INFO_V1(laplace_path_has_roles);
+Datum laplace_path_has_roles(PG_FUNCTION_ARGS){
+    int16 roles=PG_GETARG_INT16(1);
+    if(roles<0 || roles>UINT8_MAX)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native path role selection must be an 8-bit mask")));
+    PG_RETURN_BOOL(lp_pg_path_has_roles(PG_GETARG_DATUM(0),(uint8)roles));
+}
 /* The role byte belongs to an index key, never to an entity's identity. Keeping
  * all 128 ID bits avoids collisions between membership and endpoint postings. */
 static Datum path_key(const lp_id *id, uint8 role){

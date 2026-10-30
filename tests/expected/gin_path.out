@@ -1,4 +1,5 @@
 \set ECHO none
 gin_path: all-vertex and endpoint GIN postings match sequential scans for every ZM family
+gin_path: exact edge roles preserve every selection and RLE multiplicity
 gin_path: broad stable frontiers and varying arrays preserve exact membership
 gin_path: streamed ID sets preserve built and pending postings across repeated scans

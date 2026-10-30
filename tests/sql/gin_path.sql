@@ -46,6 +46,30 @@ BEGIN
 END $$;
 SELECT 'gin_path: all-vertex and endpoint GIN postings match sequential scans for every ZM family';
 
+-- One ID can appear as ordinary content, metadata, and an actual assertion.
+-- The selection must follow that occurrence's M, including maximal RLE runs,
+-- rather than treating a child's accumulated row mask as an edge role.
+DO $$ DECLARE role integer; selected integer; path geometry; BEGIN
+ FOR role IN 0..7 LOOP
+  path:=ST_MakePoint(1,2,3,1073741823::bigint+(role::bigint<<30));
+  FOR selected IN 0..255 LOOP
+   IF laplace_path_has_roles(path,selected::smallint) IS DISTINCT FROM ((selected & (1<<role))<>0) THEN
+    RAISE EXCEPTION 'Native path role selection changed role % mask %',role,selected;
+   END IF;
+  END LOOP;
+ END LOOP;
+ IF laplace_path_has_roles(ST_GeomFromText('LINESTRING ZM EMPTY'),255::smallint)
+    OR laplace_path_has_roles(NULL,6::smallint) IS NOT NULL
+    OR laplace_path_has_roles(path,NULL) IS NOT NULL THEN
+  RAISE EXCEPTION 'Native empty/NULL role selection changed';
+ END IF;
+ BEGIN
+  PERFORM laplace_path_has_roles(path,256::smallint);
+  RAISE EXCEPTION 'Native path accepted an out-of-range role selection';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
+SELECT 'gin_path: exact edge roles preserve every selection and RLE multiplicity';
+
 -- A broad frontier can make a sequential scan cheaper than thousands of GIN
 -- probes. Its stable search array must not be rebuilt and scanned for every
 -- stored path. Exercise the same external Param used by Native provenance.

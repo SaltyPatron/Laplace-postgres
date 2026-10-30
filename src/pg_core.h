@@ -43,7 +43,10 @@ typedef void (*lp_pg_witness_visit)(const lp_id *id,const lp_id *lineage,double 
 void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_witness_visit visit,void *context);
 /* Complete direct-container frontier through canonical GIN indexes, with
  * PostgreSQL bitmap visibility/lossy rechecks and ascending parent-ID visits. */
-void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context);
+void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool assertions,lp_pg_path_visit visit,void *context);
+/* Assertion frontiers select actual CLAIM/RECORD vertices before acquiring
+ * ordinary content parents. The path remains the authority for every edge. */
+bool lp_pg_path_has_roles(Datum path,uint8 roles);
 /* Registered witness roots, or an explicit subset; visit each stored path once. */
 typedef void (*lp_pg_stored_path_visit)(const lp_id *id,lp_path path,Datum mask,void *context);
 void lp_pg_walk_witnesses(ArrayType *roots,lp_pg_stored_path_visit visit,void *context);

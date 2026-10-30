@@ -64,6 +64,18 @@ DO $$ DECLARE found bigint; expected bigint; leaf regclass; BEGIN
  IF EXISTS(SELECT FROM public.laplace_claims_each(ARRAY[public.laplace_cp_id(65)],NULL,ARRAY[0::smallint],'{}',1::smallint,ARRAY[public.laplace_cp_id(65)])) THEN
   RAISE EXCEPTION 'lossy required-member nomination confused an endpoint with a middle member';
  END IF;
+ -- Removing an assertion changes M, while its product and identity remain.
+ -- Partial-index membership, old posting visibility and lossy-page rechecks
+ -- must all follow the updated edge, without hiding ordinary containers.
+ UPDATE public.physicality p SET path=ST_SetPoint(p.path,0,
+   ST_MakePoint(ST_X(ST_PointN(p.path,1)),ST_Y(ST_PointN(p.path,1)),ST_Z(ST_PointN(p.path,1)),1))
+ FROM dense_expected e WHERE p.entity=e.id AND e.i%4=0;
+ IF (SELECT count(*) FROM public.laplace_attested(ARRAY[public.laplace_cp_id(65)]))<>
+       (SELECT count(*) FROM dense_expected WHERE i%4=2)
+    OR (SELECT count(*) FROM public.laplace_containers(ARRAY[public.laplace_cp_id(65)],'{}'::smallint[]))<>
+       (SELECT count(*) FROM dense_expected WHERE i%2=0) THEN
+  RAISE EXCEPTION 'assertion metadata update changed product membership or retained removed testimony';
+ END IF;
 END $$;
 ROLLBACK;
 SELECT 'containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed';

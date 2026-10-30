@@ -1,6 +1,22 @@
 \set ECHO none
 \pset format unaligned
 \pset tuples_only on
+SET client_min_messages = warning;
+-- Index repair uses the same owner as cold install and upgrade. A missing
+-- assertion index must be restored with all attached leaf indexes, before a
+-- reader can nominate assertion parents again.
+BEGIN;
+DROP INDEX public.physicality_assertions;
+DO $$ BEGIN
+ PERFORM public.laplace_schema_indexes();
+ IF (SELECT count(*) FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indexrelid
+     WHERE h.inhparent='public.physicality_assertions'::regclass AND i.indisvalid AND i.indisready)<>256 THEN
+  RAISE EXCEPTION 'index repair did not restore every canonical assertion partition';
+ END IF;
+ PERFORM public.laplace_schema_indexes();
+ PERFORM count(*) FROM public.laplace_testimony(ARRAY[public.laplace_id('index repair probe')]);
+END $$;
+ROLLBACK;
 -- An upgrade must expose every declared C export, including APIs that were
 -- missing from an installed predecessor. Repair is idempotent and never adopts
 -- or overwrites a same-signature function owned by the host application.
