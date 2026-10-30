@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.55-to-1.56 development
+CMake includes it in both the baseline and the in-place 1.38–1.56-to-1.57 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -64,6 +64,19 @@ tables for normal lifecycle cleanup, without a fabricated witness.
 Provenance is containment (`LP_SAID_RECORD`, `LP_SAID_CLAIM` vertices under each file's trunk in `physicality`). `laplace_attested(claims blake3[], include_files boolean DEFAULT false)` returns actual source/container testimony. `laplace_attribution(claims blake3[])` adds per-claim source shares. `laplace_source_attribution(claims blake3[], scope blake3[] DEFAULT '{}')` returns model/query settlement across distinct selected claims: source ID, claims touched, exact bigint games, Fisher information and basis points. Empty scope selects all sources; a supplied scope filters witnesses before solving.
 
 `laplace_source_standings(claims blake3[], scope blake3[] DEFAULT '{}')` exposes that same selected-source solve directly to path/query consumers, returning one standing per distinct witnessed claim.
+
+`laplace_testimony(claims blake3[], sources blake3[] DEFAULT NULL)` reads the
+stored assertion face through the same indexed containment DAG. Each row keeps
+the claim, registered corpus witness, containing record, zero-based logical
+record slot, exact bigint observation/token counts, score, source position,
+effective trust and declared dependence class. Outcomes are `2` confirm, `1`
+draw and `0` refute only when that category is stored on the assertion vertex.
+A continuous scored observation has a NULL outcome and retains its exact score;
+categories are never reconstructed from source totals or standings. Duplicate
+input claims share one read. NULL source scope selects all registered witnesses,
+including zero-trust sources; an empty scope selects none. `calculation` identifies
+the declared `DerivedCalculation` dependence class. No source bytes, alternate
+attestation table, or consensus fold is required.
 
 Attribution uses `lp_series_evaluate`, the same rooted posterior that produces standings. A shared dependence root contributes `J/(1+omega²J)` once, distributed among its observations by games; repeated copies cannot manufacture independent precision. Registered lineage and explicit dependence qualifiers use the same resolution and signed-trust semantics as cumulative ingestion. Largest-remainder settlement happens after source aggregation, with canonical source-ID ties and exactly `10000` basis points for positive total information. Zero-information witnesses retain their testimony and receive zero shares. Indexed witness metadata, containment and realization use the caller's snapshot and column privileges; these read paths require no SPI scope or schema setting.
 

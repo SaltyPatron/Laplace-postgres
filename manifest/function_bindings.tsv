@@ -16,6 +16,7 @@ laplace_angular4d	false
 laplace_angular4d_gist_compress	false
 laplace_angular4d_gist_distance	false
 laplace_attested	false
+laplace_testimony	false
 laplace_attested_series	false
 laplace_attribution	false
 laplace_bank_bit	false

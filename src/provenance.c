@@ -31,6 +31,7 @@ typedef struct { size_t p, c; uint64_t times; uint32_t outcome, spare, position;
 typedef struct { lp_id id; int nparents; uint8_t file, claim; } PgWNode;
 typedef lp_vec(PgWNode) PgWNodes;
 typedef lp_vec(PgEdge)  PgEdges;
+typedef lp_vec(uint64_t) PgOrdinals;
 typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
 typedef struct { double games, tokens, score; uint32_t position; lp_id claim, dependence; double dependence_trust; uint8_t has_dependence; } PgTally;
 typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness, share_bp;
@@ -71,6 +72,7 @@ static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
 }
 
 typedef struct { size_t *head, *order, n; } PgDown;
+typedef void (*PgTestimonyVisit)(const PgDag *,const PgDown *,const uint64_t *,size_t,double,void *);
 
 static void *pg_down_array(size_t count,size_t width,bool zero)
 {
@@ -334,7 +336,7 @@ static int by_attr_row(const void *a, const void *b)
     return memcmp(x->dependence.b,y->dependence.b,16);
 }
 
-typedef struct { PgDag *dag;lp_idmap *front,*next,*seen,*classes;PgVertices *vertices;int level; } PgUpward;
+typedef struct { PgDag *dag;lp_idmap *front,*next,*seen,*classes;PgVertices *vertices;int level;PgOrdinals *ordinals; } PgUpward;
 static void pg_upward_path(const lp_id *key,Datum value,Datum mask,void *context)
 {
     PgUpward *walk=context;lp_id id=*key;bool first;(void)mask;
@@ -343,7 +345,12 @@ static void pg_upward_path(const lp_id *key,Datum value,Datum mask,void *context
     lp_vec_reserve(walk->vertices,(size_t)count);lp_vertex *vertices=walk->vertices->v;
     if(lp_path_decode(geometry.p,vertices,(size_t)count)!=(size_t)count)return;
     size_t parent=PG_NONE;int fresh=0;const lp_trust_class *pending=NULL;lp_id dependence={{0}};
+    uint64_t ordinal=0;
     for(int k=0;k<count;k++){
+        uint64_t position=ordinal;
+        if(UINT64_MAX-ordinal<vertices[k].run)
+            ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony ordinal overflow")));
+        ordinal+=vertices[k].run;
         if(vertices[k].said==LP_SAID_DEPENDENCE){pending=pg_dependence_class(walk->classes,vertices,count,k);dependence=vertices[k].id;continue;}
         const lp_trust_class *scope=pending;pending=NULL;
         if(lp_idmap_find(walk->front,&vertices[k].id)<0)continue;
@@ -353,6 +360,7 @@ static void pg_upward_path(const lp_id *key,Datum value,Datum mask,void *context
         if(parent==PG_NONE){parent=pg_dag_node(walk->dag,&id,&fresh);walk->dag->n.v[parent].file=vertices[0].said==LP_SAID_METADATA;}
         size_t child=pg_dag_node(walk->dag,&vertices[k].id,NULL);
         PgEdge *edge=pg_dag_edge(walk->dag,parent,child,vertices+k);
+        if(walk->ordinals)lp_push(walk->ordinals,position);
         if(walk->level==0){edge->claim=1;edge->rec=said==LP_SAID_RECORD;
             if(scope){edge->has_dependence=1;edge->dependence=dependence;edge->dependence_trust=scope->prior;}}
     }
@@ -369,7 +377,8 @@ static void pg_witness_metadata(const lp_id *id,const lp_id *lineage,double trus
 
 static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots,
-                                 const lp_idmap *known_witnesses, PgAttrRows *out,lp_idmap **registry)
+                                 const lp_idmap *known_witnesses, PgAttrRows *out,lp_idmap **registry,
+                                 PgTestimonyVisit testimony,void *testimony_context)
 {
     (void)idarr;
     PgDag d = { lp_idmap_new(), {0}, {0} };
@@ -389,12 +398,13 @@ static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int
      * Absent/unasserted operands cannot produce provenance; allocating one
      * root and reducing a full node array for each made sparse misses O(n^2). */
     PgVertices vx = {0};
+    PgOrdinals ordinals={0};
     lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
     for (int lvl = 0; lp_idmap_count(front); lvl++) {
         size_t count = lp_idmap_count(front);
         lp_idmap *next = lp_idmap_new();
         lp_idmap *seen = lp_idmap_new();
-        PgUpward walk={&d,front,next,seen,classes,&vx,lvl};
+        PgUpward walk={&d,front,next,seen,classes,&vx,lvl,testimony?&ordinals:NULL};
         lp_pg_lookup_containers(lp_idmap_keys(front),count,false,pg_upward_path,&walk);
         elog(DEBUG1,"Native containment: level %d; selected %zu; next %zu; nodes %zu; edges %zu",
              lvl,count,lp_idmap_count(next),d.n.n,d.e.n);
@@ -431,6 +441,10 @@ static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int
         int is_w = (wtr != NULL);
         double tr = is_w ? *wtr : 0.0;
         if (witnessed_only && (!is_w || tr <= 0.0)) continue;
+        if(testimony){
+            if(is_w)testimony(&d,&walk,ordinals.v,top,tr,testimony_context);
+            continue;
+        }
         double *cnt = pg_down_from(&d, &walk, top);
         lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d, cnt, per_claim);
@@ -446,7 +460,8 @@ static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int
         pfree(cnt);
     }
     pg_down_free(&walk);
-    lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
+    lp_vec_free(&ordinals);
+    if(out)lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
 
     if(registry)*registry=wmap;
     else if (!known_witnesses) lp_idmap_free(wmap);
@@ -457,7 +472,7 @@ static void compute_attested_registry(const lp_id *claims, int n, Oid idarr, int
 static void compute_attested_rows(const lp_id *claims,int n,Oid idarr,int witnessed_only,
                                   int include_files,const lp_idmap *roots,const lp_idmap *known_witnesses,PgAttrRows *out)
 {
-    compute_attested_registry(claims,n,idarr,witnessed_only,include_files,roots,known_witnesses,out,NULL);
+    compute_attested_registry(claims,n,idarr,witnessed_only,include_files,roots,known_witnesses,out,NULL,NULL,NULL);
 }
 
 /* The source-facing provenance API remains one row per corpus/container. The
@@ -516,6 +531,82 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
         set_put(fcinfo, ts, td, v, nl);
     }
     lp_vec_free(&rows);
+    PG_RETURN_NULL();
+}
+
+typedef struct {
+    FunctionCallInfo call;Tuplestorestate *rows;TupleDesc descriptor;
+    lp_idmap *sources;lp_id calculation;
+} PgTestimony;
+
+static uint64_t pg_testimony_product(uint64_t a,uint64_t b)
+{
+    if(b && a>(uint64_t)PG_INT64_MAX/b)
+        ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony multiplicity exceeds bigint")));
+    return a*b;
+}
+
+/* Exact occurrence arithmetic over the same indexed DAG as standings and
+ * attribution. Outcomes come from assertion vertices, never a folded score. */
+static void pg_testimony_root(const PgDag *d,const PgDown *walk,const uint64_t *ordinals,size_t top,double trust,void *context)
+{
+    PgTestimony *out=context;const lp_id *source=&d->n.v[top].id;
+    if(out->sources && lp_idmap_find(out->sources,source)<0)return;
+    if(walk->n!=d->n.n)
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native testimony containment is cyclic")));
+    uint64_t *counts=pg_down_array(d->n.n,sizeof(*counts),true);counts[top]=1;
+    for(size_t i=0;i<walk->n;i++){
+        if(!(i&4095))CHECK_FOR_INTERRUPTS();
+        size_t p=walk->order[i];if(!counts[p])continue;
+        for(size_t k=walk->head[p];k!=PG_NONE;k=d->e.v[k].next){
+            const PgEdge *e=d->e.v+k;uint64_t n=pg_testimony_product(counts[p],e->times);
+            if(counts[e->c]>(uint64_t)PG_INT64_MAX-n)
+                ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony multiplicity exceeds bigint")));
+            counts[e->c]+=n;
+        }
+    }
+    for(size_t k=0;k<d->e.n;k++){
+        if(!(k&4095))CHECK_FOR_INTERRUPTS();
+        const PgEdge *e=d->e.v+k;if(!e->claim || !counts[e->p])continue;
+        if(ordinals[k]>(uint64_t)PG_INT64_MAX)
+            ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony ordinal exceeds bigint")));
+        uint64_t tokens=pg_testimony_product(counts[e->p],e->times);
+        uint64_t occurrences=e->rec?tokens:counts[e->p];
+        bool scored=e->outcome==LP_OUTCOME_SCORE;
+        int16 outcome=e->outcome==LP_OUTCOME_WIN?2:e->outcome==LP_OUTCOME_DRAW?1:0;
+        /* Fixed-width IDs are borrowed until tuplestore copies this row. */
+        Datum values[]={PointerGetDatum(&d->n.v[e->c].id),PointerGetDatum(source),PointerGetDatum(&d->n.v[e->p].id),
+            Int64GetDatum((int64)ordinals[k]),Int16GetDatum(outcome),Int64GetDatum((int64)occurrences),
+            Int64GetDatum((int64)tokens),Float8GetDatum(lp_outcome_score(e->outcome,e->spare)),
+            Int32GetDatum((int32)e->position),Float8GetDatum(e->has_dependence?e->dependence_trust:trust),
+            e->has_dependence?PointerGetDatum(&e->dependence):(Datum)0,
+            BoolGetDatum(e->has_dependence && lp_id_eq(&e->dependence,&out->calculation))};
+        bool nulls[lengthof(values)]={false};nulls[4]=scored;nulls[10]=!e->has_dependence;
+        set_put(out->call,out->rows,out->descriptor,values,nulls);
+    }
+    pfree(counts);
+}
+
+PG_FUNCTION_INFO_V1(laplace_testimony);
+Datum laplace_testimony(PG_FUNCTION_ARGS)
+{
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_testimony",&descriptor);
+    if(PG_ARGISNULL(0))PG_RETURN_NULL();
+    int n;lp_id *claims=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n);if(!n)PG_RETURN_NULL();
+    PgTestimony out={.call=fcinfo,.rows=rows,.descriptor=descriptor};
+    const lp_trust_class *calculation=lp_trust_class_named("DerivedCalculation");
+    if(!calculation || !lp_text_id(lp_pg_text_context(),calculation->label,strlen(calculation->label),&out.calculation))
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native calculation dependence class is unavailable")));
+    if(!PG_ARGISNULL(1)){
+        int count;lp_id *sources=ids_of(PG_GETARG_ARRAYTYPE_P(1),&count);out.sources=lp_idmap_new();
+        for(int i=0;i<count;i++)lp_idmap_put(out.sources,sources+i,NULL);
+        pfree(sources);
+        if(!count){pfree(claims);lp_idmap_free(out.sources);PG_RETURN_NULL();}
+    }
+    PG_TRY();{
+        compute_attested_registry(claims,n,get_fn_expr_argtype(fcinfo->flinfo,0),0,0,NULL,NULL,NULL,NULL,
+            pg_testimony_root,&out);
+    }PG_FINALLY();{pfree(claims);lp_idmap_free(out.sources);}PG_END_TRY();
     PG_RETURN_NULL();
 }
 
@@ -684,7 +775,7 @@ static void compute_attribution_rows(const lp_id *claims,int n,Oid idarr,const l
     PgSeriesBatch *batch=palloc0(sizeof *batch);MemoryContextCallback *cleanup=palloc(sizeof *cleanup);
     *cleanup=(MemoryContextCallback){.func=pg_series_batch_free,.arg=batch};
     MemoryContextRegisterResetCallback(context,cleanup);
-    compute_attested_registry(claims,n,idarr,0,0,NULL,NULL,&batch->historical,&batch->witnesses);
+    compute_attested_registry(claims,n,idarr,0,0,NULL,NULL,&batch->historical,&batch->witnesses,NULL,NULL);
     PgAttrRows *rows=&batch->historical;size_t kept=0;
     for(size_t i=0;i<rows->n;i++)if(rows->v[i].witness&&(!scope||lp_idmap_find(scope,&rows->v[i].trunk)>=0))
         rows->v[kept++]=rows->v[i];

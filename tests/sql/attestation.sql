@@ -626,6 +626,42 @@ BEGIN
       AND laplace_path_starts(p.path,laplace_compose(ARRAY[laplace_id('file'),laplace_id('one')]));
   IF found<>1 THEN RAISE EXCEPTION 'file diagnostic omitted the containing file'; END IF;
 END $$;
+-- Read the record's stored outcomes before any source-level score fold.
+DO $$
+DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
+        positive blake3; neutral blake3; negative blake3; source_id blake3;
+        outcomes smallint[]; counts bigint[];
+BEGIN
+  positive:=pg_temp.series_node(ARRAY[laplace_id('dog'),a],'record',ARRAY[0,1073741824]::bigint[]);
+  neutral:=pg_temp.series_node(ARRAY[laplace_id('is'),a],'record',ARRAY[0,9663676416]::bigint[]);
+  negative:=pg_temp.series_node(ARRAY[laplace_id('noun'),a],'record',ARRAY[0,18253611008]::bigint[]);
+  source_id:=pg_temp.series_node(ARRAY[laplace_id('one'),positive,positive,neutral,negative],
+    'file',ARRAY[4294967296,0,0,0]::bigint[]);
+  INSERT INTO witness(id,trust) VALUES(source_id,0);
+  SELECT array_agg(outcome ORDER BY outcome),array_agg(occurrences ORDER BY outcome)
+    INTO outcomes,counts FROM laplace_testimony(ARRAY[a,a],ARRAY[source_id]);
+  IF outcomes IS DISTINCT FROM ARRAY[0,1,2]::smallint[] OR counts IS DISTINCT FROM ARRAY[1,1,2]::bigint[] THEN
+    RAISE EXCEPTION 'Native testimony lost stored outcomes, multiplicity or duplicate-input identity: %, %',outcomes,counts;
+  END IF;
+  IF EXISTS(SELECT FROM laplace_testimony(ARRAY[a],ARRAY[source_id])
+    WHERE source<>source_id OR context NOT IN(positive,neutral,negative) OR ordinal<>1 OR trust<>0
+       OR tokens<>occurrences OR dependence_root IS NOT NULL OR calculation) THEN
+    RAISE EXCEPTION 'Native testimony changed record context, registration, ordinal or qualifiers';
+  END IF;
+  IF EXISTS(
+    (SELECT claim,source,sum(occurrences)::float8,sum(tokens)::float8,sum(occurrences*score)
+     FROM laplace_testimony(ARRAY[a]) GROUP BY claim,source
+     EXCEPT ALL SELECT claim,trunk,games,tokens,score FROM laplace_attested(ARRAY[a]) WHERE witness)
+    UNION ALL
+    (SELECT claim,trunk,games,tokens,score FROM laplace_attested(ARRAY[a]) WHERE witness
+     EXCEPT ALL SELECT claim,source,sum(occurrences)::float8,sum(tokens)::float8,sum(occurrences*score)
+     FROM laplace_testimony(ARRAY[a]) GROUP BY claim,source)
+  ) THEN RAISE EXCEPTION 'Record testimony does not reproduce exact existing source totals'; END IF;
+  IF EXISTS(SELECT FROM laplace_testimony('{}'::blake3[])) OR
+     EXISTS(SELECT FROM laplace_testimony(ARRAY[a],'{}'::blake3[])) THEN
+    RAISE EXCEPTION 'Empty testimony selection returned evidence';
+  END IF;
+END $$;
 -- One corpus may contain curated and calculated testimony. Calculation is a
 -- contained registry-class qualifier, not a second witness. Copies of that
 -- calculation in another corpus still share its dependence root.
@@ -648,6 +684,9 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
     WHERE witness AND dependence_root=cls AND trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'contained calculation did not retain its class root and trust'; END IF;
+  SELECT count(*) INTO found FROM laplace_testimony(ARRAY[c],ARRAY[first_source,second_source])
+    WHERE dependence_root=cls AND calculation AND trust=0.70 AND outcome=2 AND occurrences=1 AND score=1;
+  IF found<>2 THEN RAISE EXCEPTION 'Native record testimony lost its declared calculation class'; END IF;
   SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[first_source,second_source])
     WHERE claim=c AND dependence_root=cls AND dependence_trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'downward calculation lost its dependence root or trust'; END IF;

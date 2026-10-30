@@ -128,6 +128,14 @@ CREATE FUNCTION @extschema@.laplace_attested(claims @extschema@.blake3[], includ
 
     AS 'MODULE_PATHNAME', 'laplace_attested';
 
+CREATE FUNCTION @extschema@.laplace_testimony(claims @extschema@.blake3[], sources @extschema@.blake3[] DEFAULT NULL,
+    OUT claim @extschema@.blake3, OUT source @extschema@.blake3, OUT context @extschema@.blake3,
+    OUT ordinal bigint, OUT outcome smallint, OUT occurrences bigint, OUT tokens bigint,
+    OUT score double precision, OUT "position" integer, OUT trust double precision,
+    OUT dependence_root @extschema@.blake3, OUT calculation boolean) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_testimony';
+
 CREATE FUNCTION @extschema@.laplace_attested_series(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean, OUT dependence_root @extschema@.blake3) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
 
