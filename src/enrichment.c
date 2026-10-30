@@ -1059,8 +1059,6 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
  * Route copied IDs through the same Native partition bounds as enrichment;
  * neither scan public paths again nor sweep unrelated destination indexes. */
 PG_FUNCTION_INFO_V1(laplace_clean_stage);
-PG_FUNCTION_INFO_V1(laplace_stage_partitions);
-PG_FUNCTION_INFO_V1(laplace_clean_partitions);
 typedef struct { Oid target;Relation parent;HTAB *touched; } CleanStage;
 static void clean_stage_row(TupleTableSlot *slot,void *context)
 {
@@ -1069,9 +1067,9 @@ static void clean_stage_row(TupleTableSlot *slot,void *context)
     Oid partition=enrichment_partition(stage->target,RelationGetPartitionKey(stage->parent),RelationGetPartitionDesc(stage->parent,true),id);
     hash_search(stage->touched,&partition,HASH_ENTER,NULL);
 }
-static ArrayType *stage_partition_ids(Oid input)
+Datum laplace_clean_stage(PG_FUNCTION_ARGS)
 {
-    MemoryContext caller=CurrentMemoryContext;
+    Oid input = PG_GETARG_OID(0);
     Relation stage = table_open(input, AccessShareLock);
     Oid target = lp_pg_relation("physicality");
     Relation parent = table_open(target, AccessShareLock);
@@ -1100,34 +1098,10 @@ static ArrayType *stage_partition_ids(Oid input)
     if (!plan) ereport(ERROR, (errmsg("laplace_clean_stage: selection plan failed")));
     CleanStage scan={target,parent,touched};lp_pg_stream(plan,NULL,clean_stage_row,&scan);SPI_freeplan(plan);
     int count = hash_get_num_entries(touched), at = 0;
-    Datum *values = MemoryContextAlloc(caller,sizeof(Datum) * Max(count, 1));
+    Datum *values = palloc(sizeof(Datum) * Max(count, 1));
     HASH_SEQ_STATUS entries; hash_seq_init(&entries, touched); Oid *partition;
     while ((partition = hash_seq_search(&entries))) values[at++] = ObjectIdGetDatum(*partition);
-    hash_destroy(touched);SPI_finish();
-    table_close(stage, NoLock);table_close(parent, NoLock);
-    pfree(source);pfree(selection);
-    ArrayType *ids=construct_array(values,count,OIDOID,sizeof(Oid),true,TYPALIGN_INT);
-    pfree(values);return ids;
-}
-
-/* Deferred merges return storage identities, never assumptions about a hash
- * prefix or partition count. The same restricted authority drains the union
- * once all child waves in a working window have committed. */
-static int64 clean_partition_ids(ArrayType *ids)
-{
-    Relation parent=table_open(lp_pg_relation("physicality"),AccessShareLock);
-    PartitionDesc parts=RelationGetPartitionDesc(parent,true);
-    HASHCTL control={.keysize=sizeof(Oid),.entrysize=sizeof(Oid)};
-    HTAB *allowed=hash_create("Native maintenance partitions",Max(parts->nparts,1),&control,HASH_ELEM|HASH_BLOBS);
-    for(int i=0;i<parts->nparts;i++)hash_search(allowed,&parts->oids[i],HASH_ENTER,NULL);
-    ArrayIterator iterator=array_create_iterator(ids,0,NULL);Datum item;bool missing;
-    while(array_iterate(iterator,&item,&missing)){
-        Oid partition=missing?InvalidOid:DatumGetObjectId(item);
-        if(missing || !hash_search(allowed,&partition,HASH_FIND,NULL))
-            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_clean_partitions requires Native physicality partitions")));
-    }
-    array_free_iterator(iterator);hash_destroy(allowed);
-    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_clean_partitions: SPI_connect")));
+    ArrayType *ids = construct_array(values, count, OIDOID, sizeof(Oid), true, TYPALIGN_INT);
     Oid type = OIDARRAYOID; Datum parameter = PointerGetDatum(ids);
     if (lp_pg_execute_args("SELECT @extschema@.laplace_clean_pending_list(i.indexrelid)"
         " FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid"
@@ -1140,22 +1114,8 @@ static int64 clean_partition_ids(ArrayType *ids)
         Datum pages = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing);
         if (!missing) cleaned += DatumGetInt64(pages);
     }
-    SPI_freetuptable(SPI_tuptable);SPI_finish();table_close(parent,NoLock);
-    return cleaned;
-}
-
-Datum laplace_stage_partitions(PG_FUNCTION_ARGS)
-{
-    PG_RETURN_ARRAYTYPE_P(stage_partition_ids(PG_GETARG_OID(0)));
-}
-
-Datum laplace_clean_partitions(PG_FUNCTION_ARGS)
-{
-    PG_RETURN_INT64(clean_partition_ids(PG_GETARG_ARRAYTYPE_P(0)));
-}
-
-Datum laplace_clean_stage(PG_FUNCTION_ARGS)
-{
-    ArrayType *ids=stage_partition_ids(PG_GETARG_OID(0));
-    int64 cleaned=clean_partition_ids(ids);pfree(ids);PG_RETURN_INT64(cleaned);
+    SPI_freetuptable(SPI_tuptable); pfree(ids); pfree(values); hash_destroy(touched);
+    SPI_finish(); table_close(stage, NoLock); table_close(parent, NoLock);
+    pfree(source); pfree(selection);
+    PG_RETURN_INT64(cleaned);
 }
