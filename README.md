@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.53-to-1.54 development
+CMake includes it in both the baseline and the in-place 1.38–1.54-to-1.55 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -74,6 +74,13 @@ realizes an ordered set of selected IDs in one context, preserves duplicate inpu
 occurrences and compressed runs, and reads shared descendants once. Scalar
 `laplace_text` uses the same reader. Newly discovered nodes form each frontier;
 transfer windows follow `work_mem` and PostgreSQL's actual array capacity.
+
+`laplace_parts(geometry)` projects ordered logical IDs from an already acquired
+path using the Native run decoder. It retains repetitions and performs no
+database lookup. Query adapters use this overload rather than fetching the
+same carrier again by ID; `laplace_parts(text)` retains its text decomposition
+contract, and `laplace_vertex_ids` retains its distinct sorted index-key contract.
+
 Text and label classification/rendering use explicit Native occurrence stacks,
 preserving child order and runs without a fixed altitude cutoff or recursive C
 calls. Cyclic carriers are rejected; output and working memory remain subject to

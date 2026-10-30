@@ -23,6 +23,12 @@ DO $$ DECLARE
  orphan blake3;
  counts bigint[];
 BEGIN
+ IF laplace_parts(laplace_path(ARRAY[b,a,a,c,b])) IS DISTINCT FROM ARRAY[b,a,a,c,b]
+    OR laplace_parts(laplace_path(ARRAY[a])) IS DISTINCT FROM ARRAY[a]
+    OR laplace_parts(ST_GeomFromText('LINESTRING ZM EMPTY')) IS DISTINCT FROM '{}'::blake3[]
+    OR laplace_parts(NULL::geometry) IS NOT NULL THEN
+   RAISE EXCEPTION 'acquired path lost ordered constituents or compressed repetitions';
+ END IF;
  separator:=pg_temp.ordered_node(ARRAY[laplace_cp_id(13),laplace_cp_id(10)]);
  IF cardinality(laplace_separator_ids())<>85
     OR NOT separator=ANY(laplace_separator_ids())

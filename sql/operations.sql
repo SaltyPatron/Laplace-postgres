@@ -1,4 +1,8 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry) RETURNS @extschema@.blake3[]
+    AS 'MODULE_PATHNAME','laplace_path_parts' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry)
+    IS 'Ordered logical constituents of an already acquired Native path, including every RLE repetition. No entity or physicality lookup; unlike laplace_vertex_ids, this preserves order and duplicates.';
 -- Distinct metrics retain their own exact access paths. Tier is a key prefix,
 -- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
 CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity(tier,hilbert,id);

@@ -89,6 +89,7 @@ laplace_path_ends	false
 laplace_path_enrich_ewkb	false
 laplace_path_ewkb	false
 laplace_path_length	false
+laplace_path_parts	false
 laplace_path_overlaps	false
 laplace_path_starts	false
 laplace_path_times	false

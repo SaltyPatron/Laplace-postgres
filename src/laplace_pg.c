@@ -224,6 +224,15 @@ Datum laplace_path_length(PG_FUNCTION_ARGS){
     if (n > PG_INT64_MAX) ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("laplace_path_length: run count exceeds bigint")));
     PG_RETURN_INT64((int64)n);
 }
+PG_FUNCTION_INFO_V1(laplace_path_parts);
+Datum laplace_path_parts(PG_FUNCTION_ARGS){
+    Geo g=geo_of(PG_GETARG_DATUM(0));size_t n=lp_path_len(g.p);
+    if(n>INT_MAX || n>MaxAllocSize/sizeof(lp_id))
+        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("laplace_parts: expanded path exceeds array capacity")));
+    lp_id *ids=palloc(sizeof(*ids)*Max(n,(size_t)1));
+    if(lp_path_expand(g.p,ids,n)!=n)ereport(ERROR,(errmsg("laplace_parts: incomplete path expansion")));
+    ArrayType *result=id_array(fcinfo,ids,(int)n);pfree(ids);PG_RETURN_ARRAYTYPE_P(result);
+}
 
 /* One Native solve for a complete claim, not sequential updates of its previous
  * standing. Scores here are mean outcomes; containment's summed wins are
