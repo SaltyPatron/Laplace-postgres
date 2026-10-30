@@ -32,6 +32,10 @@
 #include <limits.h>
 
 typedef struct { Oid partition; lp_id id; int64 ordinal; } PresenceKey;
+/* A carrier already read under this statement's snapshot. Keep only its
+ * location, not another copy of its potentially large geometry. This prefix
+ * is shared by plain carrier maps and scored-claim map entries. */
+typedef struct { Oid partition; ItemPointerData tuple; } CarrierLocation;
 static long enrichment_fetch_rows(void);
 static int presence_order(const void *a,const void *b)
 {
@@ -119,6 +123,48 @@ static void indexed_keys(Relation parent,const char *column,PresenceKey *keys,si
                          NativeKeyVisit visit,void *context)
 {
     indexed_keys_until(parent,column,keys,count,visit,context,NULL);
+}
+
+/* Reuse GIN's acquired row locations after standing qualification. Sorting by
+ * the same partition/ID key as indexed_keys preserves its visit/fan order.
+ * Parent ACL/RLS checks and child locks were established before nomination;
+ * the original active snapshot remains authoritative for heap visibility. */
+static void acquired_rows(Relation parent,PresenceKey *keys,size_t count,lp_idmap *carriers,
+                          NativeKeyVisit visit,void *context,const bool *done)
+{
+    for(size_t i=0;i<count;i++){
+        const CarrierLocation *location=lp_idmap_at(carriers,(size_t)keys[i].ordinal-1);
+        if(!OidIsValid(location->partition) || !ItemPointerIsValid(&location->tuple))
+            ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native acquired carrier has no row location")));
+        keys[i].partition=location->partition;
+    }
+    lp_sort(keys,count,sizeof(*keys),presence_order);
+    Snapshot snapshot=GetActiveSnapshot();
+    for(size_t begin=0;begin<count && (!done || !*done);){
+        size_t end=begin+1;while(end<count && keys[end].partition==keys[begin].partition)end++;
+        Relation table=table_open(keys[begin].partition,AccessShareLock);
+        TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
+        TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
+        TupleTableSlot *slot=table_slot_create(table,NULL);
+        AttrNumber identity=get_attnum(RelationGetRelid(table),"entity");
+        for(size_t i=begin;i<end && (!done || !*done);i++){
+            CHECK_FOR_INTERRUPTS();
+            const CarrierLocation *location=lp_idmap_at(carriers,(size_t)keys[i].ordinal-1);
+            ItemPointerData tuple=location->tuple;
+            if(!table_tuple_fetch_row_version(table,&tuple,snapshot,slot))
+                ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native acquired carrier lost its snapshot-visible row")));
+            bool missing;Datum id=slot_getattr(slot,identity,&missing);
+            if(missing || !lp_id_eq((const lp_id *)DatumGetPointer(id),&keys[i].id))
+                ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native acquired carrier identity changed")));
+            TupleTableSlot *row=conversion?execute_attr_map_slot(conversion->attrMap,slot,projected):slot;
+            visit(row,keys+i,context);
+            if(projected)ExecClearTuple(projected);
+            ExecClearTuple(slot);
+        }
+        ExecDropSingleTupleTableSlot(slot);
+        if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
+        table_close(table,NoLock);begin=end;
+    }
 }
 
 typedef struct { FunctionCallInfo fcinfo; Tuplestorestate *output; TupleDesc descriptor; } PresenceOutput;
@@ -306,7 +352,8 @@ static void container_remember(TupleTableSlot *slot,AttrNumber id,lp_idmap *pare
 {
     bool missing;Datum value=slot_getattr(slot,id,&missing);
     if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native containment parent identity is null")));
-    lp_idmap_put(parents,(const lp_id *)DatumGetPointer(value),NULL);
+    CarrierLocation *location=lp_idmap_get(parents,(const lp_id *)DatumGetPointer(value),NULL);
+    *location=(CarrierLocation){slot->tts_tableOid,slot->tts_tid};
 }
 static bool container_endpoint_matches(TupleTableSlot *slot,AttrNumber path,lp_idmap *wanted,int endpoint)
 {
@@ -428,7 +475,9 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             MemoryContext previous=MemoryContextSwitchTo(scratch);
             if(endpoint?(!recheck || container_endpoint_matches(slot,path,wanted,endpoint)):
                ((!recheck && (strategy==3 || unique<=window)) || container_matches(slot,path,wanted,strategy==7,&epoch))){
+                slot->tts_tableOid=relation_id;
                 TupleTableSlot *row=conversion?execute_attr_map_slot(conversion->attrMap,slot,projected):slot;
+                if(projected){row->tts_tableOid=relation_id;row->tts_tid=slot->tts_tid;}
                 proceed=visit(row,context);if(projected)ExecClearTuple(projected);
             }
             MemoryContextSwitchTo(previous);MemoryContextReset(scratch);ExecClearTuple(slot);
@@ -456,11 +505,18 @@ void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path
 {
     if(!count)return;
     const char *column;Relation parent=presence_parent(lp_pg_relation("physicality"),&column,masks?3:2);
-    lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_new();
+    lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_sized(sizeof(CarrierLocation));
     PG_TRY();{
         for(size_t i=0;i<count;i++)lp_idmap_put(wanted,ids+i,NULL);
-        scan_containers(parent,column,wanted,parents,3,0);table_close(parent,NoLock);
-        lp_pg_lookup_paths(lp_idmap_keys(parents),lp_idmap_count(parents),masks,visit,context);
+        scan_containers(parent,column,wanted,parents,3,0);
+        size_t found=lp_idmap_count(parents);
+        PresenceKey *keys=palloc_extended(Max(found,(size_t)1)*sizeof(*keys),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
+        PathFrontier front={visit,context,get_attnum(RelationGetRelid(parent),"path"),
+            masks?get_attnum(RelationGetRelid(parent),"mask"):InvalidAttrNumber,
+            AllocSetContextCreate(CurrentMemoryContext,"Native acquired path tuple",ALLOCSET_DEFAULT_SIZES)};
+        acquired_rows(parent,keys,found,parents,path_frontier_visit,&front,NULL);
+        MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
     }PG_FINALLY();{lp_idmap_free(wanted);lp_idmap_free(parents);}PG_END_TRY();
 }
 
@@ -530,7 +586,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
     Relation parent=read_parent(target,&column,selected,lengthof(selected));
     out.path=get_attnum(target,"path");out.tier=get_attnum(target,"tier");out.mask=get_attnum(target,"mask");
     out.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native container output",ALLOCSET_DEFAULT_SIZES);
-    lp_idmap *wanted=lp_idmap_sized(sizeof(uint64)),*parents=lp_idmap_new();
+    lp_idmap *wanted=lp_idmap_sized(sizeof(uint64)),*parents=lp_idmap_sized(sizeof(CarrierLocation));
     PG_TRY();{
         for(int i=0;i<count;i++){
             bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);
@@ -540,7 +596,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended((found?found:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
-        indexed_keys(parent,column,keys,found,container_row,&out);pfree(keys);
+        acquired_rows(parent,keys,found,parents,container_row,&out,NULL);pfree(keys);
     }PG_FINALLY();{lp_idmap_free(wanted);lp_idmap_free(parents);}PG_END_TRY();
     MemoryContextDelete(out.tuple_context);table_close(parent,NoLock);pfree(ids);PG_RETURN_NULL();
 }
@@ -655,7 +711,7 @@ PG_FUNCTION_INFO_V1(laplace_present_ids);
  * tier and a real standing must all survive. ID order makes bounded results
  * independent of heap order; per-input duplicates retain their ordinals. */
 typedef struct {uint64 epoch,sent;int head,floor;} ClaimKey;
-typedef struct {bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
+typedef struct {CarrierLocation carrier;bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*parents,*required,*opposite;lp_id *refuse,*include;int nrefuse,ninclude,*links;
     bool each,done;uint64 limit,sent,saturated,epoch;int floor,endpoint;int64 arity;lp_mask bits;
@@ -699,7 +755,9 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     value=slot_getattr(slot,read->id,&missing);
     if(missing)ereport(ERROR,(errmsg("Native claim identity is null")));
     bool fresh;size_t at=lp_idmap_put(read->parents,(const lp_id *)DatumGetPointer(value),&fresh);
-    if(fresh)memset(lp_idmap_at(read->parents,at),0,sizeof(ClaimStanding));
+    ClaimStanding *standing=lp_idmap_at(read->parents,at);
+    if(fresh)memset(standing,0,sizeof(*standing));
+    standing->carrier=(CarrierLocation){slot->tts_tableOid,slot->tts_tid};
     return true;
 }
 static void claim_standing(TupleTableSlot *slot,const PresenceKey *key,void *context)
@@ -707,7 +765,8 @@ static void claim_standing(TupleTableSlot *slot,const PresenceKey *key,void *con
     ClaimRead *read=context;ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
     Datum values[4];
     for(int i=0;i<4;i++){bool missing;values[i]=slot_getattr(slot,read->standing[i],&missing);if(missing)ereport(ERROR,(errmsg("Native claim standing is null")));}
-    *standing=(ClaimStanding){true,DatumGetFloat8(values[0]),DatumGetFloat8(values[1]),DatumGetFloat8(values[2]),DatumGetInt64(values[3])};
+    *standing=(ClaimStanding){.carrier=standing->carrier,.known=true,.rating=DatumGetFloat8(values[0]),
+        .deviation=DatumGetFloat8(values[1]),.volatility=DatumGetFloat8(values[2]),.matches=DatumGetInt64(values[3])};
 }
 static void claim_carrier(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
@@ -800,7 +859,7 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         indexed_keys(standings,column,keys,n,claim_standing,&read);table_close(standings,NoLock);
         size_t known=0;for(size_t i=0;i<n;i++)if(((ClaimStanding *)lp_idmap_at(read.parents,(size_t)keys[i].ordinal-1))->known)keys[known++]=keys[i];
         read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
-        indexed_keys_until(paths,"entity",keys,known,claim_carrier,&read,&read.done);
+        acquired_rows(paths,keys,known,read.parents,claim_carrier,&read,&read.done);
         MemoryContextDelete(read.tuple_context);pfree(keys);table_close(paths,NoLock);
     }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);lp_idmap_free(read.opposite);}PG_END_TRY();
     pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);pfree(read.links);return (Datum)0;

@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.57-to-1.58 development
+CMake includes it in both the baseline and the in-place 1.38–1.58-to-1.59 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -157,9 +157,13 @@ no arbitrary subset. A single work_mem-bounded spool holds tentative results,
 spilling through PostgreSQL when needed. No per-row or per-partition SPI is
 used, no extra connections are opened, and no planner settings are changed.
 
-`laplace_claims` and `laplace_claims_each` use that same GIN/primary-key kernel
+`laplace_claims` and `laplace_claims_each` use that same indexed frontier
 for scored responders. Native applies mask, middle-refusal and tier rules,
 reads consensus as an exact ID set, then elects responders in ID order.
+GIN already acquires each candidate carrier. Claims and containment retain
+those MVCC row locations and reuse them after qualification, preserving the
+existing partition/ID visit order without seeking the same paths by primary key
+again. The original snapshot and exact carrier identity are checked on reuse.
 Qualification precedes the per-input fan; NULL fan returns the complete set.
 Duplicate input ordinals, compressed runs and 64-bit counts are preserved.
 The functions perform no SPI planning over the partitioned relations.
@@ -168,9 +172,9 @@ Partition bounds route keys, and PostgreSQL's tuple-conversion map projects
 child storage into the parent's declared columns. Renaming or reordering a
 partition's physical columns cannot change the returned ID, tier or carrier.
 
-Containment frontiers, explicit root/claim selections and series-carrier
-validation reuse that primary-key kernel. Only compact ID keys are sorted;
-Native visits their range indexes in ID order and consumes paths directly.
+Explicit root/claim selections and series-carrier validation reuse the
+primary-key kernel. Containment frontiers reuse their acquired carrier rows.
+Only compact ID keys are sorted; Native consumes paths in the same ID order.
 This avoids a cardinality-dependent SQL join choosing full physicality scans
 and a multi-gigabyte external sort. Path/mask column privileges and the shared
 relation's RLS boundary are checked before direct access. Tuple detoasting is
@@ -181,7 +185,7 @@ table access applies MVCC visibility. When its memory budget requires page-level
 instead of tuple-level candidates, Native rechecks each candidate path against
 the exact 128-bit ID set. This bitmap representation never approximates IDs or
 discards true matches. Duplicate parent IDs are reduced before the shared
-primary-index reader visits them in ID order. Each partition's bitmap follows
+carrier reader visits them in ID order. Each partition's bitmap follows
 `work_mem`; array windows follow the same budget and PostgreSQL's representation
 limits. Large selections stream the GIN membership-key range against the owned
 Native ID set; small selections seek individual entries. Neither switches to a

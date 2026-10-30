@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
-project(LaplacePostgres VERSION 1.58.0 LANGUAGES C CXX ASM)
+project(LaplacePostgres VERSION 1.59.0 LANGUAGES C CXX ASM)
 include(cmake/LaplacePgExecutor.cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
