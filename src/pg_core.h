@@ -64,13 +64,13 @@ static inline size_t frontier_window_ids(void)
 }
 /* The generic overlap operator can stream large membership ranges. Sparse
  * stored-ID frontiers need exact entry seeks instead: their random BLAKE3
- * bounds otherwise cover almost the whole GIN dictionary. Keep transfer
- * windows below that operator's range-switch boundary, without limiting IDs. */
+ * bounds otherwise cover almost the whole GIN dictionary. Native callers select
+ * the access strategy explicitly, without limiting the input identities. */
 #define LP_PG_GIN_RANGE_IDS (BLCKSZ / sizeof(lp_id))
-static inline size_t gin_exact_window_ids(void)
-{
-    return Min(frontier_window_ids(), LP_PG_GIN_RANGE_IDS - 1);
-}
+/* Native ScanKeys can request exact postings without exposing a second SQL
+ * operator. The support routines recognize this access strategy; its predicate
+ * and lossy recheck are the ordinary overlap operation. */
+#define LP_PG_GIN_EXACT_OVERLAPS 10
 
 static inline Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
 

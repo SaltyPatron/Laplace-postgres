@@ -333,6 +333,8 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
     size_t budget=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
+    bool first_leaf=true;
+    elog(DEBUG1,"Native containment frontier: %zu IDs; strategy %u; endpoint %d",unique,strategy,endpoint);
     size_t nrequired=required?lp_idmap_count(required):0;
     ArrayType *required_keys=nrequired?id_array_of(element,lp_idmap_keys(required),(int)(required_any?nrequired:Min(budget,nrequired))):NULL;
     Datum mask_values[64];int nbits=0;
@@ -354,11 +356,14 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
             GinStatsData stats;ginGetStats(index,&stats);
             /* A small dictionary is cheaper to stream than millions of absent
-             * seeks. A sparse set in a larger dictionary uses exact postings.
-             * Stale statistics change cost only; both paths recheck all IDs. */
+             * seeks. For a sparse set, ask the support routine for exact keys
+             * in ONE memory-bounded scan. Artificial 511-ID windows otherwise
+             * rescan the GIN pending list and repeat entry-tree descent. */
             if(stats.nEntries>0 && (uint64)stats.nEntries>unique)
-                window=gin_exact_window_ids();
+                nomination=LP_PG_GIN_EXACT_OVERLAPS;
+            if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; strategy %u; window %zu",stats.nEntries,nomination,window);
         }
+        first_leaf=false;
         ScanKeyData key[3];int nkeys=required_keys?2:1;
         ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,(Datum)0);
         if(required_keys){

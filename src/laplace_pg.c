@@ -1082,7 +1082,7 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
         d[0] = path_key((const lp_id *)PG_GETARG_POINTER(0), st == LP_STRAT_FIRST ? PATH_FIRST : PATH_LAST);
         *n = 1; PG_RETURN_POINTER(d);
     }
-    if (st != LP_STRAT_CONTAINS && st != LP_STRAT_OVERLAPS) ereport(ERROR, (errmsg("laplace: unknown path GIN strategy %u", st)));
+    if (st != LP_STRAT_CONTAINS && st != LP_STRAT_OVERLAPS && st != LP_PG_GIN_EXACT_OVERLAPS) ereport(ERROR, (errmsg("laplace: unknown path GIN strategy %u", st)));
     ArrayType *array=PG_GETARG_ARRAYTYPE_P(0);
     /* A page of identity operands selects a streamed key range. This changes
      * access mechanics only; all input IDs and exact endpoint roles remain. */
@@ -1103,12 +1103,12 @@ PG_FUNCTION_INFO_V1(laplace_gin_consistent);
 Datum laplace_gin_consistent(PG_FUNCTION_ARGS){
     bool *check = (bool *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
     *(bool *)PG_GETARG_POINTER(5) = false; /* Exact key postings; page-level bitmap candidates still require rechecks. */
-    PG_RETURN_BOOL(st == LP_STRAT_OVERLAPS ? bool_any(check, n) : bool_all(check, n));
+    PG_RETURN_BOOL(st == LP_STRAT_OVERLAPS || st == LP_PG_GIN_EXACT_OVERLAPS ? bool_any(check, n) : bool_all(check, n));
 }
 PG_FUNCTION_INFO_V1(laplace_gin_triconsistent);
 Datum laplace_gin_triconsistent(PG_FUNCTION_ARGS){
     const GinTernaryValue *check = (const GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
-    PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
+    PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_OVERLAPS || st == LP_PG_GIN_EXACT_OVERLAPS ? tri_any(check, n) : tri_all(check, n));
 }
 
 /* A scan can test millions of short paths against one large frontier. Build

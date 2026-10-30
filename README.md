@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.51-to-1.52 development
+CMake includes it in both the baseline and the in-place 1.38–1.53-to-1.54 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -243,9 +243,13 @@ interface does not replace the ingest spine's client-side novelty descent.
 The lower layers are inventoried in [Native's interface map](../Laplace-Native/README.md#shared-interfaces-from-codepoints-upward).
 This extension adds PostgreSQL access and result adapters above those kernels.
 
-Large containment selections use GIN's [partial-match interface](https://www.postgresql.org/docs/18/gin.html#GIN-PARTIAL-MATCH)
-to stream the membership-key range against one Native ID set. Small selections
-retain ordinary entry seeks. PostgreSQL owns pending lists, posting trees,
+Large SQL overlap selections use GIN's [partial-match interface](https://www.postgresql.org/docs/18/gin.html#GIN-PARTIAL-MATCH)
+to stream the membership-key range against one Native ID set. Native containment
+chooses streamed matching for a small dictionary and exact entry seeks for a
+sparse frontier in a larger dictionary. An internal ScanKey strategy requests
+exact postings for the complete memory-bounded array, without splitting at the
+SQL operator's range-switch boundary. Each leaf opens once, unions every transfer
+window into one bitmap, and visits its heap once. PostgreSQL owns pending lists, posting trees,
 bitmap visibility and concurrency in both cases. No cardinality threshold
 switches a frontier to a physicality heap scan. Existing index keys retain all
 128 ID bits and their endpoint role, so this support-method update needs no

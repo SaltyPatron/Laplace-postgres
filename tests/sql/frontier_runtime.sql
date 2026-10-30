@@ -41,7 +41,7 @@ END $$;
 -- Build its ID, coordinate and Hilbert key through the Native composition API.
 DO $$
 DECLARE ids blake3[]; coords geometry[]; parent blake3; path geometry;
-        projection record; child_tier smallint; index_id oid; found bigint;
+        projection record; child_tier smallint; index_id oid; found bigint; memory text;
 BEGIN
  SELECT array_agg(e.id ORDER BY e.id),array_agg(e.coord ORDER BY e.id),max(e.tier)
  INTO ids,coords,child_tier FROM frontier_words w JOIN public.entity e ON e.id=laplace_id(w.content);
@@ -56,10 +56,13 @@ BEGIN
    JOIN pg_catalog.pg_am a ON a.oid=c.relam
    WHERE i.indrelid=(SELECT tableoid FROM public.physicality WHERE entity=parent) AND a.amname='gin'
  LOOP PERFORM public.laplace_clean_pending_list(index_id::regclass); END LOOP;
- SELECT count(*) INTO found FROM public.laplace_holders(
-   ids[1:513] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i)) h
- WHERE h.entity=parent;
- IF found<>1 THEN RAISE EXCEPTION 'sparse frontier lost or repeated its canonical parent: %',found; END IF;
+ FOREACH memory IN ARRAY ARRAY['64kB','16MB'] LOOP
+   PERFORM set_config('work_mem',memory,true);
+   SELECT count(*) INTO found FROM public.laplace_holders(
+     ids[1:513] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i)) h
+   WHERE h.entity=parent;
+   IF found<>1 THEN RAISE EXCEPTION 'sparse frontier lost or repeated its canonical parent under %: %',memory,found; END IF;
+ END LOOP;
 END $$;
 ROLLBACK;
 SELECT 'frontier runtime: complete traversal over 17000 canonical paths passed';
