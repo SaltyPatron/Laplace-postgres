@@ -75,6 +75,16 @@ BEGIN
        RAISE EXCEPTION 'endpoint set changed input ordinals under %, direction %: %',memory,endpoint,found;
      END IF;
    END LOOP;
+   FOR endpoint IN 1..2 LOOP
+     SELECT count(*) INTO found FROM public.laplace_claims_each(
+       ids[1:513] || ids[17000:17000] || ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(100001,100487) i),
+       NULL::bigint,'{}'::smallint[],'{}'::blake3[],endpoint::smallint,NULL::blake3[],NULL::bigint,
+       ARRAY(SELECT md5(i::text)::blake3 FROM generate_series(110001,111000) i) ||
+       CASE WHEN endpoint=1 THEN ids[17000:17000] ELSE ids[1:1] END) c WHERE c.entity=parent;
+     IF found<>1 THEN
+       RAISE EXCEPTION 'opposite endpoint intersection lost complete transfer windows or RLE under %, direction %: %',memory,endpoint,found;
+     END IF;
+   END LOOP;
  END LOOP;
 END $$;
 ROLLBACK;

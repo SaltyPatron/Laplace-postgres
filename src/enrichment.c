@@ -323,7 +323,7 @@ static bool container_endpoint_matches(TupleTableSlot *slot,AttrNumber path,lp_i
  * Array windows are transport bounds; lossy rechecks use the complete set. */
 typedef bool (*ContainerVisit)(TupleTableSlot *slot,void *context);
 static void scan_container_rows(Relation parent,const char *column,lp_idmap *wanted,StrategyNumber strategy,
-                                 lp_idmap *required,bool required_any,int endpoint,lp_mask bits,ContainerVisit visit,void *context)
+                                 lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,ContainerVisit visit,void *context)
 {
     if(GinFuzzySearchLimit)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native containment requires exact GIN search (gin_fuzzy_search_limit=0)")));
@@ -333,6 +333,10 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
     size_t budget=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
+    /* Every extra key needs an entry-tree probe in each partition. A broader
+     * opposite set is cheaper to test against the acquired primary candidates;
+     * claim_nominate still qualifies its complete set before standing and fan. */
+    bool indexed_opposite=opposite && lp_idmap_count(opposite)<=unique;
     bool first_leaf=true;
     elog(DEBUG1,"Native containment frontier: %zu IDs; strategy %u; endpoint %d",unique,strategy,endpoint);
     size_t nrequired=required?lp_idmap_count(required):0;
@@ -364,7 +368,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; strategy %u; window %zu",stats.nEntries,nomination,window);
         }
         first_leaf=false;
-        ScanKeyData key[3];int nkeys=required_keys?2:1;
+        ScanKeyData key[4];int nkeys=required_keys?2:1;
         ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,(Datum)0);
         if(required_keys){
             StrategyNumber selection=required_any?3:7;
@@ -372,6 +376,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             if(!OidIsValid(operation))ereport(ERROR,(errmsg("Native required membership needs its GIN operation")));
             ScanKeyEntryInitialize(key+1,0,index_column,selection,array_type,index->rd_indcollation[index_column-1],get_opcode(operation),PointerGetDatum(required_keys));
         }
+        int opposite_key=indexed_opposite?nkeys++:-1;
         /* The canonical GIN index already stores path AND mask. Push
          * positive carrier bits into that same access method: filtering
          * after the heap fetched every text parent defeats the index. A
@@ -390,18 +395,29 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         TIDBitmap *bitmap=tbm_create((Size)work_mem*1024,NULL);
         for(size_t begin=0;begin<unique;begin+=window){
             size_t amount=Min(window,unique-begin);
-            if(endpoint){
-                for(int end=0;end<2;end++)if(endpoint&(1<<end)){
-                    ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
+            ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
+            size_t opposite_count=indexed_opposite?lp_idmap_count(opposite):1;
+            for(size_t other=0;other<opposite_count;other+=window){
+                ArrayType *other_keys=NULL;
+                if(indexed_opposite){
+                    other_keys=id_array_of(element,lp_idmap_keys(opposite)+other,(int)Min(window,opposite_count-other));
+                    ScanKeyEntryInitialize(key+opposite_key,0,index_column,
+                        endpoint==1?LP_PG_GIN_LAST_ANY:LP_PG_GIN_FIRST_ANY,array_type,
+                        index->rd_indcollation[index_column-1],operation,PointerGetDatum(other_keys));
+                }
+                if(endpoint){
+                  for(int end=0;end<2;end++)if(endpoint&(1<<end)){
                     ScanKeyEntryInitialize(key,0,index_column,end?LP_PG_GIN_LAST_ANY:LP_PG_GIN_FIRST_ANY,array_type,
                         index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
-                    index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);pfree(keys);
+                    index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);
+                  }
+                }else{
+                    ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
+                    index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);
                 }
-            }else{
-                ArrayType *keys=id_array_of(element,lp_idmap_keys(wanted)+begin,(int)amount);
-                ScanKeyEntryInitialize(key,0,index_column,nomination,operand,index->rd_indcollation[index_column-1],operation,PointerGetDatum(keys));
-                index_rescan(scan,key,nkeys,NULL,0);index_getbitmap(scan,bitmap);pfree(keys);
+                if(other_keys)pfree(other_keys);
             }
+            pfree(keys);
         }
         TableScanDesc heap=table_beginscan_bm(table,snapshot,0,NULL);
         heap->st.rs_tbmiterator=tbm_begin_iterate(bitmap,NULL,InvalidDsaPointer);
@@ -434,7 +450,7 @@ static bool container_parent(TupleTableSlot *slot,void *context)
 static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits)
 {
     ContainerParents out={get_attnum(RelationGetRelid(parent),"entity"),parents};
-    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,bits,container_parent,&out);
+    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,container_parent,&out);
 }
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,lp_pg_path_visit visit,void *context)
 {
@@ -611,7 +627,7 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
             read.links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        scan_container_rows(parent,column,read.wanted,3,read.required,false,0,read.kinds==1?UINT64_C(1):0,holder_row,&read);
+        scan_container_rows(parent,column,read.wanted,3,read.required,false,0,NULL,read.kinds==1?UINT64_C(1):0,holder_row,&read);
         if(read.pending){
             TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
             tuplestore_rescan(read.pending);
@@ -641,7 +657,7 @@ PG_FUNCTION_INFO_V1(laplace_present_ids);
 typedef struct {uint64 epoch,sent;int head,floor;} ClaimKey;
 typedef struct {bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
 typedef struct {
-    PresenceOutput output;lp_idmap *wanted,*parents,*required;lp_id *refuse,*include;int nrefuse,ninclude,*links;
+    PresenceOutput output;lp_idmap *wanted,*parents,*required,*opposite;lp_id *refuse,*include;int nrefuse,ninclude,*links;
     bool each,done;uint64 limit,sent,saturated,epoch;int floor,endpoint;int64 arity;lp_mask bits;
     AttrNumber id,path,tier,mask,standing[4];MemoryContext tuple_context;
 } ClaimRead;
@@ -664,6 +680,11 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     if(missing)ereport(ERROR,(errmsg("Native claim path is null")));
     Geo path=geo_of(value);
     if(read->arity && lp_path_len(path.p)!=(uint64)read->arity)return true;
+    if(read->opposite){
+        if(!path.p.n)return true;
+        lp_id id=lp_path_id(path.p,read->endpoint==1?path.p.n-1:0);
+        if(lp_idmap_find(read->opposite,&id)<0)return true;
+    }
     if(lp_path_middle_any(path.p,read->refuse,(size_t)read->nrefuse))return true;
     if(read->include && !lp_path_middle_any(path.p,read->include,(size_t)read->ninclude))return true;
     if(read->each){
@@ -745,9 +766,18 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         read.include=ids_of(PG_GETARG_ARRAYTYPE_P(5),&read.ninclude);
         if(!read.ninclude){pfree(ids);pfree(read.refuse);pfree(read.include);return (Datum)0;}
     }
+    lp_id *opposite=NULL;int nopposite=0;
+    if(PG_NARGS()>7 && !PG_ARGISNULL(7)){
+        if(read.endpoint!=1 && read.endpoint!=2)
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
+        opposite=ids_of(PG_GETARG_ARRAYTYPE_P(7),&nopposite);
+        if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);return (Datum)0;}
+        read.opposite=lp_idmap_new();
+    }
     read.wanted=lp_idmap_sized(sizeof(ClaimKey));read.parents=lp_idmap_sized(sizeof(ClaimStanding));read.required=lp_idmap_new();
     read.links=palloc_extended((Size)count*sizeof(int),MCXT_ALLOC_HUGE);
     PG_TRY();{
+        for(int i=0;i<nopposite;i++)lp_idmap_put(read.opposite,opposite+i,NULL);
         for(int i=0;i<read.ninclude;i++)lp_idmap_put(read.required,read.include+i,NULL);
         for(int i=count-1;i>=0;i--){bool fresh;size_t at=lp_idmap_put(read.wanted,ids+i,&fresh);ClaimKey *part=lp_idmap_at(read.wanted,at);
             if(fresh){memset(part,0,sizeof(*part));part->head=-1;}read.links[i]=part->head;part->head=i;}
@@ -761,7 +791,7 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
         Relation paths=read_parent(target,&column,path_columns,lengthof(path_columns));
         read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
-        scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.bits,claim_nominate,&read);
+        scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.opposite,read.bits,claim_nominate,&read);
         n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
         const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
@@ -772,8 +802,8 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
         indexed_keys_until(paths,"entity",keys,known,claim_carrier,&read,&read.done);
         MemoryContextDelete(read.tuple_context);pfree(keys);table_close(paths,NoLock);
-    }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);}PG_END_TRY();
-    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(read.links);return (Datum)0;
+    }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);lp_idmap_free(read.opposite);}PG_END_TRY();
+    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);pfree(read.links);return (Datum)0;
 }
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}

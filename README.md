@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.54-to-1.55 development
+CMake includes it in both the baseline and the in-place 1.38–1.55-to-1.56 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -74,6 +74,17 @@ realizes an ordered set of selected IDs in one context, preserves duplicate inpu
 occurrences and compressed runs, and reads shared descendants once. Scalar
 `laplace_text` uses the same reader. Newly discovered nodes form each frontier;
 transfer windows follow `work_mem` and PostgreSQL's actual array capacity.
+
+`laplace_claims_each(..., endpoint, middle_any, arity, opposite)` intersects
+both directed endpoint sets in the shared Native access. `endpoint=1`
+selects input first constituents and `opposite` last constituents; `endpoint=2`
+reverses those roles. NULL leaves the opposite endpoint unconstrained, while
+an empty array selects nothing. An opposite set with no more distinct IDs than the primary set joins the GIN
+scan; broader sets qualify acquired carriers before standing lookup. Both sets
+use bounded complete transfer windows, and every carrier qualifies against both
+complete sets, including lossy bitmap rechecks, before standing lookup and fan.
+The seven-argument overload retains its existing behavior and needs no index
+rebuild.
 
 `laplace_parts(geometry)` projects ordered logical IDs from an already acquired
 path using the Native run decoder. It retains repetitions and performs no

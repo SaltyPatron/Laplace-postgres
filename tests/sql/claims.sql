@@ -61,6 +61,23 @@ BEGIN
   RAISE EXCEPTION 'invalid endpoint was accepted';
  EXCEPTION WHEN invalid_parameter_value THEN NULL;
  END;
+ IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint,NULL,0,ARRAY[b,b]))<>8
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',2::smallint,NULL,0,ARRAY[a]))<>4
+ OR (SELECT count(*) FROM laplace_claims_each(keys,1,bits,'{}',1::smallint,ARRAY[c],3,ARRAY[b]))<>2
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint,NULL,0,ARRAY[c]))
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',2::smallint,NULL,0,ARRAY[c]))
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint,NULL,0,'{}'::blake3[]))
+ OR EXISTS((SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint,NULL,0,NULL::blake3[])
+             EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint))
+            UNION ALL (SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint)
+             EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',1::smallint,NULL,0,NULL::blake3[]))) THEN
+  RAISE EXCEPTION 'Native opposite endpoints lost direction, input ordinals, null/empty scope, RLE, middle selection or qualification before fan';
+ END IF;
+ BEGIN
+  PERFORM * FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,0,ARRAY[b]);
+  RAISE EXCEPTION 'undirected opposite endpoint was accepted';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL;
+ END;
  IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c]))<>3
  OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c,laplace_cp_id(100)]))<>6
  OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[b]))<>3
