@@ -113,7 +113,7 @@ foreach(_previous IN LISTS _previous_sql)
   endif()
 endforeach()
 install(SCRIPT "${_module_package}")
-install(CODE "file(READ [==[${_sql_output}/laplace_module.txt]==] _module_name)\nstring(STRIP \"\${_module_name}\" _module_name)\nfile(INSTALL \"${CMAKE_CURRENT_BINARY_DIR}/\${_module_name}${CMAKE_SHARED_MODULE_SUFFIX}\" DESTINATION \"\$ENV{DESTDIR}${LAPLACE_PG_INSTALL_LIBDIR}\" TYPE FILE)\n")
+install(CODE "set(MODULE_INDEX [==[${_sql_output}/laplace_module.txt]==])\nset(MODULE_BUILD [==[${CMAKE_CURRENT_BINARY_DIR}]==])\nset(MODULE_SUFFIX [==[${CMAKE_SHARED_MODULE_SUFFIX}]==])\nset(MODULE_LIBDIR [==[${LAPLACE_PG_INSTALL_LIBDIR}]==])\ninclude([==[${CMAKE_CURRENT_SOURCE_DIR}/cmake/InstallModule.cmake]==])\n")
 if(WIN32)
   # LoadLibrary does not search PATH: the DLLs laplace.dll loads (ICU's, and libmmd from the compiler) go next to
   # postgres.exe, as PostGIS's do. The list comes from the built module's imports at install time; the system's and
@@ -132,6 +132,9 @@ install(FILES "${_sql_output}/laplace.control" ${LAPLACE_EXTENSION_SQL} DESTINAT
 
 if(PROJECT_IS_TOP_LEVEL)
   enable_testing()
+  add_test(NAME module_install COMMAND ${CMAKE_COMMAND}
+    "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}" "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/module-install.cmake")
   find_program(LAPLACE_PG_REGRESS NAMES pg_regress
                HINTS "${LAPLACE_PG_DIR}/lib/pgxs/src/test/regress" "${LAPLACE_PG_DIR}/bin")
   if(NOT LAPLACE_PG_REGRESS)
