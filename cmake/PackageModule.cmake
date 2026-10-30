@@ -7,7 +7,9 @@ get_filename_component(suffix "${MODULE}" LAST_EXT)
 configure_file("${MODULE}" "${directory}/${name}${suffix}" COPYONLY)
 file(READ "${CONTROL}" control)
 if(OVERRIDE)
-  set(path "${OVERRIDE}")
+  # Consumers with a private dynamic_library_path select a module basename;
+  # standalone PostgreSQL installations retain the usual $libdir location.
+  string(REPLACE "@MODULE_NAME@" "${name}" path "${OVERRIDE}")
 else()
   set(path "$libdir/${name}")
 endif()

@@ -325,7 +325,9 @@ The same CMake target can be embedded after an existing Laplace-Native target.
 Set `LAPLACE_PG_CONFIG` to the target server and `LAPLACE_PG_INSTALL_LIBDIR`,
 `LAPLACE_PG_INSTALL_SHAREDIR`, `LAPLACE_PG_INSTALL_BINDIR` to the product package
 destinations. `LAPLACE_PG_MODULE_PATHNAME` selects its installed module binding;
-the default remains `$libdir/laplace`. The monorepo builds and installs this
+`@MODULE_NAME@` expands to the linked library's content-addressed basename.
+The default is `$libdir/laplace_<digest>`; products with a private
+`dynamic_library_path` can select `@MODULE_NAME@` alone. The monorepo builds and installs this
 canonical target with its consumers, including the generated baseline and
 upgrade scripts. It does not depend on a separately installed extension version.
 
