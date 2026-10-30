@@ -211,8 +211,13 @@ dependence and removal of claims without evidence, without fixed claim slices
 or conflict-driven accumulation. Source registration retains its transaction
 boundary; these APIs do not independently commit it.
 
-`laplace_merge_stage` drains GIN pending entries for copied path partitions
-before consuming the staging tables and returning to provenance/series reads.
+The two-argument `laplace_merge_stage` drains GIN pending entries for copied
+path partitions before consuming staging tables and returning. Native clients
+can pass a third `true` argument to defer maintenance across closed dependency
+waves. Each merge returns its actual destination partition OIDs; the client
+unions these per writer and calls `laplace_clean_partitions` once per working
+window, before provenance/series reads. Child-wave commit barriers and source
+publication remain unchanged. Older clients retain immediate maintenance.
 `laplace_clean_stage` routes the copied IDs through the same Native partition
 bounds as enrichment and uses the existing restricted index-maintenance
 authority. It leaves unrelated partitions alone. Search results are unchanged;

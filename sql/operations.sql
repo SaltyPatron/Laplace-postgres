@@ -310,7 +310,12 @@ BEGIN
   );
 END $$;
 
-CREATE OR REPLACE FUNCTION @extschema@.laplace_merge_stage(entities regclass, paths regclass, OUT entity_rows bigint, OUT physicality_rows bigint, OUT updated_rows bigint) RETURNS record
+CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_partitions(paths regclass) RETURNS oid[]
+    AS 'MODULE_PATHNAME','laplace_stage_partitions' LANGUAGE C STRICT;
+CREATE OR REPLACE FUNCTION @extschema@.laplace_clean_partitions(partitions oid[]) RETURNS bigint
+    AS 'MODULE_PATHNAME','laplace_clean_partitions' LANGUAGE C STRICT;
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_merge_stage(entities regclass, paths regclass, defer_index boolean, OUT entity_rows bigint, OUT physicality_rows bigint, OUT updated_rows bigint, OUT pending_partitions oid[]) RETURNS record
     LANGUAGE plpgsql
     -- Reuse the partition-pruned FK lookup plan across the COPY window.
     -- PostgreSQL restores the caller's policy on return or exception; Native
@@ -325,6 +330,10 @@ DECLARE e text; p text; plan_name text; classified text; invalid boolean;
         known_entities bigint; known_paths bigint; candidates bigint; previous_candidates bigint;
         retried boolean:=false; conflicting_schema text; conflicting_table text; conflicting_constraint text;
 BEGIN
+  IF defer_index IS NULL THEN
+    RAISE EXCEPTION 'laplace_merge_stage requires an explicit index-maintenance policy' USING ERRCODE='22023';
+  END IF;
+  pending_partitions:=ARRAY[]::oid[];
   SELECT format('%I.%I',n.nspname,c.relname) INTO e
   FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
   WHERE c.oid=entities AND n.nspname='stage' AND c.relpersistence='u' AND c.relkind='r';
@@ -413,7 +422,10 @@ BEGIN
         changed:=@extschema@.laplace_enrich_stage(paths,'@extschema@.physicality',p_class::regclass,known_paths);
       END IF;
       updated_rows:=updated_rows+changed;
-      IF physicality_rows>0 OR changed>0 THEN PERFORM @extschema@.laplace_clean_stage(paths); END IF;
+      IF physicality_rows>0 OR changed>0 THEN
+        IF defer_index THEN pending_partitions:=@extschema@.laplace_stage_partitions(paths);
+        ELSE PERFORM @extschema@.laplace_clean_stage(paths); END IF;
+      END IF;
       EXIT;
     EXCEPTION WHEN unique_violation THEN
       GET STACKED DIAGNOSTICS conflicting_schema=SCHEMA_NAME,conflicting_table=TABLE_NAME,conflicting_constraint=CONSTRAINT_NAME;
@@ -430,6 +442,16 @@ BEGIN
   IF classified IS NOT NULL THEN EXECUTE format('DROP TABLE %s',classified); END IF;
   EXECUTE format('TRUNCATE %s,%s',e,p);
 END $_$;
+
+-- Existing callers retain immediate maintenance and their three-column API.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_merge_stage(entities regclass, paths regclass, OUT entity_rows bigint, OUT physicality_rows bigint, OUT updated_rows bigint) RETURNS record
+    LANGUAGE SQL BEGIN ATOMIC
+      SELECT m.entity_rows,m.physicality_rows,m.updated_rows
+      FROM @extschema@.laplace_merge_stage(entities,paths,false) m;
+    END;
+
+COMMENT ON FUNCTION @extschema@.laplace_merge_stage(regclass,regclass,boolean)
+    IS 'Publish one closed dependency wave. Deferred maintenance returns exact Native physicality partition OIDs; drain their union with laplace_clean_partitions before reading the working window testimony.';
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_recoordinate(apply boolean DEFAULT false, OUT entity_rows bigint, OUT physicality_rows bigint) RETURNS record
     LANGUAGE plpgsql

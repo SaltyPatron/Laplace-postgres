@@ -29,6 +29,8 @@ laplace_claims_each	false
 laplace_claim_preview	false
 laplace_constituents	false
 laplace_clean_stage	true
+laplace_stage_partitions	true
+laplace_clean_partitions	true
 laplace_codepoint	false
 laplace_compose	false
 laplace_confidence	false

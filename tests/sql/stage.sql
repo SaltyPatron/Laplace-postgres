@@ -115,6 +115,43 @@ DO $$ DECLARE remaining bigint; cleaned bigint; untouched bigint; BEGIN
     RAISE EXCEPTION 'maintenance accepted public input';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+-- Working-window maintenance preserves immediate readback while allowing
+-- closed child waves to share one final drain. The returned OIDs are the
+-- actual routed destinations, never a client-side partition convention.
+DO $$ DECLARE result record; routed oid[]; expected oid[]; BEGIN
+  TRUNCATE stage.merge_entities,stage.merge_paths;
+  PERFORM pg_temp.fill_stage();
+  SELECT array_agg(DISTINCT tableoid::oid ORDER BY tableoid::oid) INTO expected
+    FROM public.physicality WHERE entity=ANY(ARRAY[laplace_id('dog'),laplace_id('cat'),laplace_id('ant')]);
+  SELECT array_agg(p ORDER BY p) INTO routed FROM unnest(laplace_stage_partitions('stage.merge_paths')) p;
+  IF routed IS DISTINCT FROM expected THEN RAISE EXCEPTION 'maintenance returned incorrect destination partitions'; END IF;
+  UPDATE stage.merge_paths SET mask=laplace_mask_slot('kind','claim');
+  SELECT * INTO result FROM laplace_merge_stage('stage.merge_entities','stage.merge_paths',true);
+  SELECT array_agg(p ORDER BY p) INTO routed FROM unnest(result.pending_partitions) p;
+  IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>3
+      OR routed IS DISTINCT FROM expected THEN RAISE EXCEPTION 'deferred merge lost metadata or maintenance destinations'; END IF;
+  IF EXISTS(SELECT FROM unnest(ARRAY['dog','cat','ant']) t WHERE laplace_text(laplace_id(t))<>t)
+      THEN RAISE EXCEPTION 'deferred maintenance broke immediate content readback'; END IF;
+  IF laplace_clean_partitions(result.pending_partitions)<=0
+      OR laplace_clean_partitions(result.pending_partitions)<>0
+      OR laplace_clean_partitions(ARRAY[]::oid[])<>0
+      OR cardinality(laplace_stage_partitions('stage.merge_paths'))<>0
+      THEN RAISE EXCEPTION 'working-window maintenance failed to drain exact destinations'; END IF;
+  SELECT * INTO result FROM laplace_merge_stage('stage.merge_entities','stage.merge_paths',true);
+  IF cardinality(result.pending_partitions)<>0 THEN RAISE EXCEPTION 'empty merge scheduled maintenance'; END IF;
+  BEGIN
+    PERFORM laplace_clean_partitions(ARRAY['public.entity'::regclass::oid]);
+    RAISE EXCEPTION 'maintenance accepted a foreign relation';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_clean_partitions(ARRAY[NULL]::oid[]);
+    RAISE EXCEPTION 'maintenance accepted a null partition';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+  BEGIN
+    PERFORM laplace_merge_stage('stage.merge_entities','stage.merge_paths',NULL);
+    RAISE EXCEPTION 'merge accepted an undefined maintenance policy';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+END $$;
 -- A client's positive classifications survive staging. Only claimed-new keys
 -- participate in the final flat overlap check, including ordinary replay.
 TRUNCATE stage.merge_entities,stage.merge_paths;

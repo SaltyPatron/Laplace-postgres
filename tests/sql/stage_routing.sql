@@ -30,13 +30,14 @@ UPDATE stage.routing_paths SET mask=laplace_mask_slot('kind','tuple');
 -- targets. The maintenance-test role has no UPDATE grant on any child.
 GRANT USAGE ON SCHEMA stage TO :"writer";
 GRANT SELECT ON stage.routing_entities,stage.routing_paths TO :"writer";
-GRANT SELECT,UPDATE ON public.entity,public.physicality TO :"writer";
+GRANT SELECT,INSERT,UPDATE ON public.entity,public.physicality TO :"writer";
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
   IF laplace_enrich_stage('stage.routing_entities','public.entity')<>2049
      OR laplace_enrich_stage('stage.routing_paths','public.physicality')<>2049 THEN
     RAISE EXCEPTION 'small-memory routing lost a changed carrier';
   END IF;
+  PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.routing_paths'));
 END $$;
 RESET SESSION AUTHORIZATION;
 DO $$ BEGIN
@@ -105,12 +106,17 @@ DO $$ BEGIN
     END IF;
   EXCEPTION WHEN null_value_not_allowed THEN NULL; END;
 END $$;
+SELECT pg_temp.routing_batch();
 REVOKE UPDATE ON public.entity,public.physicality FROM :"writer";
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
   BEGIN
     PERFORM laplace_enrich_stage('stage.routing_entities','public.entity');
     RAISE EXCEPTION 'unchanged input bypassed destination UPDATE privileges';
+  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+  BEGIN
+    PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.routing_paths'));
+    RAISE EXCEPTION 'deferred maintenance bypassed destination write privileges';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
 END $$;
 RESET SESSION AUTHORIZATION;

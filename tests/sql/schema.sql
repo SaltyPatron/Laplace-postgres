@@ -81,7 +81,7 @@ BEGIN
  IF EXISTS(SELECT FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
   JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
   WHERE e.extname='laplace' AND d.deptype='e' AND NOT p.prosecdef AND p.proconfig IS NOT NULL
-    AND NOT (p.proname='laplace_merge_stage' AND p.pronargs=2
+    AND NOT (p.proname='laplace_merge_stage' AND p.pronargs=3
       AND p.proconfig=ARRAY['plan_cache_mode=force_generic_plan'])) THEN
   RAISE EXCEPTION 'ordinary Native or SQL function retains per-call settings';
  END IF;
