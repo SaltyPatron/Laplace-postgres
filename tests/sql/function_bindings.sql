@@ -1,6 +1,48 @@
 \set ECHO none
 \pset format unaligned
 \pset tuples_only on
+-- An upgrade must expose every declared C export, including APIs that were
+-- missing from an installed predecessor. Repair is idempotent and never adopts
+-- or overwrites a same-signature function owned by the host application.
+DO $$ DECLARE repaired oid; BEGIN
+  ALTER EXTENSION laplace DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+  PERFORM public.laplace_restore_function_bindings();
+  repaired := 'public.laplace_testimony(public.blake3[],public.blake3[])'::regprocedure;
+  IF NOT EXISTS(SELECT FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid
+      WHERE d.classid='pg_proc'::regclass AND d.objid=repaired
+        AND d.refclassid='pg_extension'::regclass AND d.deptype='e' AND e.extname='laplace')
+      OR NOT EXISTS(SELECT FROM pg_proc WHERE oid=repaired AND pronargdefaults=1
+        AND provolatile='s' AND proparallel='s' AND proretset) THEN
+    RAISE EXCEPTION 'missing Native API was not repaired with its declared contract';
+  END IF;
+  PERFORM public.laplace_restore_function_bindings();
+  IF repaired <> 'public.laplace_testimony(public.blake3[],public.blake3[])'::regprocedure THEN
+    RAISE EXCEPTION 'Native API repair changed an existing function identity';
+  END IF;
+  ALTER EXTENSION laplace DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+  CREATE FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]) RETURNS integer
+    LANGUAGE sql IMMUTABLE RETURN 7;
+  BEGIN
+    PERFORM public.laplace_restore_function_bindings();
+    RAISE EXCEPTION 'Native API repair adopted a foreign function';
+  EXCEPTION WHEN duplicate_object THEN NULL; END;
+  IF public.laplace_testimony(NULL,NULL)<>7 THEN
+    RAISE EXCEPTION 'Native API repair overwrote a foreign function';
+  END IF;
+  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+  PERFORM public.laplace_restore_function_bindings();
+  ALTER EXTENSION laplace DROP FUNCTION public.laplace_isa();
+  BEGIN
+    PERFORM public.laplace_restore_function_bindings();
+    RAISE EXCEPTION 'Native binding verification ignored a missing declared export';
+  EXCEPTION WHEN undefined_function THEN
+    IF SQLERRM <> 'Native API is missing its declared function: laplace_isa' THEN RAISE; END IF;
+  END;
+  ALTER EXTENSION laplace ADD FUNCTION public.laplace_isa();
+  PERFORM public.laplace_restore_function_bindings();
+END $$;
 DO $$ BEGIN
   -- Remove per-call scope from both a frozen-bank primitive and an already
   -- parsed SQL adapter. Native SPI readers bind installed objects explicitly.

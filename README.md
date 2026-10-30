@@ -29,7 +29,7 @@ the stable `laplace` library remains available for predecessor installations.
 
 The installation source is `sql/laplace.sql.in`: one current baseline.
 `sql/operations.sql` defines the publication and maintenance operations once;
-CMake includes it in both the baseline and the in-place 1.38–1.56-to-1.57 development
+CMake includes it in both the baseline and the in-place 1.38–1.57-to-1.58 development
 transitions from one update template. Installable scripts are generated under the build's
 `extension/` directory. Cold installs do not replay earlier development revisions.
 
@@ -335,7 +335,11 @@ installations by removing per-function search-path settings from ordinary
 functions. ROM/geometry/index intrinsics run directly, SQL/SPI entry points
 bind installed objects explicitly, and thin SQL adapters use parsed
 `BEGIN ATOMIC` bodies. Consumers call this owner instead of assigning settings
-to every extension function. The registry records whether a C entry point uses
+to every extension function. `sql/api.sql` declares versioned Native APIs once
+for install, upgrade and missing-function repair. Repair uses PostgreSQL's parsed
+signatures, preserves existing function identities, rejects foreign ownership,
+and verifies every registered C export is present before succeeding.
+The registry records whether a C entry point uses
 SPI; that classification does not grant authority or require a GUC scope.
 
 Frozen bank and value names bind once per expression; varying arguments are
