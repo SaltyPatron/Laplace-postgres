@@ -1,2 +1,0 @@
-\set ECHO none
-mask: 64-bit packing, enum filtering, set merges, global IDs and GIN passed

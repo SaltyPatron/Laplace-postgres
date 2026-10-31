@@ -1,3 +1,0 @@
-\set ECHO none
-containers: dense bitmap, exact rechecks, virtual floor and canonical range routing passed
-containers: sparse global selections retain GIN access above leaf row counts

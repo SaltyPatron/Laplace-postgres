@@ -1,0 +1,61 @@
+{
+  "purpose": "Lossless archival checkpoint of local commit history; no implementation is integrated or validated by this archive.",
+  "repository": "Laplace-postgres",
+  "created_utc": "2026-10-31T04:58:26.681836+00:00",
+  "main_before_archive": "f70a8a8444fce436c67ad7a9c25057a4222ee129",
+  "original_local_branches": [
+    [
+      "refs/heads/fix/native-paths-query-surface",
+      "a4f4dbf208c021a06ddca7ee3e0a67b2f7bf04ff",
+      "origin/fix/native-paths-query-surface"
+    ],
+    [
+      "refs/heads/main",
+      "f70a8a8444fce436c67ad7a9c25057a4222ee129",
+      "origin/main"
+    ]
+  ],
+  "preserved_commit_count": 20,
+  "preserved_commits": [
+    "0dfeef5b6a2894290ebe0fd5e798e243663f477e",
+    "1143159ab9451e76d12042741f4bc4e08e10100a",
+    "11440151c1831c110631c055afdc732dfac507f7",
+    "171c5ab8d2dbd6c810b093d0e253d5dc1547c185",
+    "188085eb94e41bec8e2cfef0251bd73fe44c43c6",
+    "1cd02d4c1da5e613a36e22232fe188f3a2337ffc",
+    "2648f58f83946177a61d9806fb29df7181f305bc",
+    "28f9c6f648f289be8e67f8be9a4360aec1477bba",
+    "535e6b6b318c373f2f81ecccd9d7591ab2bc4690",
+    "659051afa4f6f7daf27f77bd7e3de789a7cd966b",
+    "6d2aadc37c6ce18823600edf6e5d636747235da2",
+    "8c10cec77972764dbf4f78e126a321a9025d7fc8",
+    "8fab37a9763354dacd1539333ea51b749b1cdca7",
+    "a4a0d044dc2f9d3527f428d1bf5eebdfc3933f82",
+    "b8d4c91ddaf2ef4378b66b0f8824447d7d91e159",
+    "d19829a1e9cbf42e8b4c755c279de93b937de05c",
+    "ddb6098dba2feb63d5d977d4206ff9c1384793f5",
+    "e7f0960df14d1951618b1c19afb93bddf37197c4",
+    "f22fb1fd5e73c5c9d055d69eb2ec0dc0fc5775a5",
+    "f61fec5b6506c0379f73156cf5afbbceb29a6c49"
+  ],
+  "preserved_tips": [
+    "0dfeef5b6a2894290ebe0fd5e798e243663f477e",
+    "1143159ab9451e76d12042741f4bc4e08e10100a",
+    "11440151c1831c110631c055afdc732dfac507f7",
+    "171c5ab8d2dbd6c810b093d0e253d5dc1547c185",
+    "188085eb94e41bec8e2cfef0251bd73fe44c43c6",
+    "2648f58f83946177a61d9806fb29df7181f305bc",
+    "535e6b6b318c373f2f81ecccd9d7591ab2bc4690",
+    "659051afa4f6f7daf27f77bd7e3de789a7cd966b",
+    "6d2aadc37c6ce18823600edf6e5d636747235da2",
+    "8c10cec77972764dbf4f78e126a321a9025d7fc8",
+    "8fab37a9763354dacd1539333ea51b749b1cdca7",
+    "a4a0d044dc2f9d3527f428d1bf5eebdfc3933f82",
+    "b8d4c91ddaf2ef4378b66b0f8824447d7d91e159",
+    "d19829a1e9cbf42e8b4c755c279de93b937de05c",
+    "ddb6098dba2feb63d5d977d4206ff9c1384793f5",
+    "e7f0960df14d1951618b1c19afb93bddf37197c4",
+    "f22fb1fd5e73c5c9d055d69eb2ec0dc0fc5775a5",
+    "f61fec5b6506c0379f73156cf5afbbceb29a6c49"
+  ]
+}
