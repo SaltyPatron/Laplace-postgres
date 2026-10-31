@@ -12,11 +12,7 @@ include(cmake/LaplacePgExecutor.cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Laplace-postgres: built with CMake against pg_config's paths, with Laplace-Native built as part of it and linked in.
-if(DEFINED ENV{LAPLACE_NATIVE} AND NOT "$ENV{LAPLACE_NATIVE}" STREQUAL "")
-  set(LAPLACE_NATIVE "$ENV{LAPLACE_NATIVE}" CACHE PATH "Laplace-Native sources")
-else()
-  set(LAPLACE_NATIVE "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Native" CACHE PATH "Laplace-Native sources")
-endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaplaceNative.cmake")
 if(NOT TARGET laplace_static)
   add_subdirectory(${LAPLACE_NATIVE} native EXCLUDE_FROM_ALL)
 endif()
