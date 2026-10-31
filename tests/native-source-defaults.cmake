@@ -25,7 +25,7 @@ function(configure profile selected)
   execute_process(COMMAND "${CMAKE_COMMAND}" -E env "--unset=LAPLACE_NATIVE"
     "LAPLACE_NATIVE=${selected}" "${CMAKE_COMMAND}" -S "${WORK}/project" -B "${WORK}/${profile}" -G Ninja
     "-DSELECTION_MODULE=${SOURCE}/cmake/LaplaceNative.cmake" ${ARGN}
-    COMMAND_ERROR_IS_FATAL ANY OUTPUT_QUIET)
+    WORKING_DIRECTORY "${WORK}" COMMAND_ERROR_IS_FATAL ANY OUTPUT_QUIET)
 endfunction()
 function(build profile expected)
   execute_process(COMMAND "${CMAKE_COMMAND}" --build "${WORK}/${profile}"
@@ -65,4 +65,10 @@ configure(parent "${WORK}/Native first" "-DPARENT_NATIVE=${WORK}/Native second" 
 build(parent 23)
 configure(sibling "")
 build(sibling 99)
+configure(relative "${WORK}/Native second" "-DLAPLACE_NATIVE=Native first")
+build(relative 17)
+configure(relative "${WORK}/Native second")
+build(relative 17)
+configure(relative "${WORK}/Native second" -ULAPLACE_NATIVE)
+build(relative 23)
 message(STATUS "Native source defaults follow the environment; explicit/parent choices persist; unchanged builds do no work")
