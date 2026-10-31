@@ -560,3 +560,18 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_ordered_pair_counts(vocab @extsch
  roots @extschema@.blake3[] DEFAULT NULL,separators @extschema@.blake3[] DEFAULT @extschema@.laplace_separator_ids(),
  OUT container @extschema@.blake3,OUT gap integer,OUT subject @extschema@.blake3,OUT object @extschema@.blake3,OUT occurrences bigint)
 RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_ordered_pair_counts' LANGUAGE C STABLE PARALLEL RESTRICTED;
+-- Recover missing operational measurements from stored testimony. This never
+-- registers another witness, changes a claim, or runs the standing solver.
+CREATE OR REPLACE PROCEDURE @extschema@.laplace_measure_attestations(roots @extschema@.blake3[] DEFAULT NULL)
+LANGUAGE plpgsql AS $$
+DECLARE selected @extschema@.blake3; measured bigint;
+BEGIN
+  FOR selected IN SELECT id FROM @extschema@.witness
+      WHERE (roots IS NULL AND attestations IS NULL) OR id OPERATOR(@extschema@.=) ANY(roots)
+      ORDER BY id LOOP
+    SELECT count(DISTINCT claim) INTO measured
+      FROM @extschema@.laplace_contained_series(ARRAY[selected]);
+    UPDATE @extschema@.witness SET attestations=measured WHERE id OPERATOR(@extschema@.=) selected;
+    COMMIT;
+  END LOOP;
+END $$;

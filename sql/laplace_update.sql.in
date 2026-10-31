@@ -1,5 +1,10 @@
--- In-place transition for populated development databases; no retained-data DDL.
+-- In-place transition; existing content, testimony and standing are retained.
 \echo Use "ALTER EXTENSION laplace UPDATE" to load this file. \quit
+
+ALTER TABLE @extschema@.witness
+    ADD COLUMN IF NOT EXISTS attestations bigint CHECK (attestations >= 0);
+COMMENT ON COLUMN @extschema@.witness.attestations IS
+    'Measured distinct claims asserted by this witness. Repeated games and dependence roots do not add attestations. NULL means not measured; maintained with source publication.';
 
 -- @laplace_path_set_match@
 

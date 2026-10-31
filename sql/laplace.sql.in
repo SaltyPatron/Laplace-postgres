@@ -935,8 +935,11 @@ PARTITION BY RANGE (entity);
 CREATE TABLE @extschema@.witness (
     id @extschema@.blake3 NOT NULL,
     lineage @extschema@.blake3,
-    trust double precision NOT NULL
+    trust double precision NOT NULL,
+    attestations bigint CHECK (attestations >= 0)
 );
+COMMENT ON COLUMN @extschema@.witness.attestations IS
+    'Measured distinct claims asserted by this witness. Repeated games and dependence roots do not add attestations. NULL means not measured; maintained with source publication.';
 
 CREATE TABLE @extschema@.consensus (
     claim @extschema@.blake3 NOT NULL,
