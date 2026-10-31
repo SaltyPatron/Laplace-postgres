@@ -15,42 +15,21 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: Laplace-postgres }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 38f4139bab5ea44f860d5e9e2b322b963b7f5a71, path: Laplace-Native, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: eb00ac7f86318127f39605905641f8a90ba70f4e, path: Laplace-Native, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
-      - name: Select qualified inputs for the exact Native revision
-        id: native-inputs
+      - name: Select qualified Native inputs for the exact source revision
         env:
           GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
-        run: |
-          python3 - <<'PY'
-          import importlib.util, json, os, subprocess
-          spec = importlib.util.spec_from_file_location('dependencies', 'Laplace-Operations/.github/scripts/resolve-dependencies.py')
-          dependencies = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(dependencies)
-          revision = subprocess.check_output(['git', '-C', 'Laplace-Native', 'rev-parse', 'HEAD'], text=True).strip()
-          def request(path):
-              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
-          run = dependencies.verified_native_run(os.environ['GITHUB_REPOSITORY_OWNER'], revision, request)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f'run={run}\n')
-          print(f'Qualified Native inputs: {revision}, run {run}')
-          PY
-      - name: Receive the independently qualified complete Unicode cache closure
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          repository: SaltyPatron/Laplace-Native
-          run-id: ${{ steps.native-inputs.outputs.run }}
-          github-token: ${{ secrets.LAPLACE_CHECKOUT }}
-          name: native-prepared-inputs
-          path: ${{ runner.temp }}/native-floor-inputs
-      - name: Verify and select the candidate cache paths
-        run: python3 Laplace-Native/scripts/ci-inputs.py verify "$RUNNER_TEMP/native-floor-inputs"
+        run: bash Laplace-Operations/native-inputs.sh prepare "$GITHUB_WORKSPACE/Laplace-Native"
+      - name: Verify Native source selection across reconfiguration
+        run: cmake "-DSOURCE=$GITHUB_WORKSPACE/Laplace-postgres" "-DWORK=$RUNNER_TEMP/native-source-defaults" -P Laplace-postgres/tests/native-source-defaults.cmake
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
-          cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_OPERATIONS:PATH="$GITHUB_WORKSPACE/Laplace-Operations"
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
           ctest --test-dir "$LAPLACE_BUILD/Laplace-postgres/icx-release" -R '^configure_incremental$' --output-on-failure
       - name: Install and execute the candidate in an isolated database
