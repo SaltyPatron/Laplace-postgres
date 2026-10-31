@@ -46,11 +46,14 @@ jobs:
           path: ${{ runner.temp }}/native-floor-inputs
       - name: Verify and select the candidate cache paths
         run: python3 Laplace-Native/scripts/ci-inputs.py verify "$RUNNER_TEMP/native-floor-inputs"
+      - name: Verify Native source selection across reconfiguration
+        run: cmake "-DSOURCE=$GITHUB_WORKSPACE/Laplace-postgres" "-DWORK=$RUNNER_TEMP/native-source-defaults" -P Laplace-postgres/tests/native-source-defaults.cmake
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
-          cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_OPERATIONS:PATH="$GITHUB_WORKSPACE/Laplace-Operations"
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
           ctest --test-dir "$LAPLACE_BUILD/Laplace-postgres/icx-release" -R '^configure_incremental$' --output-on-failure
       - name: Install and execute the candidate in an isolated database
