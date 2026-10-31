@@ -52,6 +52,7 @@ jobs:
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
           cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
+          ctest --test-dir "$LAPLACE_BUILD/Laplace-postgres/icx-release" -R '^configure_incremental$' --output-on-failure
       - name: Install and execute the candidate in an isolated database
         run: |
           . Laplace-Operations/laplace.env

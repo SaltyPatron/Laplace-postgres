@@ -3,6 +3,11 @@ if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
 project(LaplacePostgres VERSION 1.61.0 LANGUAGES C CXX ASM)
+# Some configured ASM toolchains leave the global format Unknown despite the
+# C compiler's verified ELF ABI. Ninja needs the actual format for RPATH edits.
+if(CMAKE_EXECUTABLE_FORMAT STREQUAL "Unknown" AND CMAKE_C_COMPILER_ABI STREQUAL "ELF")
+  set(CMAKE_EXECUTABLE_FORMAT ELF)
+endif()
 include(cmake/LaplacePgExecutor.cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -20,11 +25,12 @@ include(${LAPLACE_NATIVE}/cmake/LaplaceFlags.cmake)
 
 if(LAPLACE_PG_CONFIG)
   set(PG_CONFIG "${LAPLACE_PG_CONFIG}")
-else()
-  set(PG_CONFIG "${LAPLACE_PG_DIR}/bin/pg_config" CACHE FILEPATH "pg_config of the target server")
+elseif(NOT DEFINED PG_CONFIG)
+  set(PG_CONFIG "${LAPLACE_PG_DIR}/bin/pg_config")
 endif()
 foreach(v includedir-server pkglibdir sharedir libdir bindir)
-  execute_process(COMMAND ${PG_CONFIG} --${v} OUTPUT_VARIABLE out OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(COMMAND "${PG_CONFIG}" --${v} OUTPUT_VARIABLE out
+                  OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
   string(REPLACE "-" "_" name ${v})
   set(PG_${name} ${out})
 endforeach()
@@ -121,7 +127,13 @@ foreach(_version IN LISTS _versions)
   string(REPLACE "-- @laplace_operations@" "${_operations}" _sql "${_sql}")
   string(REPLACE "-- @laplace_api@" "${_api}" _sql "${_sql}")
   set(_output "${_sql_output}/laplace--${_version}.sql")
-  file(WRITE "${_output}" "${_sql}")
+  set(_installed_sql "")
+  if(EXISTS "${_output}")
+    file(READ "${_output}" _installed_sql)
+  endif()
+  if(NOT EXISTS "${_output}" OR NOT "${_installed_sql}" STREQUAL "${_sql}")
+    file(WRITE "${_output}" "${_sql}")
+  endif()
   list(APPEND LAPLACE_EXTENSION_SQL "${_output}")
 endforeach()
 file(GLOB _previous_sql "${_sql_output}/laplace--*.sql")
@@ -153,6 +165,10 @@ if(PROJECT_IS_TOP_LEVEL)
   add_test(NAME module_install COMMAND ${CMAKE_COMMAND}
     "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}" "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/module-install.cmake")
+  add_test(NAME configure_incremental COMMAND ${CMAKE_COMMAND}
+    "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}" "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/configure-incremental.cmake")
+  set_tests_properties(configure_incremental PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
   find_program(LAPLACE_PG_REGRESS NAMES pg_regress
                HINTS "${LAPLACE_PG_DIR}/lib/pgxs/src/test/regress" "${LAPLACE_PG_DIR}/bin")
   if(NOT LAPLACE_PG_REGRESS)
