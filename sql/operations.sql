@@ -481,7 +481,7 @@ BEGIN
   IF EXISTS (SELECT FROM @extschema@.entity e JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) e.id
       WHERE e.tier=0 AND (@extschema@.laplace_codepoint(e.id) IS NULL OR @extschema:postgis@.GeometryType(p.path)<>'POINT'
         OR @extschema@.laplace_path_length(p.path)<>1 OR @extschema@.laplace_vertex_ids(p.path)<>ARRAY[e.id])) THEN
-    RAISE EXCEPTION 'laplace_recoordinate: tier0 row is not a canonical scalar self-path' USING ERRCODE='23514';
+    RAISE EXCEPTION 'laplace_recoordinate: tier0 row is not a canonical codepoint self-path' USING ERRCODE='23514';
   END IF;
   IF EXISTS (SELECT FROM @extschema@.entity e JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) e.id
       CROSS JOIN LATERAL unnest(@extschema@.laplace_vertex_ids(p.path)) AS vertex(id)

@@ -8,6 +8,10 @@ source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${LAPLACE_PG_DIR:?PostgreSQL installation required}"
 : "${LAPLACE_CONNINFO:?declared PostgreSQL connection required}"
 : "${LAPLACE_WORK:?declared scratch volume required}"
+# Candidate connections select the same private cache closure as the candidate
+# reader. No cluster or application database settings are changed.
+: "${LAPLACE_TIER0:?candidate Tier-0 cache required}" "${LAPLACE_FLAGS:?candidate flags required}" "${LAPLACE_HIGHWAY:?candidate Highway required}"
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c laplace.tier0=$LAPLACE_TIER0 -c laplace.flags=$LAPLACE_FLAGS -c laplace.highway=$LAPLACE_HIGHWAY"
 pg="$LAPLACE_PG_DIR/bin"
 admin=$(printf '%s\n' "$LAPLACE_CONNINFO" | sed 's/dbname=[^ ]*/dbname=postgres/')
 [[ $admin == *'dbname=postgres'* ]] || { echo 'connection must name a database'; exit 2; }

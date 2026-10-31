@@ -106,8 +106,9 @@ DO $$ DECLARE missing blake3:=laplace_id('unrecorded projection child'); parent 
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
 CREATE TEMP TABLE projection_floor AS
-SELECT laplace_cp_id(cp) AS id,laplace_coord(chr(cp)) AS coord,laplace_hilbert(chr(cp)) AS hilbert
-FROM unnest(ARRAY[100,55295,57344,1114111]) cp;
+SELECT id,coord,laplace_hilbert4(coord) # '-9223372036854775808'::bigint AS hilbert
+FROM (SELECT laplace_cp_id(cp) AS id,ST_GeomFromEWKB(laplace_cp_coord_ewkb(cp)) AS coord
+      FROM unnest(ARRAY[100,55295,55296,57343,57344,1114111]) cp) codepoints;
 INSERT INTO public.entity(id,tier,coord,hilbert)
 SELECT id,0,ST_MakePoint(0,0,0,0),0 FROM projection_floor;
 INSERT INTO public.physicality(entity,tier,hilbert,path)
@@ -117,7 +118,7 @@ CREATE TEMP TABLE projection_floor_before AS SELECT
   (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) AS paths;
 DO $$ DECLARE changes record; BEGIN
   SELECT * INTO changes FROM laplace_recoordinate();
-  IF changes.entity_rows<>4 OR changes.physicality_rows<>4 THEN
+  IF changes.entity_rows<>6 OR changes.physicality_rows<>6 THEN
     RAISE EXCEPTION 'stored canonical atoms were not projected from the floor: %',changes;
   END IF;
   IF (SELECT entities FROM projection_floor_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(e) ORDER BY id) FROM public.entity e)
@@ -125,7 +126,7 @@ DO $$ DECLARE changes record; BEGIN
     RAISE EXCEPTION 'stored-atom audit changed public rows';
   END IF;
   SELECT * INTO changes FROM laplace_recoordinate(true);
-  IF changes.entity_rows<>4 OR changes.physicality_rows<>4 THEN RAISE EXCEPTION 'stored-atom apply count differs from audit'; END IF;
+  IF changes.entity_rows<>6 OR changes.physicality_rows<>6 THEN RAISE EXCEPTION 'stored-atom apply count differs from audit'; END IF;
   IF EXISTS (SELECT FROM projection_floor f JOIN public.entity e USING(id)
       JOIN public.physicality p ON p.entity=f.id WHERE e.tier<>0 OR p.tier<>0
         OR ST_AsEWKB(e.coord)<>ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert OR p.hilbert<>f.hilbert
@@ -135,11 +136,11 @@ DO $$ DECLARE changes record; BEGIN
   SELECT * INTO changes FROM laplace_recoordinate();
   IF changes.entity_rows<>0 OR changes.physicality_rows<>0 THEN RAISE EXCEPTION 'stored-atom repair is not idempotent'; END IF;
 END $$;
-DO $$ DECLARE invalid blake3:=laplace_cp_id(55296); BEGIN
+DO $$ DECLARE invalid blake3:=laplace_id('unknown Tier-0 atom'); BEGIN
   BEGIN
     INSERT INTO public.entity(id,tier,coord,hilbert) VALUES(invalid,0,ST_MakePoint(0,0,0,0),0);
     INSERT INTO public.physicality(entity,tier,hilbert,path) VALUES(invalid,0,0,laplace_path(ARRAY[invalid]));
-    PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'unknown surrogate atom accepted';
+    PERFORM laplace_recoordinate(true); RAISE EXCEPTION 'unknown non-atom accepted';
   EXCEPTION WHEN check_violation THEN NULL; END;
   BEGIN
     UPDATE public.physicality SET path=laplace_path(ARRAY[entity,entity]) WHERE tier=0;
