@@ -3,6 +3,11 @@ if(POLICY CMP0207)
   cmake_policy(SET CMP0207 NEW)                        # runtime dependencies matched on normalized paths
 endif()
 project(LaplacePostgres VERSION 1.61.0 LANGUAGES C CXX ASM)
+# Some configured ASM toolchains leave the global format Unknown despite the
+# C compiler's verified ELF ABI. Ninja needs the actual format for RPATH edits.
+if(CMAKE_EXECUTABLE_FORMAT STREQUAL "Unknown" AND CMAKE_C_COMPILER_ABI STREQUAL "ELF")
+  set(CMAKE_EXECUTABLE_FORMAT ELF)
+endif()
 include(cmake/LaplacePgExecutor.cmake)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
