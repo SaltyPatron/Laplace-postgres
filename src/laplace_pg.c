@@ -123,7 +123,7 @@ static void cache_setting(const char *name,const char *description,char **value,
 }
 void _PG_init(void){
     lp_allocator(tx_grow, tx_release);
-    cache_setting("laplace.tier0", "Path of the tier-0 perf-cache (1,112,064 scalar records, 64 bytes each).", &tier0_path,lp_tier0_path());
+    cache_setting("laplace.tier0", "Path of the tier-0 perf-cache (1,114,112 codepoint records, 64 bytes each).", &tier0_path,lp_tier0_path());
     cache_setting("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", &flags_path,lp_flags_path());
     cache_setting("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", &highway_path,lp_highway_path());
 }
