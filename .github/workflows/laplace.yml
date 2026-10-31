@@ -18,11 +18,29 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 140273083f149358b2c8f3cce3e69c781df889b2, path: Laplace-Native, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+      - name: Select qualified inputs for the exact Native revision
+        id: native-inputs
+        env:
+          GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, json, os, subprocess
+          spec = importlib.util.spec_from_file_location('dependencies', 'Laplace-Operations/.github/scripts/resolve-dependencies.py')
+          dependencies = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(dependencies)
+          revision = subprocess.check_output(['git', '-C', 'Laplace-Native', 'rev-parse', 'HEAD'], text=True).strip()
+          def request(path):
+              return json.loads(subprocess.check_output(['gh', 'api', path], text=True))
+          run = dependencies.verified_native_run(os.environ['GITHUB_REPOSITORY_OWNER'], revision, request)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'run={run}\n')
+          print(f'Qualified Native inputs: {revision}, run {run}')
+          PY
       - name: Receive the independently qualified complete Unicode cache closure
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           repository: SaltyPatron/Laplace-Native
-          run-id: 41174072192
+          run-id: ${{ steps.native-inputs.outputs.run }}
           github-token: ${{ secrets.LAPLACE_CHECKOUT }}
           name: native-prepared-inputs
           path: ${{ runner.temp }}/native-floor-inputs
