@@ -980,9 +980,6 @@ BEGIN
  END LOOP;
 END $partitions$;
 ALTER TABLE @extschema@.physicality ALTER COLUMN path SET STATISTICS 0;
-CREATE INDEX entity_hilbert ON @extschema@.entity(hilbert);
-CREATE INDEX entity_coord ON @extschema@.entity USING gist(coord @extschema@.laplace_point4d_ops);
-CREATE INDEX physicality_paths ON @extschema@.physicality USING gin(path @extschema@.laplace_path_ops,mask @extschema@.laplace_mask_ops) WITH(gin_pending_list_limit=32768);
 ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(entity) REFERENCES @extschema@.entity(id);
 DO $dump_content$
 DECLARE item record;
