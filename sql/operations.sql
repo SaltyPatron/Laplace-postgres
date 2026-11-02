@@ -5,10 +5,6 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometr
     AS 'MODULE_PATHNAME','laplace_path_parts' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry)
     IS 'Ordered logical constituents of an already acquired Native path, including every RLE repetition. No entity or physicality lookup; unlike laplace_vertex_ids, this preserves order and duplicates.';
--- Distinct metrics retain their own exact access paths. Tier is a key prefix,
--- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
-CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity(tier,hilbert,id);
-CREATE INDEX IF NOT EXISTS entity_angular ON @extschema@.entity USING gist(coord @extschema@.laplace_angular4d_ops);
 CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
     fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
     middle_any @extschema@.blake3[], arity bigint DEFAULT 0, OUT i bigint, OUT entity @extschema@.blake3,
@@ -528,8 +524,12 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_schema_indexes() RETURNS void
     LANGUAGE plpgsql
     AS $$
 BEGIN
+  -- Distinct metrics retain their own exact access paths. Tier is a key prefix,
+  -- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
   CREATE INDEX IF NOT EXISTS entity_hilbert ON @extschema@.entity (hilbert);
+  CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity (tier, hilbert, id);
   CREATE INDEX IF NOT EXISTS entity_coord ON @extschema@.entity USING gist (coord @extschema@.laplace_point4d_ops);
+  CREATE INDEX IF NOT EXISTS entity_angular ON @extschema@.entity USING gist (coord @extschema@.laplace_angular4d_ops);
   -- 32 MB a partition: a search scans the pending list, so it spills around a batch instead of holding a source.
   -- 4 MB spilled every few thousand paths (full-page images). 256 MB held the list until the source ended.
   CREATE INDEX IF NOT EXISTS physicality_paths ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops, mask @extschema@.laplace_mask_ops) WITH (gin_pending_list_limit = 32768);
