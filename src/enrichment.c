@@ -419,13 +419,17 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         size_t window=budget;
         if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
             GinStatsData stats;ginGetStats(index,&stats);
-            /* A small dictionary is cheaper to stream than millions of absent
-             * seeks. For a sparse set, ask the support routine for exact keys
-             * in ONE memory-bounded scan. Artificial 511-ID windows otherwise
-             * rescan the GIN pending list and repeat entry-tree descent. */
-            if(stats.nEntries>0 && (uint64)stats.nEntries>unique)
+            /* Each exact key probe descends the entry B-tree (~4 pages per
+             * key), whereas LP_STRAT_OVERLAPS streams stats.nEntryPages leaf
+             * pages once against a shared PathOverlapSet. Use exact seeks only
+             * when those B-tree probes touch fewer pages than streaming the
+             * dictionary, and keep a single full-set window when streaming so
+             * work_mem slicing never rescans the dictionary multiple times. */
+            if(stats.nEntryPages>0 && unique<=((uint64)stats.nEntryPages+3)/4)
                 nomination=LP_PG_GIN_EXACT_OVERLAPS;
-            if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; strategy %u; window %zu",stats.nEntries,nomination,window);
+            else
+                window=Max(window,unique);
+            if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; entry_pages %u; strategy %u; window %zu",stats.nEntries,stats.nEntryPages,nomination,window);
         }
         first_leaf=false;
         ScanKeyData key[4];int nkeys=required_keys?2:1;
@@ -521,22 +525,33 @@ static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,
     ContainerParents out={get_attnum(RelationGetRelid(parent),"entity"),parents};
     scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,assertions,container_parent,&out);
 }
+typedef struct {AttrNumber id,path,mask;lp_idmap *parents;lp_pg_path_visit visit;void *context;} DirectContainers;
+static bool direct_container_visit(TupleTableSlot *slot,void *context)
+{
+    DirectContainers *out=context;bool id_null,path_null,mask_null=false;
+    Datum id=slot_getattr(slot,out->id,&id_null);
+    if(id_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native containment parent identity is null")));
+    const lp_id *key=(const lp_id *)DatumGetPointer(id);
+    bool fresh;lp_idmap_put(out->parents,key,&fresh);if(!fresh)return true;
+    Datum path=slot_getattr(slot,out->path,&path_null),mask=(Datum)0;
+    if(out->mask>0)mask=slot_getattr(slot,out->mask,&mask_null);
+    if(path_null||mask_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native path frontier: null carrier")));
+    out->visit(key,path,mask,out->context);
+    return true;
+}
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool assertions,lp_pg_path_visit visit,void *context)
 {
     if(!count)return;
     const char *column;Relation parent=presence_parent(lp_pg_relation("physicality"),&column,masks?3:2);
-    lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_sized(sizeof(CarrierLocation));
+    lp_idmap *wanted=lp_idmap_new(),*parents=lp_idmap_new();
     PG_TRY();{
         for(size_t i=0;i<count;i++)lp_idmap_put(wanted,ids+i,NULL);
-        scan_containers(parent,column,wanted,parents,3,0,assertions);
-        size_t found=lp_idmap_count(parents);
-        PresenceKey *keys=palloc_extended(Max(found,(size_t)1)*sizeof(*keys),MCXT_ALLOC_HUGE);
-        for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
-        PathFrontier front={visit,context,get_attnum(RelationGetRelid(parent),"path"),
+        DirectContainers out={get_attnum(RelationGetRelid(parent),"entity"),
+            get_attnum(RelationGetRelid(parent),"path"),
             masks?get_attnum(RelationGetRelid(parent),"mask"):InvalidAttrNumber,
-            AllocSetContextCreate(CurrentMemoryContext,"Native acquired path tuple",ALLOCSET_DEFAULT_SIZES)};
-        acquired_rows(parent,keys,found,parents,path_frontier_visit,&front,NULL);
-        MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
+            parents,visit,context};
+        scan_container_rows(parent,column,wanted,3,NULL,false,0,NULL,0,assertions,direct_container_visit,&out);
+        table_close(parent,NoLock);
     }PG_FINALLY();{lp_idmap_free(wanted);lp_idmap_free(parents);}PG_END_TRY();
 }
 
