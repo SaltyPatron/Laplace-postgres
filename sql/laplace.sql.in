@@ -24,6 +24,10 @@ CREATE FUNCTION @extschema@.blake3_send(@extschema@.blake3) RETURNS bytea
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'blake3_send';
 
+CREATE FUNCTION @extschema@.blake3_from_bytea(bytea) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'blake3_from_bytea';
+
 CREATE TYPE @extschema@.blake3 (
     INTERNALLENGTH = 16,
     INPUT = @extschema@.blake3_in,
