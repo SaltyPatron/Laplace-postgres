@@ -34,6 +34,9 @@ CREATE TYPE @extschema@.blake3 (
     STORAGE = plain
 );
 
+CREATE CAST (bytea AS @extschema@.blake3) WITH FUNCTION @extschema@.blake3_from_bytea(bytea) AS ASSIGNMENT;
+CREATE CAST (@extschema@.blake3 AS bytea) WITH FUNCTION @extschema@.blake3_send(@extschema@.blake3) AS ASSIGNMENT;
+
 CREATE TYPE @extschema@.laplace_box4d;
 
 CREATE FUNCTION @extschema@.laplace_box4d_in(cstring) RETURNS @extschema@.laplace_box4d

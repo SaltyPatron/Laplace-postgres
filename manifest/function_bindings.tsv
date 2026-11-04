@@ -12,6 +12,7 @@ blake3_ne	false
 blake3_out	false
 blake3_recv	false
 blake3_send	false
+blake3_from_bytea	false
 laplace_angular4d	false
 laplace_angular4d_gist_compress	false
 laplace_angular4d_gist_distance	false

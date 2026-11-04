@@ -745,11 +745,11 @@ PG_FUNCTION_INFO_V1(laplace_present_ids);
  * frontier. Qualification precedes the caller's fan: masks, middle refusals,
  * tier and a real standing must all survive. ID order makes bounded results
  * independent of heap order; per-input duplicates retain their ordinals. */
-typedef struct {uint64 epoch,sent;int head,floor;} ClaimKey;
-typedef struct {CarrierLocation carrier;bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
+typedef struct {uint64 epoch,sent,nom_epoch,nominated;int head,floor;} ClaimKey;
+typedef struct {CarrierLocation carrier;Datum path;int16 tier;bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*parents,*required,*opposite;lp_id *refuse,*include;int nrefuse,ninclude,*links;
-    bool each,done;uint64 limit,sent,saturated,epoch;int floor,endpoint;int64 arity;lp_mask bits;
+    bool each,done;uint64 limit,sent,saturated,epoch,nom_epoch,nom_saturated;int floor,endpoint;int64 arity;lp_mask bits;
     AttrNumber id,path,tier,mask,standing[4];MemoryContext tuple_context;
 } ClaimRead;
 static void claim_key_tier(TupleTableSlot *slot,const PresenceKey *key,void *context)
@@ -767,9 +767,10 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     value=slot_getattr(slot,read->tier,&missing);
     if(missing)ereport(ERROR,(errmsg("Native claim tier is null")));
     int tier=DatumGetInt16(value);if(!read->each && tier<=read->floor)return true;
-    value=slot_getattr(slot,read->path,&missing);
+    Datum path_datum=slot_getattr(slot,read->path,&missing);
     if(missing)ereport(ERROR,(errmsg("Native claim path is null")));
-    Geo path=geo_of(value);
+    bytea *detoasted=(bytea *)PG_DETOAST_DATUM(path_datum);
+    Geo path=geo_of(PointerGetDatum(detoasted));
     if(read->arity && lp_path_len(path.p)!=(uint64)read->arity)return true;
     if(read->opposite){
         if(!path.p.n)return true;
@@ -778,21 +779,48 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     }
     if(lp_path_middle_any(path.p,read->refuse,(size_t)read->nrefuse))return true;
     if(read->include && !lp_path_middle_any(path.p,read->include,(size_t)read->ninclude))return true;
+    uint64 nom_cap=read->limit<UINT64_MAX?Max(read->limit,UINT64_C(64)):UINT64_MAX;
     if(read->each){
         bool eligible=false;
         for(size_t i=0;i<path.p.n;i++){
             if(read->endpoint && !((i==0 && (read->endpoint&1)) || (i==path.p.n-1 && (read->endpoint&2))))continue;
             lp_id id=lp_path_id(path.p,i);int64 at=lp_idmap_find(read->wanted,&id);
-            if(at>=0 && tier>((ClaimKey *)lp_idmap_at(read->wanted,(size_t)at))->floor){eligible=true;break;}
+            if(at<0)continue;
+            ClaimKey *part=lp_idmap_at(read->wanted,(size_t)at);
+            if(tier>part->floor && part->nominated<nom_cap){eligible=true;break;}
         }
-        if(!eligible)return true;
+        if(!eligible)return nom_cap==UINT64_MAX || read->nom_saturated<lp_idmap_count(read->wanted);
     }
     value=slot_getattr(slot,read->id,&missing);
     if(missing)ereport(ERROR,(errmsg("Native claim identity is null")));
     bool fresh;size_t at=lp_idmap_put(read->parents,(const lp_id *)DatumGetPointer(value),&fresh);
     ClaimStanding *standing=lp_idmap_at(read->parents,at);
-    if(fresh)memset(standing,0,sizeof(*standing));
+    if(fresh){
+        memset(standing,0,sizeof(*standing));
+        Size sz=VARSIZE_ANY(detoasted);
+        bytea *copied=MemoryContextAlloc(read->tuple_context,sz);
+        memcpy(copied,detoasted,sz);
+        standing->path=PointerGetDatum(copied);
+        standing->tier=(int16)tier;
+    }
     standing->carrier=(CarrierLocation){slot->tts_tableOid,slot->tts_tid};
+    if(nom_cap<UINT64_MAX){
+        if(!read->each)return lp_idmap_count(read->parents)<nom_cap;
+        if(++read->nom_epoch==0){
+            for(size_t i=0;i<lp_idmap_count(read->wanted);i++)((ClaimKey *)lp_idmap_at(read->wanted,i))->nom_epoch=0;
+            read->nom_epoch=1;
+        }
+        for(size_t i=0;i<path.p.n;i++){
+            if(read->endpoint && !((i==0 && (read->endpoint&1)) || (i==path.p.n-1 && (read->endpoint&2))))continue;
+            lp_id id=lp_path_id(path.p,i);int64 ka=lp_idmap_find(read->wanted,&id);
+            if(ka<0)continue;
+            ClaimKey *part=lp_idmap_at(read->wanted,(size_t)ka);
+            if(part->nom_epoch==read->nom_epoch || tier<=part->floor || part->nominated>=nom_cap)continue;
+            part->nom_epoch=read->nom_epoch;
+            if(++part->nominated>=nom_cap)read->nom_saturated++;
+        }
+        return read->nom_saturated<lp_idmap_count(read->wanted);
+    }
     return true;
 }
 static void claim_standing(TupleTableSlot *slot,const PresenceKey *key,void *context)
@@ -800,28 +828,26 @@ static void claim_standing(TupleTableSlot *slot,const PresenceKey *key,void *con
     ClaimRead *read=context;ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
     Datum values[4];
     for(int i=0;i<4;i++){bool missing;values[i]=slot_getattr(slot,read->standing[i],&missing);if(missing)ereport(ERROR,(errmsg("Native claim standing is null")));}
-    *standing=(ClaimStanding){.carrier=standing->carrier,.known=true,.rating=DatumGetFloat8(values[0]),
+    *standing=(ClaimStanding){.carrier=standing->carrier,.path=standing->path,.tier=standing->tier,.known=true,.rating=DatumGetFloat8(values[0]),
         .deviation=DatumGetFloat8(values[1]),.volatility=DatumGetFloat8(values[2]),.matches=DatumGetInt64(values[3])};
 }
-static void claim_carrier(TupleTableSlot *slot,const PresenceKey *key,void *context)
+static void claim_emit_cached(ClaimRead *read,const PresenceKey *key)
 {
-    ClaimRead *read=context;const ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
-    MemoryContext previous=MemoryContextSwitchTo(read->tuple_context);bool missing;
-    Datum path=slot_getattr(slot,read->path,&missing);if(missing)ereport(ERROR,(errmsg("Native claim carrier is null")));
+    const ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)key->ordinal-1);
+    Datum path=standing->path;
     Datum values[]={0,PointerGetDatum(&key->id),path,Float8GetDatum(standing->rating),Float8GetDatum(standing->deviation),Float8GetDatum(standing->volatility),Int64GetDatum(standing->matches)};
     bool nulls[lengthof(values)]={false};
     if(!read->each){
         set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values+1,nulls+1);
         read->done=++read->sent>=read->limit;
     }else{
-        Datum tier=slot_getattr(slot,read->tier,&missing);if(missing)ereport(ERROR,(errmsg("Native claim carrier tier is null")));
         Geo geometry=geo_of(path);
         if(++read->epoch==0){for(size_t i=0;i<lp_idmap_count(read->wanted);i++)((ClaimKey *)lp_idmap_at(read->wanted,i))->epoch=0;read->epoch=1;}
         for(size_t i=0;i<geometry.p.n;i++){
             if(read->endpoint && !((i==0 && (read->endpoint&1)) || (i==geometry.p.n-1 && (read->endpoint&2))))continue;
             lp_id id=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(read->wanted,&id);if(at<0)continue;
             ClaimKey *part=lp_idmap_at(read->wanted,(size_t)at);
-            if(part->epoch==read->epoch || part->sent>=read->limit || DatumGetInt16(tier)<=part->floor)continue;
+            if(part->epoch==read->epoch || part->sent>=read->limit || standing->tier<=part->floor)continue;
             part->epoch=read->epoch;
             for(int input=part->head;input>=0;input=read->links[input]){
                 values[0]=Int64GetDatum((int64)input+1);set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);
@@ -830,7 +856,6 @@ static void claim_carrier(TupleTableSlot *slot,const PresenceKey *key,void *cont
         }
         read->done=read->saturated==lp_idmap_count(read->wanted);
     }
-    MemoryContextSwitchTo(previous);MemoryContextReset(read->tuple_context);
 }
 static Datum read_claims(FunctionCallInfo fcinfo,bool each)
 {
@@ -882,21 +907,24 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         read.tier=get_attnum(target,"tier");indexed_keys(entities,column,keys,n,claim_key_tier,&read);
         table_close(entities,NoLock);pfree(keys);
         for(size_t i=0;i<n;i++)read.floor=Max(read.floor,((ClaimKey *)lp_idmap_at(read.wanted,i))->floor);
+        read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
         const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
         Relation paths=read_parent(target,&column,path_columns,lengthof(path_columns));
         read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
         scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.opposite,read.bits,false,claim_nominate,&read);
+        table_close(paths,NoLock);
         n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
         const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
         Relation standings=read_parent(target,&column,standing_columns,lengthof(standing_columns));
         for(int i=0;i<4;i++)read.standing[i]=get_attnum(target,standing_columns[i+1]);
         indexed_keys(standings,column,keys,n,claim_standing,&read);table_close(standings,NoLock);
-        size_t known=0;for(size_t i=0;i<n;i++)if(((ClaimStanding *)lp_idmap_at(read.parents,(size_t)keys[i].ordinal-1))->known)keys[known++]=keys[i];
-        read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
-        acquired_rows(paths,keys,known,read.parents,claim_carrier,&read,&read.done);
-        MemoryContextDelete(read.tuple_context);pfree(keys);table_close(paths,NoLock);
-    }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);lp_idmap_free(read.opposite);}PG_END_TRY();
+        for(size_t i=0;i<n && !read.done;i++){
+            if(((ClaimStanding *)lp_idmap_at(read.parents,(size_t)keys[i].ordinal-1))->known)
+                claim_emit_cached(&read,keys+i);
+        }
+        MemoryContextDelete(read.tuple_context);read.tuple_context=NULL;pfree(keys);
+    }PG_FINALLY();{if(read.tuple_context)MemoryContextDelete(read.tuple_context);lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);lp_idmap_free(read.opposite);}PG_END_TRY();
     pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);pfree(read.links);return (Datum)0;
 }
 PG_FUNCTION_INFO_V1(laplace_claims);

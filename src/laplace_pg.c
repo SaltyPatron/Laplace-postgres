@@ -72,6 +72,12 @@ PG_FUNCTION_INFO_V1(blake3_recv);
 Datum blake3_recv(PG_FUNCTION_ARGS){ StringInfo b = (StringInfo)PG_GETARG_POINTER(0); uint8 *u = palloc(16); memcpy(u, pq_getmsgbytes(b, 16), 16); PG_RETURN_POINTER(u); }
 PG_FUNCTION_INFO_V1(blake3_send);
 Datum blake3_send(PG_FUNCTION_ARGS){ StringInfoData b; pq_begintypsend(&b); pq_sendbytes(&b, PG_GETARG_POINTER(0), 16); PG_RETURN_BYTEA_P(pq_endtypsend(&b)); }
+PG_FUNCTION_INFO_V1(blake3_from_bytea);
+Datum blake3_from_bytea(PG_FUNCTION_ARGS){
+    bytea *b = PG_GETARG_BYTEA_PP(0);
+    if (VARSIZE_ANY_EXHDR(b) != 16) ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION), errmsg("a blake3 ID is 16 bytes (got %zu)", (size_t)VARSIZE_ANY_EXHDR(b))));
+    uint8 *u = palloc(16); memcpy(u, VARDATA_ANY(b), 16); PG_RETURN_POINTER(u);
+}
 #define ID_CMP(name, test) PG_FUNCTION_INFO_V1(name); Datum name(PG_FUNCTION_ARGS){ int c = lp_id_cmp(PG_GETARG_POINTER(0), PG_GETARG_POINTER(1)); PG_RETURN_BOOL(test); }
 ID_CMP(blake3_eq, c == 0) ID_CMP(blake3_ne, c != 0) ID_CMP(blake3_lt, c < 0) ID_CMP(blake3_le, c <= 0) ID_CMP(blake3_gt, c > 0) ID_CMP(blake3_ge, c >= 0)
 PG_FUNCTION_INFO_V1(blake3_cmp);
@@ -507,7 +513,7 @@ static void set_run(FunctionCallInfo fcinfo, Kept *k){
  * The composition is read one DAG level per statement: every entity a level names that is not an atom and not yet
  * read is fetched in one set, from the trunk down, and the text is then written out of memory in path order. */
 typedef struct { size_t node; uint32 run; } TChild;
-typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque, claim; uint8 text_state; } TNode;
+typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque, claim, scalar; uint8 text_state; } TNode;
 static size_t tnode(lp_idmap *t, const lp_id *id){
     bool fresh; size_t i = lp_idmap_put(t, id, &fresh);
     if (fresh) *(TNode *)lp_idmap_at(t,i) = (TNode){ .have=lp_tier0_codepoint(lp_pg_tier0(),id)>=0 };
@@ -516,30 +522,30 @@ static size_t tnode(lp_idmap *t, const lp_id *id){
 static lp_mask mask_native(VarBit *mask);
 static const lp_bank *mask_bank(text *name);
 static int64 mask_slot(const lp_bank *bank,text *value);
-typedef struct { lp_idmap *nodes; const lp_idmap *inspect; MemoryContext keep; bool labels; lp_mask tuple,opaque,claim; size_t found; } TextFrontier;
+typedef struct { lp_idmap *nodes; const lp_idmap *inspect; MemoryContext keep; bool labels; lp_mask tuple,opaque,claim,file; size_t found; } TextFrontier;
 static void text_frontier_row(const lp_id *id,Datum path,Datum mask,void *context){
     TextFrontier *front=context;front->found++;
     lp_mask carrier=front->labels?mask_native(DatumGetVarBitP(mask)):0;
     bool tuple=(carrier&front->tuple)!=0,opaque=!tuple && (carrier&front->opaque)!=0;
-    bool claim=(carrier&front->claim)!=0;
+    bool claim=(carrier&front->claim)!=0,file=(carrier&front->file)!=0;
     bool inspect=claim && front->inspect && lp_idmap_find(front->inspect,id)>=0;
     Geo geometry=geo_of(path);lp_path p=geometry.p;
     /* A row role is not an exclusive modality. The same scalar composition
-     * can also have been used as a record or claim (for example, "en").
+     * can also have been used as a record, claim, or tuple (for example, "en" or "01").
      * Its actual Unicode surface remains readable in every containing path. */
-    if(opaque && p.n){
-        bool scalar_text=true;
-        for(size_t i=0;i<p.n;i++){
-            lp_id child=lp_path_id(p,i);
-            if(lp_tier0_codepoint(lp_pg_tier0(),&child)<0){scalar_text=false;break;}
-        }
-        if(scalar_text)opaque=false;
+    bool scalar_text=p.n>0;
+    for(size_t i=0;i<p.n;i++){
+        lp_id child=lp_path_id(p,i);
+        if(lp_tier0_codepoint(lp_pg_tier0(),&child)<0){scalar_text=false;break;}
     }
-    if(opaque && !inspect){TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;}
+    if(opaque && scalar_text)opaque=false;
+    if(opaque && !inspect && (file || p.n==0 || p.n>64)){
+        TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;
+    }
     TChild *kid=MemoryContextAlloc(front->keep,sizeof(TChild)*(p.n?p.n:1));
     for(size_t i=0;i<p.n;i++){lp_id child=lp_path_id(p,i);kid[i]=(TChild){tnode(front->nodes,&child),lp_path_run(p,i)};}
     TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));
-    me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;me->opaque=opaque;me->claim=claim;
+    me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;me->opaque=opaque;me->claim=claim;me->scalar=scalar_text;
 }
 static void read_levels(lp_idmap *t, MemoryContext keep, bool labels,const lp_idmap *inspect){
     TextFrontier front={.nodes=t,.inspect=inspect,.keep=keep,.labels=labels};
@@ -548,6 +554,7 @@ static void read_levels(lp_idmap *t, MemoryContext keep, bool labels,const lp_id
         for(size_t i=0;i<lengthof(roles);i++){
             lp_mask value=lp_pg_kind_mask(roles[i]);
             if(i==0)front.tuple=value;else front.opaque|=value;
+            if(i==1)front.file=value;
             if(i==3)front.claim=value;
         }
     }
@@ -575,7 +582,8 @@ typedef struct {size_t node,child;} SurfaceFrame;
 static bool text_surface(lp_idmap *t,size_t i){
     TNode *root=lp_idmap_at(t,i);
     if(root->text_state==1 || root->text_state==2)return root->text_state==1;
-    if(root->opaque || root->tuple){root->text_state=2;return false;}
+    if(root->opaque || (root->tuple && !root->scalar)){root->text_state=2;return false;}
+    if(root->tuple)return false;
     if(root->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
     if(!root->nkid){root->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,i))>=0?1:2;return root->text_state==1;}
     lp_vec(SurfaceFrame) stack={0};lp_push(&stack,((SurfaceFrame){i,0}));
@@ -583,7 +591,7 @@ static bool text_surface(lp_idmap *t,size_t i){
         CHECK_FOR_INTERRUPTS();SurfaceFrame *frame=stack.v+stack.n-1;
         TNode *node=lp_idmap_at(t,frame->node);
         if(node->text_state==1 || node->text_state==2){stack.n--;continue;}
-        if(node->opaque || node->tuple){node->text_state=2;continue;}
+        if(node->opaque || (node->tuple && !node->scalar)){node->text_state=2;continue;}
         if(!node->nkid){
             node->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,frame->node))>=0?1:2;continue;
         }
@@ -607,8 +615,8 @@ static void render_tree(lp_idmap *t,size_t root,StringInfo out,bool labels){
         CHECK_FOR_INTERRUPTS();RenderFrame *frame=stack.v+stack.n-1;
         TNode *node=lp_idmap_at(t,frame->node);
         if(!frame->entered){
-            bool tuple=frame->labels && !node->opaque && node->tuple;
-            if(frame->labels && !tuple){
+            bool structured=frame->labels && (node->tuple || (node->opaque && node->nkid>0)) && !text_surface(t,frame->node);
+            if(frame->labels && !structured){
                 if(!text_surface(t,frame->node)){
                     char hex[33];lp_id_hex(lp_idmap_key(t,frame->node),hex);appendStringInfoString(out,hex);stack.n--;continue;
                 }

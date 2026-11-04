@@ -1,4 +1,6 @@
 -- Current versioned Native API: one declaration for install, upgrade and repair.
+CREATE OR REPLACE FUNCTION @extschema@.blake3_from_bytea(bytea) RETURNS @extschema@.blake3
+    AS 'MODULE_PATHNAME', 'blake3_from_bytea' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE OR REPLACE FUNCTION @extschema@.laplace_path_has_roles(path @extschema:postgis@.geometry, roles smallint) RETURNS boolean
     AS 'MODULE_PATHNAME','laplace_path_has_roles' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 CREATE OR REPLACE FUNCTION @extschema@.laplace_testimony(claims @extschema@.blake3[], sources @extschema@.blake3[] DEFAULT NULL,

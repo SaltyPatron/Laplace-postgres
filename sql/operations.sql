@@ -1,4 +1,16 @@
 -- Current operation definitions, shared by cold install and development update.
+CREATE OR REPLACE FUNCTION @extschema@.blake3_from_bytea(bytea) RETURNS @extschema@.blake3
+    AS 'MODULE_PATHNAME','blake3_from_bytea' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION @extschema@.blake3_from_bytea(bytea)
+    IS 'Convert a 16-byte raw bytea identity directly into a Native blake3 identity without hex encoding.';
+DO $blake3_casts$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_cast WHERE castsource = 'bytea'::regtype AND casttarget = '@extschema@.blake3'::regtype) THEN
+  CREATE CAST (bytea AS @extschema@.blake3) WITH FUNCTION @extschema@.blake3_from_bytea(bytea) AS ASSIGNMENT;
+ END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_cast WHERE castsource = '@extschema@.blake3'::regtype AND casttarget = 'bytea'::regtype) THEN
+  CREATE CAST (@extschema@.blake3 AS bytea) WITH FUNCTION @extschema@.blake3_send(@extschema@.blake3) AS ASSIGNMENT;
+ END IF;
+END $blake3_casts$;
 COMMENT ON FUNCTION @extschema@.laplace_path_has_roles(@extschema:postgis@.geometry,smallint)
     IS 'Whether a canonical POINT/LINESTRING ZM path has any vertex whose stored said role is selected by the 8-bit mask. Bit 0 selects ordinary content; bits 1/2 select CLAIM/RECORD. Reads actual edge metadata, without expanding RLE runs or consulting child masks.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_parts(@extschema:postgis@.geometry) RETURNS @extschema@.blake3[]
