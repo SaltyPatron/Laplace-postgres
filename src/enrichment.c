@@ -394,7 +394,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     bool first_leaf=true;
     elog(DEBUG1,"Native containment frontier: %zu IDs; strategy %u; endpoint %d",unique,strategy,endpoint);
     size_t nrequired=required?lp_idmap_count(required):0;
-    ArrayType *required_keys=nrequired?id_array_of(element,lp_idmap_keys(required),(int)(required_any?nrequired:Min(budget,nrequired))):NULL;
+    ArrayType *required_keys=(nrequired && !endpoint)?id_array_of(element,lp_idmap_keys(required),(int)(required_any?nrequired:Min(budget,nrequired))):NULL;
     Datum mask_values[64];int nbits=0;
     for(int bit=0;bit<64;bit++)if(bits&(UINT64_C(1)<<bit))mask_values[nbits++]=Int16GetDatum((int16)bit);
     ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
@@ -419,17 +419,18 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         size_t window=budget;
         if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
             GinStatsData stats;ginGetStats(index,&stats);
+            BlockNumber entry_pages=stats.nEntryPages>1?stats.nEntryPages:RelationGetNumberOfBlocks(index);
             /* Each exact key probe descends the entry B-tree (~4 pages per
              * key), whereas LP_STRAT_OVERLAPS streams stats.nEntryPages leaf
              * pages once against a shared PathOverlapSet. Use exact seeks only
              * when those B-tree probes touch fewer pages than streaming the
              * dictionary, and keep a single full-set window when streaming so
              * work_mem slicing never rescans the dictionary multiple times. */
-            if(stats.nEntryPages>0 && unique<=((uint64)stats.nEntryPages+3)/4)
+            if(entry_pages>0 && unique<=((uint64)entry_pages+3)/4)
                 nomination=LP_PG_GIN_EXACT_OVERLAPS;
             else
                 window=Max(window,unique);
-            if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; entry_pages %u; strategy %u; window %zu",stats.nEntries,stats.nEntryPages,nomination,window);
+            if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; entry_pages %u; strategy %u; window %zu",stats.nEntries,entry_pages,nomination,window);
         }
         first_leaf=false;
         ScanKeyData key[4];int nkeys=required_keys?2:1;
@@ -643,7 +644,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
 typedef struct {uint64 epoch,held[2];int head;} HolderKey;
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*required,*seen;int *links;
-    AttrNumber id,path,tier,mask;int floor,kinds;bool per_part;int64 cap;
+    AttrNumber id,path,tier,mask;int floor,kinds,endpoint;bool per_part;int64 cap;lp_mask bits;
     uint64 epoch,required_epoch,saturated;Tuplestorestate *pending;MemoryContext owner;
 } HolderRead;
 static void holder_emit(HolderRead *read,size_t key,Datum *values,bool *nulls)
@@ -663,7 +664,9 @@ static bool holder_row(TupleTableSlot *slot,void *context)
     if(DatumGetInt16(tier)<=read->floor)return true;
     Datum mask=slot_getattr(slot,read->mask,&missing);
     if(missing)ereport(ERROR,(errmsg("Native holder mask is null")));
-    int kind=(lp_pg_mask_native(mask)&UINT64_C(1))?1:0;
+    lp_mask native_mask=lp_pg_mask_native(mask);
+    if((native_mask&read->bits)!=read->bits)return true;
+    int kind=(native_mask&UINT64_C(1))?1:0;
     if(!(read->kinds&(kind?1:2)))return true;
     Datum id=slot_getattr(slot,read->id,&missing);
     if(missing)ereport(ERROR,(errmsg("Native holder ID is null")));
@@ -680,6 +683,10 @@ static bool holder_row(TupleTableSlot *slot,void *context)
         read->epoch=1;
     }
     for(size_t i=0;i<geometry.p.n;i++){
+        if(read->endpoint){
+            bool first=i==0,last=i+1==geometry.p.n;
+            if(!((read->endpoint&1 && first) || (read->endpoint&2 && last)))continue;
+        }
         lp_id child=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(read->wanted,&child);if(at<0)continue;
         HolderKey *key=lp_idmap_at(read->wanted,(size_t)at);
         if(key->epoch==read->epoch)continue;key->epoch=read->epoch;
@@ -697,9 +704,18 @@ static bool holder_row(TupleTableSlot *slot,void *context)
 PG_FUNCTION_INFO_V1(laplace_holders);
 Datum laplace_holders(PG_FUNCTION_ARGS)
 {
+    if(PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3) || PG_ARGISNULL(4) || PG_ARGISNULL(5))
+        PG_RETURN_NULL();
     HolderRead read={.output.fcinfo=fcinfo,.owner=CurrentMemoryContext,
         .per_part=PG_GETARG_BOOL(2),.floor=PG_GETARG_INT16(3),.cap=PG_GETARG_INT64(4),.kinds=PG_GETARG_INT16(5)};
     read.output.output=set_begin(fcinfo,"laplace_holders",&read.output.descriptor);
+    if(PG_NARGS()>6 && !PG_ARGISNULL(6) && !read_mask_bits(PG_GETARG_ARRAYTYPE_P(6),&read.bits))PG_RETURN_NULL();
+    if(PG_NARGS()>7 && !PG_ARGISNULL(7)){
+        read.endpoint=PG_GETARG_INT16(7);
+        if(read.endpoint<0 || read.endpoint>3)
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holders: endpoint must be 0 (any), 1 (first), 2 (last), or 3 (either)")));
+    }
+    if(read.kinds==1)read.bits|=UINT64_C(1);
     if(read.cap < -1 || (!read.per_part && read.cap>=0) || read.kinds<1 || read.kinds>3)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holders: cap requires per-part mode; kinds must select claims (1), observations (2), or both (3)")));
     int count,nrequired;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count),*required=ids_of(PG_GETARG_ARRAYTYPE_P(1),&nrequired);
@@ -718,7 +734,7 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
             read.links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        scan_container_rows(parent,column,read.wanted,3,read.required,false,0,NULL,read.kinds==1?UINT64_C(1):0,false,holder_row,&read);
+        scan_container_rows(parent,column,read.wanted,3,read.required,false,read.endpoint,NULL,read.bits,false,holder_row,&read);
         if(read.pending){
             TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
             tuplestore_rescan(read.pending);
