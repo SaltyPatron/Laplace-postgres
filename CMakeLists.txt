@@ -54,7 +54,24 @@ foreach(_row IN LISTS _binding_rows)
   endif()
 endforeach()
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_function_bindings.h" CONTENT "${_bindings}")
-add_library(laplace_pg MODULE src/laplace_pg.c src/gist4d.c src/projection.c src/provenance.c src/enrichment.c src/walk.c src/sequences.c src/function_bindings.c src/binding.c)
+add_library(laplace_pg MODULE
+  src/laplace_pg.c
+  src/realize.c
+  src/gin_path.c
+  src/gin_mask.c
+  src/couple.c
+  src/gist4d.c
+  src/projection.c
+  src/provenance.c
+  src/attribution.c
+  src/frontier_index.c
+  src/frontier_gin.c
+  src/enrichment.c
+  src/walk.c
+  src/sequences.c
+  src/function_bindings.c
+  src/binding.c
+)
 target_compile_definitions(laplace_pg PRIVATE LP_PG_VERSION_MAJOR=${PROJECT_VERSION_MAJOR} LP_PG_VERSION_MINOR=${PROJECT_VERSION_MINOR})
 target_include_directories(laplace_pg PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 set_target_properties(laplace_pg PROPERTIES OUTPUT_NAME laplace PREFIX "" C_VISIBILITY_PRESET hidden
