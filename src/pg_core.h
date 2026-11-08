@@ -10,6 +10,7 @@
 #include "utils/memutils.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
+#include "access/tupconvert.h"
 #include "laplace_pg/executor.h"
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
@@ -174,5 +175,20 @@ static inline Tuplestorestate *set_begin(FunctionCallInfo fcinfo, const char *na
 static inline void set_put(FunctionCallInfo fcinfo, Tuplestorestate *ts, TupleDesc td, Datum *v, bool *nl){
     MemoryContext m = MemoryContextSwitchTo(((ReturnSetInfo *)fcinfo->resultinfo)->econtext->ecxt_per_query_memory);
     tuplestore_putvalues(ts, td, v, nl); MemoryContextSwitchTo(m);
+}
+
+static inline TupleConversionMap *lp_pg_tuple_conversion(TupleDesc child, TupleDesc parent){
+    if (child->natts == parent->natts) {
+        bool same = true;
+        for (int i = 0; i < parent->natts; i++) {
+            Form_pg_attribute ca = TupleDescAttr(child, i), pa = TupleDescAttr(parent, i);
+            if (ca->attisdropped != pa->attisdropped ||
+                (!pa->attisdropped && (ca->atttypid != pa->atttypid || strcmp(NameStr(ca->attname), NameStr(pa->attname)) != 0))) {
+                same = false; break;
+            }
+        }
+        if (same) return NULL;
+    }
+    return convert_tuples_by_name(child, parent);
 }
 #endif

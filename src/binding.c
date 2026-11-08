@@ -25,6 +25,8 @@ static void bind_names(void)
         CacheRegisterSyscacheCallback(EXTENSIONOID, invalidate_binding, (Datum)0);
         CacheRegisterSyscacheCallback(NAMESPACEOID, invalidate_binding, (Datum)0);
         CacheRegisterSyscacheCallback(PROCOID, invalidate_binding, (Datum)0);
+        CacheRegisterSyscacheCallback(INDEXRELID, invalidate_binding, (Datum)0);
+        CacheRegisterSyscacheCallback(RELOID, invalidate_binding, (Datum)0);
         registered = true;
     }
     if (!dirty) return;

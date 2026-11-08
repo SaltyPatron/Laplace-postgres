@@ -302,12 +302,15 @@ Datum laplace_paths(PG_FUNCTION_ARGS){
  * carrier. Generic PostGIS/legacy mantissa decoders do not share this layout. */
 static void constituent_output_row(const lp_id *id,Datum path,Datum mask,void *context){
     PathOutput *output=context;Geo geometry=geo_of(path);lp_path p=geometry.p;
+    bool is_tuple=(lp_pg_mask_native(mask)&lp_pg_kind_mask("tuple"))!=0;
     if(p.n>PG_INT32_MAX)ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("too many packed constituents")));
     for(size_t i=0;i<p.n;i++){
         CHECK_FOR_INTERRUPTS();lp_id child=lp_path_id(p,i);double m;
         memcpy(&m,p.v+i*4*sizeof(double)+3*sizeof(double),sizeof m);
+        uint64 bits=lp_m_bits(m);
+        if(is_tuple && !lp_m_said(m))bits|=(uint64)LP_SAID_TUPLE<<LP_M_RUN_BITS;
         Datum values[]={id_datum(id),Int32GetDatum((int32)i+1),id_datum(&child),
-            Int32GetDatum((int32)lp_path_run(p,i)),Int64GetDatum((int64)lp_m_bits(m))};
+            Int32GetDatum((int32)lp_path_run(p,i)),Int64GetDatum((int64)bits)};
         bool nulls[]={false,false,false,false,false};
         set_put(output->call,output->rows,output->descriptor,values,nulls);
     }
@@ -319,7 +322,7 @@ Datum laplace_constituents(PG_FUNCTION_ARGS){
     PG_TRY();{
         for(int i=0;i<count;i++)lp_idmap_put(unique,ids+i,NULL);
         PathOutput output={fcinfo,rows,descriptor};
-        lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),false,constituent_output_row,&output);
+        lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),true,constituent_output_row,&output);
     }PG_FINALLY();{lp_idmap_free(unique);}PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
 }

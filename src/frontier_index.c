@@ -62,7 +62,7 @@ static void indexed_keys_until(Relation parent,const char *column,PresenceKey *k
         if(end-begin>array_ids)end=begin+array_ids;
         Relation table=table_open(keys[begin].partition,AccessShareLock);
         AttrNumber stored_attribute=get_attnum(RelationGetRelid(table),column);
-        TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
+        TupleConversionMap *conversion=lp_pg_tuple_conversion(RelationGetDescr(table),RelationGetDescr(parent));
         TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
         Oid primary=RelationGetPrimaryKeyIndex(table,false);
         if(!OidIsValid(primary))ereport(ERROR,(errmsg("Native ID reader: relation has no primary index")));
@@ -121,7 +121,7 @@ void lp_pg_acquired_rows(Relation parent,PresenceKey *keys,size_t count,lp_idmap
     for(size_t begin=0;begin<count && (!done || !*done);){
         size_t end=begin+1;while(end<count && keys[end].partition==keys[begin].partition)end++;
         Relation table=table_open(keys[begin].partition,AccessShareLock);
-        TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
+        TupleConversionMap *conversion=lp_pg_tuple_conversion(RelationGetDescr(table),RelationGetDescr(parent));
         TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
         TupleTableSlot *slot=table_slot_create(table,NULL);
         AttrNumber identity=get_attnum(RelationGetRelid(table),"entity");

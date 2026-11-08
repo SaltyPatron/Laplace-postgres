@@ -2,6 +2,7 @@
  * (lp_pg_lookup_containers, laplace_containers, laplace_holders, laplace_claims). */
 #include "pg_core.h"
 #include "geo.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
@@ -24,8 +25,22 @@
 /* GIN is the retained containment access contract, just as the primary index
  * is the retained identity access contract. Unknown SPI array sizes can
  * otherwise make the planner scan every physicality at each sparse DAG hop. */
-static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,List *predicate,int *column,Oid *operation)
+static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,List *predicate,int *column,Oid *operation,Oid *cached_id,int *cached_col)
 {
+    if(cached_id && OidIsValid(*cached_id)){
+        Relation index=try_relation_open(*cached_id,AccessShareLock);
+        if(index && index->rd_rel->relam==GIN_AM_OID && index->rd_index &&
+           index->rd_index->indrelid==RelationGetRelid(table) &&
+           index->rd_index->indisvalid && index->rd_index->indisready && index->rd_index->indislive &&
+           (!index->rd_index->indcheckxmin || TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),TransactionXmin)) &&
+           *cached_col>=1 && *cached_col<=index->rd_index->indnkeyatts &&
+           index->rd_index->indkey.values[*cached_col-1]==path){
+            Oid op=get_opfamily_member(index->rd_opfamily[*cached_col-1],get_atttype(RelationGetRelid(table),path),array_type,strategy);
+            if(OidIsValid(op)){*column=*cached_col;*operation=get_opcode(op);return index;}
+        }
+        if(index)index_close(index,NoLock);
+        *cached_id=InvalidOid;
+    }
     List *indexes=RelationGetIndexList(table);Relation found=NULL;
     foreach_oid(index_id,indexes){
         Relation index=index_open(index_id,AccessShareLock);
@@ -45,6 +60,7 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,St
     list_free(indexes);
     if(!found)ereport(ERROR,(errcode(ERRCODE_UNDEFINED_OBJECT),
         errmsg("Native containment requires a complete %sGIN path index on %s",predicate?"assertion ":"",RelationGetRelationName(table))));
+    if(cached_id){*cached_id=RelationGetRelid(found);*cached_col=*column;}
     return found;
 }
 
@@ -119,13 +135,15 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
     ArrayType *single_keys=(unique<=budget && !indexed_opposite && !nom_cap)?id_array_of(element,lp_idmap_keys(wanted),(int)unique):NULL;
     lp_id *nom_buf=(nom_cap && endpoint)?palloc(sizeof(lp_id)*(1+2*Min(budget,unique))):NULL;
-    TIDBitmap *bitmap=tbm_create((Size)work_mem*1024,NULL);
+    Size bm_mem=Min((Size)work_mem*1024,(Size)4*1024*1024);
+    TIDBitmap *bitmap=tbm_create(bm_mem,NULL);
     AttrNumber parent_path=get_attnum(RelationGetRelid(parent),"path");
     List *parent_predicate=NIL;
-    if(assertions){
-        Expr *roles=(Expr *)makeConst(INT2OID,-1,InvalidOid,sizeof(int16),Int16GetDatum((1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD)),false,true);
-        parent_predicate=list_make1(makeFuncExpr(assertion_function,BOOLOID,
-            list_make2(makeVar(1,parent_path,get_atttype(RelationGetRelid(parent),parent_path),-1,InvalidOid,0),roles),InvalidOid,InvalidOid,COERCE_EXPLICIT_CALL));
+    static Oid cached_parent[2],cached_idx[2][256];static int cached_col[2][256];static uint64 cached_gen;
+    int a_slot=assertions?1:0;
+    if(cached_gen!=lp_pg_binding_generation() || cached_parent[a_slot]!=RelationGetRelid(parent)){
+        memset(cached_idx[a_slot],0,sizeof(cached_idx[a_slot]));
+        cached_parent[a_slot]=RelationGetRelid(parent);cached_gen=lp_pg_binding_generation();
     }
     for(int p_idx=0;p_idx<nparts;p_idx++){
         Oid relation_id=partdesc?partdesc->oids[p_idx]:RelationGetRelid(parent);
@@ -137,21 +155,29 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         int index_column;Oid operation;
         Oid operand=endpoint?element:array_type;
         StrategyNumber nomination=endpoint?((endpoint&1)?8:9):strategy;
-        List *predicate=parent_predicate;
-        if(assertions && path!=parent_path){
-            Expr *roles=(Expr *)makeConst(INT2OID,-1,InvalidOid,sizeof(int16),Int16GetDatum((1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD)),false,true);
-            predicate=list_make1(makeFuncExpr(assertion_function,BOOLOID,
-                list_make2(makeVar(1,path,get_atttype(relation_id,path),-1,InvalidOid,0),roles),InvalidOid,InvalidOid,COERCE_EXPLICIT_CALL));
+        Oid *slot_id=(p_idx<256 && path==parent_path)?&cached_idx[a_slot][p_idx]:NULL;
+        int *slot_col=(p_idx<256 && path==parent_path)?&cached_col[a_slot][p_idx]:NULL;
+        List *predicate=NIL;
+        if(assertions && (!slot_id || !OidIsValid(*slot_id))){
+            if(!parent_predicate){
+                Expr *roles=(Expr *)makeConst(INT2OID,-1,InvalidOid,sizeof(int16),Int16GetDatum((1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD)),false,true);
+                parent_predicate=list_make1(makeFuncExpr(assertion_function,BOOLOID,
+                    list_make2(makeVar(1,parent_path,get_atttype(RelationGetRelid(parent),parent_path),-1,InvalidOid,0),roles),InvalidOid,InvalidOid,COERCE_EXPLICIT_CALL));
+            }
+            predicate=parent_predicate;
+            if(path!=parent_path){
+                Expr *roles=(Expr *)makeConst(INT2OID,-1,InvalidOid,sizeof(int16),Int16GetDatum((1u<<LP_SAID_CLAIM)|(1u<<LP_SAID_RECORD)),false,true);
+                predicate=list_make1(makeFuncExpr(assertion_function,BOOLOID,
+                    list_make2(makeVar(1,path,get_atttype(relation_id,path),-1,InvalidOid,0),roles),InvalidOid,InvalidOid,COERCE_EXPLICIT_CALL));
+            }
         }
-        Relation index=container_index(table,path,operand,nomination,predicate,&index_column,&operation);
+        Relation index=container_index(table,path,operand,nomination,predicate,&index_column,&operation,slot_id,slot_col);
         size_t window=budget;
         if(!endpoint && strategy==3 && unique>=LP_PG_GIN_RANGE_IDS){
             GinStatsData stats;ginGetStats(index,&stats);
             BlockNumber entry_pages=stats.nEntryPages>1?stats.nEntryPages:RelationGetNumberOfBlocks(index);
-            if(entry_pages>0 && unique<=entry_pages/4)
-                nomination=LP_PG_GIN_EXACT_OVERLAPS;
-            else
-                window=Max(window,unique);
+            if(entry_pages>0 && unique<=entry_pages/4)nomination=LP_PG_GIN_EXACT_OVERLAPS;
+            else window=Max(window,unique);
             if(first_leaf)elog(DEBUG1,"Native containment index: entries " UINT64_FORMAT "; entry_pages %u; strategy %u; window %zu",stats.nEntries,entry_pages,nomination,window);
         }
         first_leaf=false;
@@ -168,10 +194,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             AttrNumber mask=get_attnum(relation_id,"mask");
             for(int i=0;i<index->rd_index->indnkeyatts;i++)if(index->rd_index->indkey.values[i]==mask){
                 Oid op=get_opfamily_member(index->rd_opfamily[i],get_atttype(relation_id,mask),INT2ARRAYOID,2);
-                if(OidIsValid(op)){
-                    ScanKeyEntryInitialize(key+nkeys++,0,i+1,2,INT2ARRAYOID,index->rd_indcollation[i],get_opcode(op),PointerGetDatum(mask_keys));
-                    break;
-                }
+                if(OidIsValid(op)){ScanKeyEntryInitialize(key+nkeys++,0,i+1,2,INT2ARRAYOID,index->rd_indcollation[i],get_opcode(op),PointerGetDatum(mask_keys));break;}
             }
         }
         IndexScanDesc scan=index_beginscan_bitmap(index,snapshot,NULL,nkeys);
@@ -212,7 +235,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             if(keys!=single_keys)pfree(keys);
         }
         if(!tbm_is_empty(bitmap)){
-            TupleConversionMap *conversion=convert_tuples_by_name(RelationGetDescr(table),RelationGetDescr(parent));
+            TupleConversionMap *conversion=lp_pg_tuple_conversion(RelationGetDescr(table),RelationGetDescr(parent));
             TupleTableSlot *projected=conversion?MakeSingleTupleTableSlot(RelationGetDescr(parent),&TTSOpsVirtual):NULL;
             TableScanDesc heap=table_beginscan_bm(table,snapshot,0,NULL);
             heap->st.rs_tbmiterator=tbm_begin_iterate(bitmap,NULL,InvalidDsaPointer);
@@ -240,7 +263,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
             ExecDropSingleTupleTableSlot(slot);
             if(projected){ExecDropSingleTupleTableSlot(projected);free_conversion_map(conversion);}
             tbm_end_iterate(&heap->st.rs_tbmiterator);table_endscan(heap);
-            tbm_free(bitmap);bitmap=tbm_create((Size)work_mem*1024,NULL);
+            tbm_free(bitmap);bitmap=tbm_create(bm_mem,NULL);
         }
         index_endscan(scan);index_close(index,NoLock);table_close(table,NoLock);
         if(predicate && predicate!=parent_predicate)list_free_deep(predicate);
@@ -302,20 +325,13 @@ static int frontier_tier(const lp_id *ids,int count)
 {
     const char *selected[]={"id","tier"},*column;Oid target=lp_pg_relation("entity");
     Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
-    /* Unstored basis/cache children still have real parents. A NULL SQL max
-     * over entity must never suppress that entire containment frontier. */
     TierMaximum result={get_attnum(target,"tier"),0};
     PresenceKey *keys=palloc_extended((Size)count*sizeof(*keys),MCXT_ALLOC_HUGE);
-    for(int i=0;i<count;i++){
-        keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
-    }
+    for(int i=0;i<count;i++)keys[i]=(PresenceKey){.id=ids[i],.ordinal=(int64)i+1};
     lp_pg_indexed_keys(parent,column,keys,(size_t)count,stored_tier,&result);
     pfree(keys);table_close(parent,NoLock);return result.maximum;
 }
-typedef struct {
-    PresenceOutput output;AttrNumber path,tier,mask;int floor;lp_mask bits;
-    MemoryContext tuple_context;
-} ContainerOutput;
+typedef struct {PresenceOutput output;AttrNumber path,tier,mask;int floor;lp_mask bits;MemoryContext tuple_context;} ContainerOutput;
 static bool read_mask_bits(ArrayType *array,lp_mask *mask)
 {
     Datum *bits;bool *missing;int count;bool possible=true;*mask=0;
@@ -329,8 +345,7 @@ static bool read_mask_bits(ArrayType *array,lp_mask *mask)
 }
 static void container_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
-    ContainerOutput *out=context;bool missing;
-    Datum tier=slot_getattr(slot,out->tier,&missing);
+    ContainerOutput *out=context;bool missing;Datum tier=slot_getattr(slot,out->tier,&missing);
     if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native physicality tier is null")));
     if(DatumGetInt16(tier)<=out->floor)return;
     MemoryContext previous=MemoryContextSwitchTo(out->tuple_context);
@@ -359,10 +374,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
     out.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native container output",ALLOCSET_DEFAULT_SIZES);
     lp_idmap *wanted=lp_idmap_sized(sizeof(uint64)),*parents=lp_idmap_sized(sizeof(CarrierLocation));
     PG_TRY();{
-        for(int i=0;i<count;i++){
-            bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);
-            if(fresh)*(uint64 *)lp_idmap_at(wanted,at)=0;
-        }
+        for(int i=0;i<count;i++){bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(wanted,at)=0;}
         scan_containers(parent,column,wanted,parents,7,out.bits,false);
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended((found?found:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
@@ -503,8 +515,7 @@ typedef struct {
 } ClaimRead;
 static void claim_key_tier(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
-    ClaimRead *read=context;bool missing;
-    Datum value=slot_getattr(slot,read->tier,&missing);
+    ClaimRead *read=context;bool missing;Datum value=slot_getattr(slot,read->tier,&missing);
     if(missing)ereport(ERROR,(errmsg("Native claim selector tier is null")));
     ((ClaimKey *)lp_idmap_at(read->wanted,(size_t)key->ordinal-1))->floor=DatumGetInt16(value);
 }
@@ -535,8 +546,7 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
         bool eligible=false;
         for(size_t i=0;i<path.p.n;i++){
             if(read->endpoint && !((i==0 && (read->endpoint&1)) || (i==path.p.n-1 && (read->endpoint&2))))continue;
-            lp_id id=lp_path_id(path.p,i);int64 at=lp_idmap_find(read->wanted,&id);
-            if(at<0)continue;
+            lp_id id=lp_path_id(path.p,i);int64 at=lp_idmap_find(read->wanted,&id);if(at<0)continue;
             ClaimKey *part=lp_idmap_at(read->wanted,(size_t)at);int dir=(read->endpoint==3 && i>0)?1:0;
             if(tier>part->floor && part->nominated[dir]<nom_cap){eligible=true;break;}
         }
@@ -547,12 +557,9 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     bool fresh;size_t at=lp_idmap_put(read->parents,(const lp_id *)DatumGetPointer(value),&fresh);
     ClaimStanding *standing=lp_idmap_at(read->parents,at);
     if(fresh){
-        memset(standing,0,sizeof(*standing));
-        Size sz=VARSIZE_ANY(detoasted);
-        bytea *copied=MemoryContextAlloc(read->tuple_context,sz);
-        memcpy(copied,detoasted,sz);
-        standing->path=PointerGetDatum(copied);
-        standing->tier=(int16)tier;
+        memset(standing,0,sizeof(*standing));Size sz=VARSIZE_ANY(detoasted);
+        bytea *copied=MemoryContextAlloc(read->tuple_context,sz);memcpy(copied,detoasted,sz);
+        standing->path=PointerGetDatum(copied);standing->tier=(int16)tier;
     }
     standing->carrier=(CarrierLocation){slot->tts_tableOid,slot->tts_tid};
     if(nom_cap<UINT64_MAX){
@@ -563,8 +570,7 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
         }
         for(size_t i=0;i<path.p.n;i++){
             if(read->endpoint && !((i==0 && (read->endpoint&1)) || (i==path.p.n-1 && (read->endpoint&2))))continue;
-            lp_id id=lp_path_id(path.p,i);int64 ka=lp_idmap_find(read->wanted,&id);
-            if(ka<0)continue;
+            lp_id id=lp_path_id(path.p,i);int64 ka=lp_idmap_find(read->wanted,&id);if(ka<0)continue;
             ClaimKey *part=lp_idmap_at(read->wanted,(size_t)ka);int dir=(read->endpoint==3 && i>0)?1:0;
             if(part->nom_epoch[dir]==read->nom_epoch || tier<=part->floor || part->nominated[dir]>=nom_cap)continue;
             part->nom_epoch[dir]=read->nom_epoch;
