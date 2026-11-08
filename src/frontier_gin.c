@@ -645,8 +645,8 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
     }
     lp_id *opposite=NULL;int nopposite=0;
     if(PG_NARGS()>7 && !PG_ARGISNULL(7)){
-        if(read.endpoint<1 || read.endpoint>3)
-            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first, last or either endpoint selection")));
+        if(read.endpoint!=1 && read.endpoint!=2)
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
         opposite=ids_of(PG_GETARG_ARRAYTYPE_P(7),&nopposite);
         if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);return (Datum)0;}
         read.opposite=lp_idmap_new();
