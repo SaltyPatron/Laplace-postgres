@@ -28,6 +28,7 @@
 #include "utils/syscache.h"
 #include "varatt.h"
 #include "laplace/laplace.h"
+#include "laplace/tier0.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
@@ -71,9 +72,13 @@ Datum blake3_hash_extended(PG_FUNCTION_ARGS){ return hash_any_extended((const un
 
 /* ---------------------------------------------------------------- the perf-caches, mapped in this backend */
 static char *tier0_path = NULL, *flags_path = NULL, *highway_path = NULL;
+static char *tier0_profile = NULL, *highway_profile = NULL;
 const lp_tier0_record *lp_pg_tier0(void){
     const char *path=GetConfigOption("laplace.tier0",false,false);
-    const lp_tier0_record *t = lp_tier0_map(path);
+    const char *prof=GetConfigOption("laplace.tier0_profile",true,false);
+    const lp_tier0_record *t = (prof && *prof)
+        ? lp_tier0_map_branches(path, lp_tier0_parse_branches(prof))
+        : lp_tier0_map(path);
     if (!t) ereport(ERROR, (errmsg("laplace: cannot map tier 0 at \"%s\" (laplace.tier0)", path)));
     return t;
 }
@@ -87,13 +92,19 @@ lp_text *lp_pg_text_context(void){
 }
 const lp_layout *lp_pg_flags(void){
     const char *path=GetConfigOption("laplace.flags",false,false);
-    const lp_layout *l = lp_flags_map(path);
+    const char *prof=GetConfigOption("laplace.tier0_profile",true,false);
+    const lp_layout *l = (prof && *prof)
+        ? lp_flags_map_branches(path, lp_tier0_parse_branches(prof))
+        : lp_flags_map(path);
     if (!l) ereport(ERROR, (errmsg("laplace: cannot map the flags at \"%s\" (laplace.flags)", path)));
     return l;
 }
 const lp_highway *lp_pg_highway(void){
     const char *path=GetConfigOption("laplace.highway",false,false);
-    const lp_highway *h = lp_highway_map(path);
+    const char *prof=GetConfigOption("laplace.highway_profile",true,false);
+    const lp_highway *h = (prof && *prof)
+        ? lp_highway_map_branches(path, lp_highway_parse_branches(prof))
+        : lp_highway_map(path);
     if (!h) ereport(ERROR, (errmsg("laplace: cannot map the highway at \"%s\" (laplace.highway; generate it with: laplace highway)", path)));
     return h;
 }
@@ -111,8 +122,10 @@ static void cache_setting(const char *name,const char *description,char **value,
 void _PG_init(void){
     lp_allocator(tx_grow, tx_release);
     cache_setting("laplace.tier0", "Path of the tier-0 perf-cache (1,114,112 codepoint records, 64 bytes each).", &tier0_path,lp_tier0_path());
+    cache_setting("laplace.tier0_profile", "Tier-0 modular branch profile (ascii, utf, cjk, bmp, full; empty uses full or LAPLACE_TIER0_PROFILE).", &tier0_profile, "");
     cache_setting("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", &flags_path,lp_flags_path());
     cache_setting("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", &highway_path,lp_highway_path());
+    cache_setting("laplace.highway_profile", "Highway domain profile (core, wordnet, frames, lexical, full; empty uses full or LAPLACE_HIGHWAY_PROFILE).", &highway_profile, "");
 }
 
 /* ---------------------------------------------------------------- identity */
