@@ -180,7 +180,6 @@ Relation lp_pg_read_parent(Oid target,const char **column,const char *const *sel
                 aclcheck_error_col(allowed,OBJECT_TABLE,RelationGetRelationName(parent),selected[i]);
         }
     }
-    List *children=find_all_inheritors(target,AccessShareLock,NULL);list_free(children);
     return parent;
 }
 

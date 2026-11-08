@@ -18,6 +18,7 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "partitioning/partdesc.h"
 #include <limits.h>
 
 /* GIN is the retained containment access contract, just as the primary index
@@ -98,7 +99,8 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         Oid arguments[]={get_atttype(RelationGetRelid(parent),get_attnum(RelationGetRelid(parent),"path")),INT2OID};
         assertion_function=LookupFuncName(list_make2(makeString(get_namespace_name(lp_pg_schema())),makeString("laplace_path_has_roles")),2,arguments,false);
     }
-    List *relations=find_all_inheritors(RelationGetRelid(parent),NoLock,NULL);
+    PartitionDesc partdesc=parent->rd_rel->relkind==RELKIND_PARTITIONED_TABLE?RelationGetPartitionDesc(parent,true):NULL;
+    int nparts=partdesc?partdesc->nparts:1;
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
     size_t budget=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
@@ -113,8 +115,9 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     Datum mask_values[64];int nbits=0;
     for(int bit=0;bit<64;bit++)if(bits&(UINT64_C(1)<<bit))mask_values[nbits++]=Int16GetDatum((int16)bit);
     ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
-    foreach_oid(relation_id,relations){
-        CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,NoLock);
+    for(int p_idx=0;p_idx<nparts;p_idx++){
+        Oid relation_id=partdesc?partdesc->oids[p_idx]:RelationGetRelid(parent);
+        CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,AccessShareLock);
         if(table->rd_rel->relkind==RELKIND_PARTITIONED_TABLE){table_close(table,NoLock);continue;}
         if(!table->rd_tableam || !table->rd_tableam->scan_bitmap_next_tuple)
             ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native containment requires bitmap table access")));
@@ -229,7 +232,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
         if(predicate)list_free_deep(predicate);
         if(!proceed)break;
     }
-    if(required_keys)pfree(required_keys);if(mask_keys)pfree(mask_keys);MemoryContextDelete(scratch);list_free(relations);
+    if(required_keys)pfree(required_keys);if(mask_keys)pfree(mask_keys);MemoryContextDelete(scratch);
 }
 
 typedef struct {AttrNumber id;lp_idmap *parents;} ContainerParents;
