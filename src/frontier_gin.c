@@ -141,10 +141,8 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     List *parent_predicate=NIL;
     static Oid cached_parent[2],cached_idx[2][256];static int cached_col[2][256];static uint64 cached_gen;
     int a_slot=assertions?1:0;
-    if(cached_gen!=lp_pg_binding_generation() || cached_parent[a_slot]!=RelationGetRelid(parent)){
-        memset(cached_idx[a_slot],0,sizeof(cached_idx[a_slot]));
-        cached_parent[a_slot]=RelationGetRelid(parent);cached_gen=lp_pg_binding_generation();
-    }
+    if(cached_gen!=lp_pg_binding_generation()){memset(cached_idx,0,sizeof(cached_idx));memset(cached_parent,0,sizeof(cached_parent));cached_gen=lp_pg_binding_generation();}
+    if(cached_parent[a_slot]!=RelationGetRelid(parent)){memset(cached_idx[a_slot],0,sizeof(cached_idx[a_slot]));cached_parent[a_slot]=RelationGetRelid(parent);}
     for(int p_idx=0;p_idx<nparts;p_idx++){
         Oid relation_id=partdesc?partdesc->oids[p_idx]:RelationGetRelid(parent);
         CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,AccessShareLock);
