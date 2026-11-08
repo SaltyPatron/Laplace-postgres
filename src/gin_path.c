@@ -161,7 +161,7 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
         d[0] = path_key((const lp_id *)PG_GETARG_POINTER(0), st == LP_STRAT_FIRST ? PATH_FIRST : PATH_LAST);
         *n = 1; PG_RETURN_POINTER(d);
     }
-    bool endpoint_set=st==LP_PG_GIN_FIRST_ANY || st==LP_PG_GIN_LAST_ANY;
+    bool endpoint_set=st==LP_PG_GIN_FIRST_ANY || st==LP_PG_GIN_LAST_ANY || st==LP_PG_GIN_BOTH_ANY;
     if (st != LP_STRAT_CONTAINS && st != LP_STRAT_OVERLAPS && st != LP_PG_GIN_EXACT_OVERLAPS && !endpoint_set) ereport(ERROR, (errmsg("laplace: unknown path GIN strategy %u", st)));
     ArrayType *array=PG_GETARG_ARRAYTYPE_P(0);
     /* A page of identity operands selects a streamed key range. This changes
@@ -175,8 +175,21 @@ Datum laplace_gin_extract_query(PG_FUNCTION_ARGS){
         PG_RETURN_POINTER(d);
     }
     int k;lp_id *ids=ids_of(array,&k);
+    if(st==LP_PG_GIN_BOTH_ANY){
+        uint32 nf=(uint32)k,nl=(uint32)k;const lp_id *first_ids=ids,*last_ids=ids;
+        if(k>=1 && memcmp(ids[0].b,"\xff\xff\xff\xff\xff\xff\xff\xff",8)==0){
+            memcpy(&nf,ids[0].b+8,4);memcpy(&nl,ids[0].b+12,4);
+            first_ids=ids+1;last_ids=ids+1+nf;
+        }
+        int total=(int)(nf+nl);Datum *d=palloc(sizeof(Datum)*(total?total:1));
+        for(uint32 i=0;i<nf;i++)d[i]=path_key(&first_ids[i],PATH_FIRST);
+        for(uint32 i=0;i<nl;i++)d[nf+i]=path_key(&last_ids[i],PATH_LAST);
+        pfree(ids);*n=total;if(!total)*mode=GIN_SEARCH_MODE_DEFAULT;
+        PG_RETURN_POINTER(d);
+    }
     uint8 role=st==LP_PG_GIN_FIRST_ANY?PATH_FIRST:st==LP_PG_GIN_LAST_ANY?PATH_LAST:PATH_MEMBER;
     Datum *d = palloc(sizeof(Datum) * (k ? k : 1)); for (int i = 0; i < k; i++) d[i] = path_key(&ids[i], role);
+    pfree(ids);
     *n = k; if (k == 0) *mode = st == LP_STRAT_CONTAINS ? GIN_SEARCH_MODE_ALL : GIN_SEARCH_MODE_DEFAULT;
     PG_RETURN_POINTER(d);
 }

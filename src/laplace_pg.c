@@ -117,7 +117,7 @@ static void cache_setting(const char *name,const char *description,char **value,
     /* Configuration belongs to the backend. Multiple loaded generations read
      * that owner instead of redefining a setting or retaining a private copy. */
     if(!GetConfigOption(name,true,false) || (GetConfigOptionFlags(name,true)&GUC_CUSTOM_PLACEHOLDER))
-        DefineCustomStringVariable(name,description,NULL,value,initial,PGC_SUSET,0,NULL,NULL,NULL);
+        DefineCustomStringVariable(name,description,NULL,value,initial,PGC_SUSET,GUC_ALLOW_IN_PARALLEL,NULL,NULL,NULL);
 }
 void _PG_init(void){
     lp_allocator(tx_grow, tx_release);

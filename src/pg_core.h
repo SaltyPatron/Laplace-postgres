@@ -119,6 +119,7 @@ static inline size_t frontier_window_ids(void)
 #define LP_PG_GIN_EXACT_OVERLAPS 10
 #define LP_PG_GIN_FIRST_ANY 11
 #define LP_PG_GIN_LAST_ANY 12
+#define LP_PG_GIN_BOTH_ANY 13
 
 static inline Datum id_datum(const lp_id *id){ uint8 *u = palloc(16); memcpy(u, id->b, 16); return PointerGetDatum(u); }
 

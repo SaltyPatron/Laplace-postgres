@@ -348,12 +348,12 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
     (void)idarr;
     PgDag d = { lp_idmap_new(), {0}, {0} };
     lp_idmap *front = lp_idmap_new();
-    if(roots && !known_witnesses){
+    if(!known_witnesses){
         /* The downward API admits assertions by the child's carrier, not
          * solely by an incoming edge. Preserve that boundary in either
          * direction, including callers selecting non-claim content. */
         if(n){
-            PgClaimFrontier selected={.front=front,.dag=&d};lp_pg_claim_bind(&selected.binding);
+            PgClaimFrontier selected={.front=front,.dag=roots?&d:NULL};lp_pg_claim_bind(&selected.binding);
             lp_pg_lookup_paths(claims,(size_t)n,true,lp_pg_claim_frontier_row,&selected);
             MemoryContextDelete(selected.binding.context);
         }
