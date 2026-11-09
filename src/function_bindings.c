@@ -17,13 +17,8 @@
 #include "utils/regproc.h"
 
 typedef struct { const char *symbol; bool sql_scope; } FunctionBinding;
-static const FunctionBinding bindings[]={
 #include "laplace_function_bindings.h"
-};
-
-static const char current_api[]=
 #include "laplace_current_api.h"
-;
 
 /* Native declarations are shared by cold install, version transition and
  * missing-object repair. PostgreSQL parses the signature; no name guessing,
@@ -38,14 +33,18 @@ static void restore_declared_api(const char *module,Oid extension)
     }
     appendStringInfoString(&sql,at);
     List *declarations=raw_parser(sql.data,RAW_PARSE_DEFAULT);
-    foreach_ptr(RawStmt,raw,declarations){
+    ListCell *raw_cell;
+    foreach(raw_cell,declarations){
+        RawStmt *raw=lfirst_node(RawStmt,raw_cell);
         if(!IsA(raw->stmt,CreateFunctionStmt))elog(ERROR,"Native API declaration is not a function");
         CreateFunctionStmt *function=(CreateFunctionStmt *)raw->stmt;
         if(list_length(function->funcname)!=2 ||
            get_namespace_oid(strVal(linitial(function->funcname)),false)!=lp_pg_schema())
             elog(ERROR,"Native API declaration is outside its installed namespace");
         Oid arguments[FUNC_MAX_ARGS];int count=0;
-        foreach_ptr(FunctionParameter,argument,function->parameters){
+        ListCell *arg_cell;
+        foreach(arg_cell,function->parameters){
+            FunctionParameter *argument=lfirst_node(FunctionParameter,arg_cell);
             if(argument->mode==FUNC_PARAM_OUT || argument->mode==FUNC_PARAM_TABLE)continue;
             if(count==FUNC_MAX_ARGS)elog(ERROR,"Native API declaration has too many arguments");
             arguments[count++]=LookupTypeNameOid(NULL,argument->argType,false);

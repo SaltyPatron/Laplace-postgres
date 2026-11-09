@@ -340,11 +340,12 @@ static int64 clean_partition_ids(ArrayType *ids)
     }
     array_free_iterator(iterator);hash_destroy(allowed);
     if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("laplace_clean_partitions: SPI_connect")));
-    Oid type = OIDARRAYOID; Datum parameter = PointerGetDatum(ids);
+    Oid types[2] = {OIDARRAYOID, OIDOID};
+    Datum parameters[2] = {PointerGetDatum(ids), ObjectIdGetDatum(GIN_AM_OID)};
     if (lp_pg_execute_args("SELECT @extschema@.laplace_clean_pending_list(i.indexrelid)"
         " FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid"
-        " WHERE i.indrelid=ANY($1) AND c.relam=" CppAsString2(GIN_AM_OID)
-        " ORDER BY i.indexrelid", 1, &type, &parameter, NULL, false, 0) != SPI_OK_SELECT)
+        " WHERE i.indrelid=ANY($1) AND c.relam=$2"
+        " ORDER BY i.indexrelid", 2, types, parameters, NULL, false, 0) != SPI_OK_SELECT)
         ereport(ERROR, (errmsg("laplace_clean_partitions: index maintenance failed")));
     int64 cleaned = 0;
     for (uint64 row = 0; row < SPI_processed; row++) {

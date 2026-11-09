@@ -19,7 +19,8 @@ INSERT INTO "native tenant".physicality(entity,tier,hilbert,path)
 SELECT id,tier,hilbert,"native tenant".laplace_path(ARRAY["native tenant".laplace_cp_id(97),"native tenant".laplace_cp_id(98)])
 FROM "native tenant".entity;
 SET LOCAL search_path=pg_catalog,pg_temp;
-DO $$ DECLARE id "native tenant".blake3:="native tenant".laplace_id('ab'); value text;
+CREATE DOMAIN pg_temp.test_blake3 AS "native tenant".blake3;
+DO $$ DECLARE id pg_temp.test_blake3:="native tenant".laplace_id('ab'); value text;
 BEGIN
  IF "native tenant".laplace_text(id)<>'ab' THEN RAISE EXCEPTION 'installed Native text binding failed'; END IF;
  IF "native tenant".laplace_path_length("native tenant".laplace_path(ARRAY[id,id]))<>2 THEN
@@ -93,7 +94,7 @@ CREATE UNLOGGED TABLE stage.schema_entities (LIKE "native tenant".entity);
 CREATE UNLOGGED TABLE stage.schema_paths (LIKE "native tenant".physicality);
 INSERT INTO stage.schema_entities SELECT * FROM "native tenant".entity;
 INSERT INTO stage.schema_paths SELECT * FROM "native tenant".physicality;
-DO $$ DECLARE merged record; projected record; id "native tenant".blake3:="native tenant".laplace_id('ab'); BEGIN
+DO $$ DECLARE merged record; projected record; id pg_temp.test_blake3:="native tenant".laplace_id('ab'); BEGIN
  SELECT * INTO merged FROM "native tenant".laplace_merge_stage('stage.schema_entities','stage.schema_paths');
  IF merged.entity_rows<>0 OR merged.physicality_rows<>0 THEN RAISE EXCEPTION 'namespace replay inserted duplicate content'; END IF;
  PERFORM "native tenant".laplace_schema_indexes();

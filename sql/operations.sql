@@ -528,12 +528,12 @@ BEGIN
        OR p.hilbert <> projected.hilbert;
   END LOOP;
   SELECT count(*) INTO entity_rows FROM pg_temp.laplace_coordinate_projection f
-    JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) f.id WHERE @extschema:postgis@.ST_AsEWKB(e.coord)<>@extschema:postgis@.ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert;
+    JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) f.id WHERE @extschema:postgis@.ST_AsEWKB(e.coord) <> @extschema:postgis@.ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert;
   SELECT count(*) INTO physicality_rows FROM pg_temp.laplace_coordinate_projection f
     JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) f.id WHERE p.hilbert<>f.hilbert;
   IF apply THEN
     UPDATE @extschema@.entity e SET coord=f.coord,hilbert=f.hilbert FROM pg_temp.laplace_coordinate_projection f
-      WHERE e.id OPERATOR(@extschema@.=) f.id AND (@extschema:postgis@.ST_AsEWKB(e.coord)<>@extschema:postgis@.ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert);
+      WHERE e.id OPERATOR(@extschema@.=) f.id AND (@extschema:postgis@.ST_AsEWKB(e.coord) <> @extschema:postgis@.ST_AsEWKB(f.coord) OR e.hilbert<>f.hilbert);
     UPDATE @extschema@.physicality p SET hilbert=f.hilbert FROM pg_temp.laplace_coordinate_projection f
       WHERE p.entity OPERATOR(@extschema@.=) f.id AND p.hilbert<>f.hilbert;
   END IF;

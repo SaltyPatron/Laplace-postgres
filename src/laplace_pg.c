@@ -37,7 +37,8 @@
 
 #define LP_STRING_(value) #value
 #define LP_STRING(value) LP_STRING_(value)
-PG_MODULE_MAGIC_EXT(.name = "laplace", .version = LP_STRING(LP_PG_VERSION_MAJOR) "." LP_STRING(LP_PG_VERSION_MINOR));
+#define LP_PG_VERSION LP_STRING(LP_PG_VERSION_MAJOR) "." LP_STRING(LP_PG_VERSION_MINOR)
+PG_MODULE_MAGIC_EXT(.name = "laplace", .version = LP_PG_VERSION);
 
 static text *fingerprint_text(const uint8 fp[32]){ char hex[65]; lp_hex(fp, 32, hex); return cstring_to_text(hex); }
 

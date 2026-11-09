@@ -53,7 +53,7 @@ foreach(_row IN LISTS _binding_rows)
     message(FATAL_ERROR "Invalid Native function binding: ${_row}")
   endif()
 endforeach()
-file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_function_bindings.h" CONTENT "${_bindings}")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_function_bindings.h" CONTENT "static const FunctionBinding bindings[]={\n${_bindings}};\n")
 add_library(laplace_pg MODULE
   src/laplace_pg.c
   src/realize.c
@@ -115,7 +115,7 @@ string(REPLACE "\\" "\\\\" _api_c "${_api_c}")
 string(REPLACE "\"" "\\\"" _api_c "${_api_c}")
 string(REPLACE "\r" "" _api_c "${_api_c}")
 string(REPLACE "\n" "\\n\"\n\"" _api_c "${_api_c}")
-file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_current_api.h" CONTENT "\"${_api_c}\"\n")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_current_api.h" CONTENT "static const char current_api[]=\n\"${_api_c}\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/operations.sql")
 file(READ "${_sql_root}/path_set_match.sql" _path_set_match)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/path_set_match.sql")

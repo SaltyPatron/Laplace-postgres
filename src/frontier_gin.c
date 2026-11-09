@@ -41,8 +41,9 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,St
         if(index)index_close(index,NoLock);
         *cached_id=InvalidOid;
     }
-    List *indexes=RelationGetIndexList(table);Relation found=NULL;
-    foreach_oid(index_id,indexes){
+    List *indexes=RelationGetIndexList(table);Relation found=NULL;ListCell *lc;
+    foreach(lc,indexes){
+        Oid index_id=lfirst_oid(lc);
         Relation index=index_open(index_id,AccessShareLock);
         if(index->rd_rel->relam==GIN_AM_OID && index->rd_index->indisvalid &&
            index->rd_index->indisready && index->rd_index->indislive &&
