@@ -25,28 +25,22 @@
 /* GIN is the retained containment access contract, just as the primary index
  * is the retained identity access contract. Unknown SPI array sizes can
  * otherwise make the planner scan every physicality at each sparse DAG hop. */
-static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,List *predicate,int *column,Oid *operation,Oid *cached_id,int *cached_col)
-{
+static Relation container_index(Relation table,AttrNumber path,Oid array_type,StrategyNumber strategy,List *predicate,int *column,Oid *operation,Oid *cached_id,int *cached_col){
     if(cached_id && OidIsValid(*cached_id)){
         Relation index=try_relation_open(*cached_id,AccessShareLock);
-        if(index && index->rd_rel->relam==GIN_AM_OID && index->rd_index &&
-           index->rd_index->indrelid==RelationGetRelid(table) &&
+        if(index && index->rd_rel->relam==GIN_AM_OID && index->rd_index && index->rd_index->indrelid==RelationGetRelid(table) &&
            index->rd_index->indisvalid && index->rd_index->indisready && index->rd_index->indislive &&
            (!index->rd_index->indcheckxmin || TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),TransactionXmin)) &&
-           *cached_col>=1 && *cached_col<=index->rd_index->indnkeyatts &&
-           index->rd_index->indkey.values[*cached_col-1]==path){
+           *cached_col>=1 && *cached_col<=index->rd_index->indnkeyatts && index->rd_index->indkey.values[*cached_col-1]==path){
             Oid op=get_opfamily_member(index->rd_opfamily[*cached_col-1],get_atttype(RelationGetRelid(table),path),array_type,strategy);
             if(OidIsValid(op)){*column=*cached_col;*operation=get_opcode(op);return index;}
         }
-        if(index)index_close(index,NoLock);
-        *cached_id=InvalidOid;
+        if(index)index_close(index,NoLock);*cached_id=InvalidOid;
     }
     List *indexes=RelationGetIndexList(table);Relation found=NULL;ListCell *lc;
     foreach(lc,indexes){
-        Oid index_id=lfirst_oid(lc);
-        Relation index=index_open(index_id,AccessShareLock);
-        if(index->rd_rel->relam==GIN_AM_OID && index->rd_index->indisvalid &&
-           index->rd_index->indisready && index->rd_index->indislive &&
+        Oid index_id=lfirst_oid(lc);Relation index=index_open(index_id,AccessShareLock);
+        if(index->rd_rel->relam==GIN_AM_OID && index->rd_index->indisvalid && index->rd_index->indisready && index->rd_index->indislive &&
            (!index->rd_index->indcheckxmin || TransactionIdPrecedes(HeapTupleHeaderGetXmin(index->rd_indextuple->t_data),TransactionXmin)) &&
            heap_attisnull(index->rd_indextuple,Anum_pg_index_indpred,NULL)==(predicate==NIL) &&
            (predicate==NIL || equal(RelationGetIndexPredicate(index),predicate))){
@@ -55,8 +49,7 @@ static Relation container_index(Relation table,AttrNumber path,Oid array_type,St
                 if(OidIsValid(op)){*column=i+1;*operation=get_opcode(op);found=index;break;}
             }
         }
-        if(found)break;
-        index_close(index,NoLock);
+        if(found)break;index_close(index,NoLock);
     }
     list_free(indexes);
     if(!found)ereport(ERROR,(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -104,7 +97,12 @@ static bool container_endpoint_matches(TupleTableSlot *slot,AttrNumber path,lp_i
  * Endpoint seeks union existing first/last postings into one bounded bitmap;
  * they never acquire all the text parents of a common predicate or word.
  * Array windows are transport bounds; lossy rechecks use the complete set. */
+typedef struct {uint64 epoch,held[2];int head;} HolderKey;
 typedef struct {uint64 epoch[2],sent[2],nom_epoch[2],nominated[2];int head,floor;} ClaimKey;
+static bool key_active(lp_idmap *wanted,size_t at,uint64 h_kinds,uint64 nom_cap,int dir){
+    if(h_kinds){const HolderKey *hk=lp_idmap_at(wanted,at);return ((h_kinds&1) && hk->held[1]<nom_cap) || ((h_kinds&2) && hk->held[0]<nom_cap);}
+    return ((const ClaimKey *)lp_idmap_at(wanted,at))->nominated[dir]<nom_cap;
+}
 typedef bool (*ContainerVisit)(TupleTableSlot *slot,void *context);
 static void scan_container_rows(Relation parent,const char *column,lp_idmap *wanted,StrategyNumber strategy,
                                  lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,bool assertions,uint64 nom_cap,ContainerVisit visit,void *context)
@@ -134,8 +132,9 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     Datum mask_values[64];int nbits=0;
     for(int bit=0;bit<64;bit++)if(bits&(UINT64_C(1)<<bit))mask_values[nbits++]=Int16GetDatum((int16)bit);
     ArrayType *mask_keys=nbits?construct_array(mask_values,nbits,INT2OID,2,true,TYPALIGN_SHORT):NULL;
+    uint64 h_kinds=nom_cap>>60;nom_cap&=(UINT64_C(1)<<60)-1;
     ArrayType *single_keys=(unique<=budget && !indexed_opposite && !nom_cap)?id_array_of(element,lp_idmap_keys(wanted),(int)unique):NULL;
-    lp_id *nom_buf=(nom_cap && endpoint)?palloc(sizeof(lp_id)*(1+2*Min(budget,unique))):NULL;
+    lp_id *nom_buf=(nom_cap && (endpoint || h_kinds))?palloc(sizeof(lp_id)*(1+2*Min(budget,unique))):NULL;
     Size bm_mem=Min((Size)work_mem*1024,(Size)4*1024*1024);
     TIDBitmap *bitmap=tbm_create(bm_mem,NULL);
     AttrNumber parent_path=get_attnum(RelationGetRelid(parent),"path");
@@ -206,14 +205,14 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
                 const lp_id *all=lp_idmap_keys(wanted)+begin;
                 if(endpoint==3){
                     uint32 nf=0,nl=0;
-                    for(size_t i=0;i<amount;i++)if(((const ClaimKey *)lp_idmap_at(wanted,begin+i))->nominated[0]<nom_cap)nom_buf[1+nf++]=all[i];
-                    for(size_t i=0;i<amount;i++)if(((const ClaimKey *)lp_idmap_at(wanted,begin+i))->nominated[1]<nom_cap)nom_buf[1+nf+nl++]=all[i];
+                    for(size_t i=0;i<amount;i++)if(key_active(wanted,begin+i,h_kinds,nom_cap,0))nom_buf[1+nf++]=all[i];
+                    for(size_t i=0;i<amount;i++)if(key_active(wanted,begin+i,h_kinds,nom_cap,1))nom_buf[1+nf+nl++]=all[i];
                     if(!(nf+nl))continue;
                     memset(nom_buf[0].b,0xFF,8);memcpy(nom_buf[0].b+8,&nf,4);memcpy(nom_buf[0].b+12,&nl,4);
                     keys=id_array_of(element,nom_buf,1+(int)(nf+nl));
                 }else{
                     int dir=endpoint==2?1:0,nk=0;
-                    for(size_t i=0;i<amount;i++)if(((const ClaimKey *)lp_idmap_at(wanted,begin+i))->nominated[dir]<nom_cap)nom_buf[nk++]=all[i];
+                    for(size_t i=0;i<amount;i++)if(key_active(wanted,begin+i,h_kinds,nom_cap,dir))nom_buf[nk++]=all[i];
                     if(!nk)continue;
                     keys=id_array_of(element,nom_buf,nk);
                 }
@@ -387,7 +386,6 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
  * partition. Per-part mode preserves request occurrences. A cap classifies
  * each key's claim and observation sets independently: a saturated set emits
  * one hub marker and none of whichever rows the heap happened to return. */
-typedef struct {uint64 epoch,held[2];int head;} HolderKey;
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*required,*seen;int *links;
     AttrNumber id,path,tier,mask;int floor,kinds,endpoint;bool per_part;int64 cap;lp_mask bits;
@@ -480,7 +478,8 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
             read.links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        scan_container_rows(parent,column,read.wanted,3,read.required,false,read.endpoint,NULL,read.bits,false,0,holder_row,&read);
+        uint64 h_cap=read.cap>=0?(((uint64)read.kinds<<60)|((uint64)read.cap+1)):0;
+        scan_container_rows(parent,column,read.wanted,3,read.required,false,read.endpoint,NULL,read.bits,false,h_cap,holder_row,&read);
         if(read.pending){
             TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
             tuplestore_rescan(read.pending);

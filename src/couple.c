@@ -2,6 +2,7 @@
  * (laplace_fills, laplace_forward, laplace_couple). */
 #include "pg_core.h"
 #include "geo.h"
+#include "access/table.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "laplace/consensus.h"
@@ -68,51 +69,103 @@ SET_FN(laplace_fills, fills_kept)
  * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
  * trajectories, no softmax, no window. */
 static Kept forward_kept = { "laplace_forward",
-    "SELECT p.path, p.tier FROM @extschema@.physicality p WHERE p.tier > (SELECT max(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.@>) $1 "
-    "AND NOT @extschema@.laplace_mask_has(p.mask, 0::smallint) LIMIT $2", 2, NULL, 0 };
-static Kept tiers_kept = { "laplace_forward tiers", "SELECT u.i, e.tier FROM pg_catalog.unnest($1) WITH ORDINALITY u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id", 1, NULL, 0 };
+    "SELECT h.ordinal, h.path, h.tier, h.hub FROM @extschema@.laplace_holders($1, $2, true, $3, $4, 2::smallint) h", 4, NULL, 0 };
+typedef struct { AttrNumber att; int16 *tier; } ForwardTiers;
+static void forward_tier_row(TupleTableSlot *slot, const PresenceKey *key, void *context){
+    ForwardTiers *ft = context; bool nl; Datum d = slot_getattr(slot, ft->att, &nl);
+    if (!nl) { int16 t = DatumGetInt16(d); if (t > ft->tier[key->ordinal - 1]) ft->tier[key->ordinal - 1] = t; }
+}
 /* A segment's observations: each path as it lies, and its tier. */
 typedef struct { Datum path; int16 tier; } Held;
 typedef lp_vec(Held) Helds;
 PG_FUNCTION_INFO_V1(laplace_forward);
 Datum laplace_forward(PG_FUNCTION_ARGS){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_forward", &td);
-    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0); Oid el = ARR_ELEMTYPE(arr), at = get_fn_expr_argtype(fcinfo->flinfo, 0), types[2] = { at, INT8OID };
+    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0); Oid el = ARR_ELEMTYPE(arr), at = get_fn_expr_argtype(fcinfo->flinfo, 0), ftypes[4] = { at, at, INT2OID, INT8OID };
     int n; lp_id *ids = ids_of(arr, &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
+    int16 *tier = palloc(sizeof(int16) * (size_t)(n ? n : 1)); for (int i = 0; i < n; i++) tier[i] = -1;
+    if (n > 0) {
+        const char *sel[] = { "id", "tier" }, *col; Oid target = lp_pg_relation("entity");
+        Relation ent = lp_pg_read_parent(target, &col, sel, lengthof(sel));
+        ForwardTiers ft = { get_attnum(target, "tier"), tier };
+        PresenceKey *pkeys = palloc_extended((Size)n * sizeof(*pkeys), MCXT_ALLOC_HUGE);
+        for (int i = 0; i < n; i++) pkeys[i] = (PresenceKey){ .id = ids[i], .ordinal = (int64)i + 1 };
+        lp_pg_indexed_keys(ent, col, pkeys, (size_t)n, forward_tier_row, &ft);
+        pfree(pkeys); table_close(ent, NoLock);
+    }
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_forward: SPI_connect")));
-    /* each constituent's highest recorded tier (-1: not recorded): which are compositions (words and above), and the
-     * floor a segment's holders sit above. A segment of atoms alone (a space, a letter) is a hub and says nothing of the
-     * prompt, and a single constituent is the constituents' own step, not a segment */
-    int16 *tier = palloc(sizeof(int16) * (size_t)n); for (int i = 0; i < n; i++) tier[i] = -1;
-    { Datum a0[1] = { PointerGetDatum(arr) }; kept_run(&tiers_kept, &at, a0);
-      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int64 i = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)); int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-          if (i >= 1 && i <= n && t > tier[i - 1]) tier[i - 1] = t; } }
-    /* What holds [i..j] holds [i..j-1]: while the shorter segment's holders were all of them (fewer than the fan), the
-     * longer one's are those of them that hold its new part too and sit above its highest tier, found here, not asked
-     * for again. A segment whose shorter one reached the fan is asked of the index. */
     lp_idmap *followed = lp_idmap_sized(sizeof(int64)); lp_vec(lp_id) out = { 0 };
-    /* the paths a segment starting at i was answered with live until the next i: what is derived from them points at them */
     MemoryContext rowctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward rows", ALLOCSET_DEFAULT_SIZES),
-                  keepctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward held", ALLOCSET_DEFAULT_SIZES);
+                  keepctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward held", ALLOCSET_DEFAULT_SIZES),
+                  wordctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward words", ALLOCSET_DEFAULT_SIZES);
+    lp_id *w_ids = palloc(sizeof(lp_id) * (size_t)(n ? n : 1));
+    int *w_at = palloc(sizeof(int) * (size_t)(n ? n : 1)), nw = 0;
+    for (int i = 0; i < n; i++) {
+        w_at[i] = -1; if (tier[i] <= 0) continue;
+        for (int k = 0; k < nw; k++) if (lp_id_eq(&w_ids[k], &ids[i])) { w_at[i] = k; break; }
+        if (w_at[i] < 0) { w_at[i] = nw; w_ids[nw++] = ids[i]; }
+    }
+    Helds *w_held = palloc0(sizeof(Helds) * (size_t)(nw ? nw : 1));
+    bool *w_hub = palloc0(sizeof(bool) * (size_t)(nw ? nw : 1));
+    if (nw > 0) {
+        MemoryContext old = MemoryContextSwitchTo(rowctx);
+        Datum a[4] = { PointerGetDatum(id_array_of(el, w_ids, nw)), PointerGetDatum(id_array_of(el, NULL, 0)), Int16GetDatum(0), Int64GetDatum(fan) };
+        kept_run(&forward_kept, ftypes, a);
+        MemoryContextSwitchTo(wordctx);
+        for (uint64 r = 0; r < SPI_processed; r++) {
+            bool nl; int64 ord = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1;
+            if (ord < 0 || ord >= nw) continue;
+            if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 4, &nl))) { w_hub[ord] = true; continue; }
+            Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl);
+            int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &nl));
+            lp_push(&w_held[ord], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t });
+        }
+        SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
+    }
     Helds held[2] = { { 0 }, { 0 } };
     for (int i = 0; i < n; i++) {
         MemoryContextReset(keepctx);
-        int cur = 0, have = 0, floor = tier[i], words = tier[i] > 0;                   /* have: held[cur] is every holder of [i..j-1] */
+        int cur = 0, have = 0, floor = tier[i], words = tier[i] > 0;
         for (int j = i + 1; j < n; j++) {
+            int prev_words = words, prev_floor = floor;
             words += tier[j] > 0; if (tier[j] > floor) floor = tier[j];
             int next = cur ^ 1, np = j - i + 1; held[next].n = 0;
             if (!words) { have = 0; continue; }
             if (!have) {
-                MemoryContext old = MemoryContextSwitchTo(rowctx);
-                Datum a[2] = { PointerGetDatum(id_array_of(el, ids + i, np)), Int64GetDatum(fan + 1) };
-                kept_run(&forward_kept, types, a);
-                MemoryContextSwitchTo(keepctx);
-                for (uint64 r = 0; r < SPI_processed; r++) { bool nl; Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl);     /* path is NOT NULL */
-                    int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl));
-                    lp_push(&held[next], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t }); }
-                SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
-                have = held[next].n <= (size_t)fan;                                    /* no more than the fan: every holder there is */
-                if (!have) {                                                           /* a hub: reached, not crossed */
+                int best_w = -1;
+                for (int k = i; k <= j; k++) if (w_at[k] >= 0 && !w_hub[w_at[k]]) {
+                    if (best_w < 0 || w_held[w_at[k]].n < w_held[best_w].n) best_w = w_at[k];
+                }
+                if (best_w >= 0) {
+                    const Helds *src = &w_held[best_w];
+                    for (size_t r = 0; r < src->n; r++) {
+                        const Held *h = &src->v[r]; Geo g = geo_of(h->path);
+                        if (h->tier > floor && lp_path_holds(g.p, ids + i, (size_t)np, true)) lp_push(&held[next], *h);
+                    }
+                    have = 1;
+                } else {
+                    bool dup_part = false;
+                    if (j > i + 1 && prev_words > 0 && floor == prev_floor) {
+                        for (int k = i; k < j; k++) if (lp_id_eq(&ids[k], &ids[j])) { dup_part = true; break; }
+                    }
+                    if (!dup_part) {
+                        int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
+                        MemoryContext old = MemoryContextSwitchTo(rowctx);
+                        Datum a[4] = { PointerGetDatum(id_array_of(el, ids + probe, 1)), PointerGetDatum(id_array_of(el, ids + i, np)), Int16GetDatum((int16)floor), Int64GetDatum(fan) };
+                        kept_run(&forward_kept, ftypes, a);
+                        MemoryContextSwitchTo(keepctx);
+                        bool is_hub = false;
+                        for (uint64 r = 0; r < SPI_processed; r++) {
+                            bool nl; if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 4, &nl))) { is_hub = true; continue; }
+                            Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl);
+                            int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &nl));
+                            lp_push(&held[next], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t });
+                        }
+                        SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
+                        have = !is_hub;
+                    }
+                }
+                if (!have) {
                     Datum v[6]; bool nl[6] = { false, false, false, false, true, false };
                     v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum(fan + 1); v[3] = Int64GetDatum(0); v[4] = (Datum)0; v[5] = Int64GetDatum(0);
                     set_put(fcinfo, ts, td, v, nl); cur = next; continue;
@@ -137,7 +190,8 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
             cur = next;
         }
     }
-    MemoryContextDelete(rowctx); MemoryContextDelete(keepctx);
+    for (int k = 0; k < nw; k++) lp_vec_free(&w_held[k]);
+    MemoryContextDelete(rowctx); MemoryContextDelete(keepctx); MemoryContextDelete(wordctx);
     lp_idmap_free(followed); lp_vec_free(&out); lp_vec_free(&held[0]); lp_vec_free(&held[1]);
     SPI_finish(); PG_RETURN_NULL();
 }
