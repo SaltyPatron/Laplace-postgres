@@ -396,7 +396,8 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
             }
         }
         SPI_finish();
-        lp_pg_read_attestation_rows(lp_idmap_keys(batch->claims),(int)count,NULL,&batch->historical,batch->witnesses);
+        if (changed) lp_pg_read_attestation_stage(changed,&batch->historical,batch->witnesses);
+        else lp_pg_read_attestation_rows(lp_idmap_keys(batch->claims),(int)count,NULL,&batch->historical,batch->witnesses);
         pg_attribution_ancestors(batch);
         for (size_t i=0; i<batch->historical.n; i++) {
             const PgAttrRow *r=batch->historical.v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
