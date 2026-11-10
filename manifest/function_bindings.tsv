@@ -16,10 +16,10 @@ blake3_from_bytea	false
 laplace_angular4d	false
 laplace_angular4d_gist_compress	false
 laplace_angular4d_gist_distance	false
-laplace_attested	false
-laplace_testimony	false
-laplace_attested_series	false
-laplace_attribution	false
+laplace_attested	true
+laplace_testimony	true
+laplace_attested_series	true
+laplace_attribution	true
 laplace_bank_bit	false
 laplace_bank_of	false
 laplace_box4d_in	false
@@ -36,7 +36,7 @@ laplace_clean_partitions	true
 laplace_codepoint	false
 laplace_compose	false
 laplace_confidence	false
-laplace_contained_series	false
+laplace_contained_series	true
 laplace_containers	false
 laplace_coord_ewkb	false
 laplace_couple	true
@@ -141,6 +141,6 @@ laplace_ordered_pair_counts	true
 laplace_gin_compare_partial	false
 laplace_holders	false
 laplace_standings	false
-laplace_source_attribution	false
-laplace_source_standings	false
+laplace_source_attribution	true
+laplace_source_standings	true
 laplace_path_has_roles	false
