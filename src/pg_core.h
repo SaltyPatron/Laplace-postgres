@@ -97,6 +97,8 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
                                      void (*testimony)(const void *,const void *,const uint64_t *,size_t,double,void *), void *testimony_context);
 void lp_pg_compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots, const lp_idmap *known_witnesses, PgAttrRows *out);
+void lp_pg_read_attestation_rows(const lp_id *claims, int n, const lp_idmap *roots, PgAttrRows *out, lp_idmap *witnesses);
+void lp_pg_attested_unstored(const lp_id *claims, int n, Oid idarr, int include_files, PgAttrRows *rows, lp_idmap *registry);
 
 /* The live parameter buffers and the actual PostgreSQL array boundary size
  * every indexed frontier transfer. This is a window, never an input limit. */

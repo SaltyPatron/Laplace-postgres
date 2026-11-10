@@ -185,7 +185,9 @@ static void compute_attribution_rows(const lp_id *claims,int n,Oid idarr,const l
     PgSeriesBatch *batch=palloc0(sizeof *batch);MemoryContextCallback *cleanup=palloc(sizeof *cleanup);
     *cleanup=(MemoryContextCallback){.func=pg_series_batch_free,.arg=batch};
     MemoryContextRegisterResetCallback(context,cleanup);
-    lp_pg_compute_attested_registry(claims,n,idarr,0,0,NULL,NULL,&batch->historical,&batch->witnesses,NULL,NULL);
+    batch->witnesses=lp_idmap_sized(sizeof(PgSeriesWitness));
+    lp_pg_read_attestation_rows(claims,n,scope,&batch->historical,batch->witnesses);
+    lp_pg_attested_unstored(claims,n,idarr,0,&batch->historical,batch->witnesses);
     PgAttrRows *rows=&batch->historical;size_t kept=0;
     for(size_t i=0;i<rows->n;i++)if(rows->v[i].witness&&(!scope||lp_idmap_find(scope,&rows->v[i].trunk)>=0))
         rows->v[kept++]=rows->v[i];
@@ -371,17 +373,6 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
         lp_pg_lookup_paths(lp_idmap_keys(batch->claims),count,true,lp_pg_claim_frontier_row,&verified);
         MemoryContextDelete(verified.binding.context);
         if(verified.found!=count)pg_series_invalid();
-        if (lp_pg_execute("SELECT id,lineage,trust FROM @extschema@.witness ORDER BY id", true, 0) != SPI_OK_SELECT)
-            ereport(ERROR, (errmsg("laplace_series_snapshot: witness registry failed")));
-        for (uint64 row = 0; row < SPI_processed; row++) {
-            bool missing; lp_id id;
-            memcpy(id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 1, &missing)), sizeof id);
-            PgSeriesWitness *w = lp_idmap_get(batch->witnesses, &id, NULL);
-            Datum lineage = SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 2, &missing);
-            w->has_lineage = !missing; if (!missing) memcpy(w->lineage.b, DatumGetPointer(lineage), sizeof(lp_id));
-            w->trust = DatumGetFloat8(SPI_getbinval(SPI_tuptable->vals[row], SPI_tuptable->tupdesc, 3, &missing));
-        }
-        SPI_freetuptable(SPI_tuptable);
         /* A stage-resident selection stays a set in PostgreSQL; no client-side
          * array export or fixed-count keyset loop is needed. */
         char *sql = changed ? psprintf("SELECT s.claim,s.witness,s.lineage,s.games::bigint,s.score::float8,s.trust::float8"
@@ -395,20 +386,28 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
         if(parameters){parameters->params[0]=(ParamExternData){.value=PointerGetDatum(selected),.ptype=idarray,.pflags=0};}
         lp_pg_stream(plan,parameters,pg_series_pending_row,batch);
         SPI_freeplan(plan);pfree(sql);if(selected)pfree(selected);if(parameters)pfree(parameters);
-        if (lp_idmap_count(batch->witnesses)) {
-            lp_pg_compute_attested_rows(lp_idmap_keys(batch->claims), (int)count, idarray, 0, 0,
-                batch->witnesses, batch->witnesses, &batch->historical);
-            for (size_t i=0; i<batch->historical.n; i++) {
-                const PgAttrRow *r=batch->historical.v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
-                if (lp_strmap_find(batch->pairs,key,sizeof key)>=0 || r->games<=0) continue;
-                PgSeriesWitness *w=lp_idmap_lookup(batch->witnesses,&r->trunk);
-                if (!w || r->games>9007199254740992.0 || !isfinite(r->games)) pg_series_invalid();
-                PgSeriesObservation o={.claim=r->claim,.witness=r->trunk,.games=(uint64_t)r->games,
-                    .score=r->score/r->games,.trust=r->has_dependence?r->trust:w->trust,
-                    .has_lineage=r->has_dependence || w->has_lineage,
-                    .lineage=r->has_dependence?r->dependence:w->lineage};
-                lp_push(&batch->observations,o);
+        for (size_t i=0; i<batch->observations.n; i++) {
+            const PgSeriesObservation *o=batch->observations.v+i;
+            bool fresh;
+            PgSeriesWitness *w=lp_idmap_get(batch->witnesses,&o->witness,&fresh);
+            if(fresh || !o->has_lineage){
+                w->trust=o->trust; w->has_lineage=o->has_lineage;
+                if(o->has_lineage)w->lineage=o->lineage;
             }
+        }
+        SPI_finish();
+        lp_pg_read_attestation_rows(lp_idmap_keys(batch->claims),(int)count,NULL,&batch->historical,batch->witnesses);
+        pg_attribution_ancestors(batch);
+        for (size_t i=0; i<batch->historical.n; i++) {
+            const PgAttrRow *r=batch->historical.v+i; uint8_t key[32]; memcpy(key,r->claim.b,16); memcpy(key+16,r->trunk.b,16);
+            if (lp_strmap_find(batch->pairs,key,sizeof key)>=0 || r->games<=0) continue;
+            PgSeriesWitness *w=lp_idmap_lookup(batch->witnesses,&r->trunk);
+            if (!w || r->games>9007199254740992.0 || !isfinite(r->games)) pg_series_invalid();
+            PgSeriesObservation o={.claim=r->claim,.witness=r->trunk,.games=(uint64_t)r->games,
+                .score=r->score/r->games,.trust=r->has_dependence?r->trust:w->trust,
+                .has_lineage=r->has_dependence || w->has_lineage,
+                .lineage=r->has_dependence?r->dependence:w->lineage};
+            lp_push(&batch->observations,o);
         }
         lp_sort(batch->observations.v,batch->observations.n,sizeof(PgSeriesObservation),pg_series_by_claim);
         lp_id *ordered=palloc(count*sizeof(lp_id)); memcpy(ordered,lp_idmap_keys(batch->claims),count*sizeof(lp_id));
@@ -434,7 +433,7 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
             }
             set_put(fcinfo,result,td,values,missing); pfree(DatumGetPointer(values[0]));
         }
-    }
-    SPI_finish(); MemoryContextSwitchTo(caller); MemoryContextDelete(context);
+    } else SPI_finish();
+    MemoryContextSwitchTo(caller); MemoryContextDelete(context);
     PG_RETURN_NULL();
 }

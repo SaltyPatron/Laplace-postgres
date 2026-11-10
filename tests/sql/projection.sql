@@ -20,7 +20,8 @@ SELECT id,tier,CASE WHEN id=laplace_id('ant') THEN coord ELSE ST_MakePoint(0,0,0
 INSERT INTO public.physicality(entity,tier,hilbert,path,mask)
 SELECT id,tier,CASE WHEN id=laplace_id('ant') THEN hilbert ELSE 0 END,path,
   laplace_mask_slot('kind','tuple') FROM projection_expected;
-INSERT INTO public.witness(id,trust) SELECT id,0.5 FROM projection_expected WHERE ST_NPoints(path)=2;
+INSERT INTO public.attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+SELECT id,id,NULL,1,1,1,NULL,0.5 FROM projection_expected WHERE ST_NPoints(path)=2;
 INSERT INTO public.consensus(claim,rating,deviation,volatility,matches)
 SELECT id,0.2,0.5,0.06,3 FROM projection_expected WHERE ST_NPoints(path)=2;
 CREATE TEMP TABLE projection_before AS SELECT
@@ -28,7 +29,7 @@ CREATE TEMP TABLE projection_before AS SELECT
   (SELECT jsonb_agg(to_jsonb(p) ORDER BY entity) FROM public.physicality p) AS paths,
   (SELECT jsonb_agg(to_jsonb(e)-'coord'-'hilbert' ORDER BY id) FROM public.entity e) AS entity_content,
   (SELECT jsonb_agg(to_jsonb(p)-'hilbert' ORDER BY entity) FROM public.physicality p) AS path_content,
-  (SELECT jsonb_agg(to_jsonb(w) ORDER BY id) FROM public.witness w) AS witnesses,
+  (SELECT jsonb_agg(to_jsonb(a) ORDER BY claim,witness) FROM public.attestation a) AS attestations,
   (SELECT jsonb_agg(to_jsonb(c) ORDER BY claim) FROM public.consensus c) AS consensus;
 DO $$ DECLARE changes record; BEGIN
   IF NOT EXISTS(SELECT FROM projection_expected WHERE ST_NPoints(path)=2 AND laplace_path_length(path)=3) THEN
@@ -50,9 +51,9 @@ DO $$ DECLARE changes record; BEGIN
       OR p.mask<>laplace_mask_slot('kind','tuple') OR e.tier<>x.tier OR p.tier<>x.tier) THEN
     RAISE EXCEPTION 'apply changed identity/path/mask/tier or missed exact Native projection';
   END IF;
-  IF (SELECT witnesses FROM projection_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(w) ORDER BY id) FROM public.witness w)
+  IF (SELECT attestations FROM projection_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(a) ORDER BY claim,witness) FROM public.attestation a)
      OR (SELECT consensus FROM projection_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(c) ORDER BY claim) FROM public.consensus c) THEN
-    RAISE EXCEPTION 'apply changed witnesses or consensus';
+    RAISE EXCEPTION 'apply changed attestations or consensus';
   END IF;
   IF (SELECT entity_content FROM projection_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(e)-'coord'-'hilbert' ORDER BY id) FROM public.entity e)
      OR (SELECT path_content FROM projection_before) IS DISTINCT FROM (SELECT jsonb_agg(to_jsonb(p)-'hilbert' ORDER BY entity) FROM public.physicality p) THEN

@@ -60,7 +60,8 @@ BEGIN
     OR EXISTS(SELECT FROM "native tenant".laplace_standings(ARRAY[id,id])) THEN
   RAISE EXCEPTION 'installed Native holders/standings binding changed';
  END IF;
- INSERT INTO "native tenant".witness(id,trust) VALUES(id,1);
+ INSERT INTO "native tenant".attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+   VALUES(pg_catalog.md5('schema-witness-'||id::text)::"native tenant".blake3,id,NULL,1,1,1,NULL,1);
  -- Exercise large-set GIN in the backend that created the indexes, before
  -- reconnecting can hide an incomplete cached operator-class support list.
  UPDATE "native tenant".physicality SET path="gis tenant".ST_SetPoint(path,0,

@@ -41,7 +41,8 @@ BEGIN
  IF EXISTS(SELECT FROM laplace_ordered_pair_counts(ARRAY[a,b,a],1,2,ARRAY[root])) THEN
    RAISE EXCEPTION 'unregistered root admitted';
  END IF;
- INSERT INTO witness(id,trust) VALUES(root,1),(other,1);
+ INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+   SELECT md5('ordered-witness-'||w::text)::blake3,w,NULL,1,1,1,NULL,1 FROM unnest(ARRAY[root,other]) w;
  SELECT array_agg(n ORDER BY gap,subject,object) INTO counts FROM (
    SELECT gap,subject,object,sum(occurrences)::bigint n
    FROM laplace_ordered_pair_counts(ARRAY[a,b,a],1,2,ARRAY[root,other,root])
