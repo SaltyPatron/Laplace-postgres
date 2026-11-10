@@ -939,14 +939,17 @@ CREATE TABLE @extschema@.physicality (
 )
 PARTITION BY RANGE (entity);
 
-CREATE TABLE @extschema@.witness (
-    id @extschema@.blake3 NOT NULL,
+CREATE TABLE @extschema@.attestation (
+    claim @extschema@.blake3 NOT NULL,
+    witness @extschema@.blake3 NOT NULL,
     lineage @extschema@.blake3,
-    trust double precision NOT NULL,
-    attestations bigint CHECK (attestations >= 0)
-);
-COMMENT ON COLUMN @extschema@.witness.attestations IS
-    'Measured distinct claims asserted by this witness. Repeated games and dependence roots do not add attestations. NULL means not measured; maintained with source publication.';
+    games bigint NOT NULL CHECK (games > 0),
+    tokens bigint NOT NULL CHECK (tokens >= games),
+    score double precision NOT NULL CHECK (score BETWEEN 0 AND 1),
+    "position" integer,
+    trust double precision NOT NULL CHECK (trust BETWEEN -1 AND 1)
+)
+PARTITION BY RANGE (claim);
 
 CREATE TABLE @extschema@.consensus (
     claim @extschema@.blake3 NOT NULL,
@@ -963,8 +966,8 @@ ALTER TABLE @extschema@.entity
 ALTER TABLE @extschema@.physicality
     ADD CONSTRAINT physicality_pkey PRIMARY KEY (entity);
 
-ALTER TABLE @extschema@.witness
-    ADD CONSTRAINT witness_pkey PRIMARY KEY (id);
+ALTER TABLE @extschema@.attestation
+    ADD CONSTRAINT attestation_pkey UNIQUE NULLS NOT DISTINCT (claim, witness, lineage);
 
 ALTER TABLE @extschema@.consensus
     ADD CONSTRAINT consensus_pkey PRIMARY KEY (claim);
@@ -983,6 +986,7 @@ BEGIN
   suffix:=pg_catalog.to_hex(i);
   lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE pg_catalog.quote_literal(suffix||pg_catalog.repeat('0',31)) END;
   hi:=CASE WHEN i=15 THEN 'MAXVALUE' ELSE pg_catalog.quote_literal(pg_catalog.to_hex(i+1)||pg_catalog.repeat('0',31)) END;
+  EXECUTE pg_catalog.format('CREATE TABLE @extschema@.attestation_%s PARTITION OF @extschema@.attestation FOR VALUES FROM (%s) TO (%s) WITH (fillfactor=80)',suffix,lo,hi);
   EXECUTE pg_catalog.format('CREATE TABLE @extschema@.consensus_%s PARTITION OF @extschema@.consensus FOR VALUES FROM (%s) TO (%s) WITH (fillfactor=80)',suffix,lo,hi);
  END LOOP;
 END $partitions$;

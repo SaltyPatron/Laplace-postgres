@@ -163,10 +163,10 @@ Relation lp_pg_read_parent(Oid target,const char **column,const char *const *sel
     Oid schema=lp_pg_schema();
     bool paths=target==get_relname_relid("physicality",schema);
     bool standings=target==get_relname_relid("consensus",schema);
-    bool witness=target==get_relname_relid("witness",schema);
-    if(!paths && !standings && !witness && target!=get_relname_relid("entity",schema))
+    bool attestations=target==get_relname_relid("attestation",schema);
+    if(!paths && !standings && !attestations && target!=get_relname_relid("entity",schema))
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native ID target must be an installed canonical relation")));
-    *column=paths?"entity":standings?"claim":"id";
+    *column=paths?"entity":(standings||attestations)?"claim":"id";
     Relation parent=table_open(target,AccessShareLock);
     if(check_enable_rls(target,InvalidOid,false)==RLS_ENABLED)
         ereport(ERROR,(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),errmsg("Native presence requires a canonical shared relation without active RLS")));
@@ -185,7 +185,7 @@ Relation lp_pg_read_parent(Oid target,const char **column,const char *const *sel
 
 Relation lp_pg_presence_parent(Oid target,const char **column,int columns)
 {
-    const char *selected[]={target==lp_pg_relation("physicality")?"entity":target==lp_pg_relation("consensus")?"claim":"id","path","mask"};
+    const char *selected[]={target==lp_pg_relation("physicality")?"entity":(target==lp_pg_relation("consensus")||target==lp_pg_relation("attestation"))?"claim":"id","path","mask"};
     return lp_pg_read_parent(target,column,selected,columns);
 }
 
@@ -256,28 +256,43 @@ void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visi
     MemoryContextDelete(front.tuple_context);pfree(keys);table_close(parent,NoLock);
 }
 
-typedef struct {lp_pg_witness_visit visit;void *context;AttrNumber lineage,trust;} WitnessFrontier;
-static void witness_frontier_visit(TupleTableSlot *slot,const PresenceKey *key,void *context)
+typedef struct {lp_pg_witness_visit visit;void *context;bool lineage;} WitnessFrontier;
+static void witness_frontier_row(TupleTableSlot *slot,void *context)
 {
-    WitnessFrontier *front=context;bool lineage_null=true,trust_null;
-    Datum lineage=front->lineage>0?slot_getattr(slot,front->lineage,&lineage_null):(Datum)0;
-    Datum trust=slot_getattr(slot,front->trust,&trust_null);
-    if(trust_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native witness frontier: null trust")));
-    front->visit(&key->id,lineage_null?NULL:(const lp_id *)DatumGetPointer(lineage),DatumGetFloat8(trust),front->context);
+    WitnessFrontier *front=context;bool id_null,lineage_null=true,trust_null;
+    Datum id=slot_getattr(slot,1,&id_null);
+    Datum lineage=front->lineage?slot_getattr(slot,2,&lineage_null):(Datum)0;
+    Datum trust=slot_getattr(slot,front->lineage?3:2,&trust_null);
+    if(id_null||trust_null)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native witness frontier: null witness metadata")));
+    front->visit((const lp_id *)DatumGetPointer(id),lineage_null?NULL:(const lp_id *)DatumGetPointer(lineage),DatumGetFloat8(trust),front->context);
 }
 void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_witness_visit visit,void *context)
 {
     if(!count)return;
-    Oid target=lp_pg_relation("witness");const char *column;const char *selected[]={"id","trust","lineage"};
+    Oid target=lp_pg_relation("attestation");
+    const char *selected[]={"witness","trust","lineage"};
+    const char *column;
     Relation parent=lp_pg_read_parent(target,&column,selected,lineage?3:2);
-    WitnessFrontier front={visit,context,lineage?get_attnum(target,"lineage"):InvalidAttrNumber,get_attnum(target,"trust")};
+    Oid native_id=get_atttype(target,get_attnum(target,"witness"));
+    Oid idarray=get_array_type(native_id);
+    table_close(parent,NoLock);
+    WitnessFrontier front={visit,context,lineage};
+    if(SPI_connect()!=SPI_OK_CONNECT)ereport(ERROR,(errmsg("Native witness frontier: SPI connect failed")));
+    const char *sql=lineage
+        ?"SELECT DISTINCT ON (witness) witness,lineage,trust FROM @extschema@.attestation WHERE witness OPERATOR(@extschema@.=) ANY($1) ORDER BY witness,lineage NULLS FIRST"
+        :"SELECT DISTINCT ON (witness) witness,trust FROM @extschema@.attestation WHERE witness OPERATOR(@extschema@.=) ANY($1) ORDER BY witness,lineage NULLS FIRST";
+    SPIPlanPtr plan=lp_pg_prepare_cursor(sql,1,&idarray,0);
+    if(!plan)ereport(ERROR,(errmsg("Native witness frontier: plan failed")));
     size_t window=frontier_window_ids();
     for(size_t at=0;at<count;){
-        size_t amount=Min(window,count-at);PresenceKey *keys=palloc(amount*sizeof *keys);
-        for(size_t i=0;i<amount;i++)keys[i]=(PresenceKey){.id=ids[at+i],.ordinal=(int64)(at+i)+1};
-        lp_pg_indexed_keys(parent,column,keys,amount,witness_frontier_visit,&front);pfree(keys);at+=amount;
+        size_t amount=Min(window,count-at);
+        ArrayType *wanted=id_array_of(native_id,ids+at,(int)amount);
+        ParamListInfo params=makeParamList(1);
+        params->params[0]=(ParamExternData){.ptype=idarray,.value=PointerGetDatum(wanted),.pflags=0};
+        lp_pg_stream(plan,params,witness_frontier_row,&front);
+        pfree(params);pfree(wanted);at+=amount;
     }
-    table_close(parent,NoLock);
+    SPI_freeplan(plan);SPI_finish();
 }
 
 static void present_bitmap_row(TupleTableSlot *slot,const PresenceKey *key,void *context)

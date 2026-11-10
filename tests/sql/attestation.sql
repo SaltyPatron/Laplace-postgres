@@ -264,6 +264,8 @@ END $$;
 SAVEPOINT private_observation_windows;
 CREATE UNLOGGED TABLE stage.window_totals (
   LIKE stage.attestation_test INCLUDING DEFAULTS,
+  tokens bigint NOT NULL DEFAULT 1,
+  "position" integer,
   wins double precision NOT NULL,
   UNIQUE NULLS NOT DISTINCT (claim,witness,lineage),
   CHECK(games>0 AND games<=9007199254740992 AND wins>=0 AND wins<=games)
@@ -277,12 +279,13 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
 BEGIN
   SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) INTO before_rows FROM consensus c;
   SELECT count(*) INTO before_locks FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory';
-  INSERT INTO stage.window_delta VALUES(a,w,NULL,3,0,0.85,1.5),(a,w,ancestry,1,0,0.4,1);
+  INSERT INTO stage.window_delta(claim,witness,lineage,games,score,trust,wins)
+    VALUES(a,w,NULL,3,0,0.85,1.5),(a,w,ancestry,1,0,0.4,1);
   IF laplace_accumulate_series('stage.window_totals','stage.window_delta')<>2 THEN
     RAISE EXCEPTION 'private observations did not admit each dependence scope';
   END IF;
   TRUNCATE stage.window_delta;
-  INSERT INTO stage.window_delta VALUES(a,w,NULL,4,0,0.85,2);
+  INSERT INTO stage.window_delta(claim,witness,lineage,games,score,trust,wins) VALUES(a,w,NULL,4,0,0.85,2);
   PERFORM laplace_accumulate_series('stage.window_totals','stage.window_delta');
   IF (SELECT count(*) FROM stage.window_totals)<>2
      OR NOT EXISTS(SELECT FROM stage.window_totals WHERE lineage IS NULL AND games=7 AND wins=3.5 AND score=0.5)
@@ -394,7 +397,8 @@ DECLARE floor_claim blake3; root blake3; dog blake3:=laplace_id('dog');
 BEGIN
   floor_claim:=pg_temp.series_node(ARRAY[floor_id,laplace_id('is'),laplace_id('noun')],'claim');
   root:=pg_temp.series_node(ARRAY[floor_claim,laplace_id('three')],'record',ARRAY[2147483648,0]::bigint[]);
-  INSERT INTO witness VALUES(root,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+    VALUES(md5('attestation-witness-'||root::text)::blake3,root,NULL,1,1,1,NULL,0.85);
   INSERT INTO stage.attestation_test VALUES(floor_claim,root,NULL,1,1,0.85);
   PERFORM laplace_attest_series('stage.attestation_test',ARRAY[floor_claim]);
   IF EXISTS(SELECT FROM entity WHERE id=floor_id)
@@ -460,9 +464,13 @@ BEGIN
     RAISE EXCEPTION 'staging order changed the standing';
   END IF;
 END $$;
--- Register the real source trunks. The upward GIN walk reads their record M
--- runs; pending rows overlay that same evidence and must not double its games.
-INSERT INTO witness SELECT id, CASE WHEN name = 'three' THEN (SELECT id FROM series_sources WHERE name = 'one') END, 0.85 FROM series_sources;
+-- Publish the real sources' attestations, as the loader records them: each
+-- source's record says claim a 1000 times and claim b 3 times; three derives
+-- from one. Pending rows overlay that same evidence and must not double its games.
+INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+  SELECT c.id, w.id, CASE WHEN w.name = 'three' THEN (SELECT id FROM series_sources WHERE name = 'one') END,
+         CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, 1, NULL, 0.85
+  FROM series_claims c, series_sources w;
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE;
 BEGIN
@@ -520,16 +528,16 @@ BEGIN
     RAISE EXCEPTION 'source scope was applied after solving, or empty/missing selection acquired evidence';
   END IF;
   SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) INTO shares FROM laplace_source_attribution(ARRAY[a]) r;
-  UPDATE witness SET trust=-0.85;
+  UPDATE attestation SET trust=-0.85;
   IF (SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) FROM laplace_source_attribution(ARRAY[a]) r) IS DISTINCT FROM shares THEN
     RAISE EXCEPTION 'signed trust lost attribution or changed symmetric information';
   END IF;
-  UPDATE witness SET trust=0;
+  UPDATE attestation SET trust=0;
   IF (SELECT count(*) FROM laplace_source_attribution(ARRAY[a]) WHERE share_bp=0 AND fisher_weight=0 AND games=1000)<>3
      OR (SELECT count(*) FROM laplace_attribution(ARRAY[a]) WHERE share_bp=0 AND games=1000)<>3 THEN
     RAISE EXCEPTION 'uninformative sources lost testimony or acquired royalties';
   END IF;
-  UPDATE witness SET lineage=CASE WHEN id=one_root THEN two_root WHEN id=two_root THEN one_root ELSE lineage END;
+  UPDATE attestation SET lineage=CASE WHEN witness=one_root THEN two_root WHEN witness=two_root THEN one_root ELSE lineage END;
   BEGIN
     PERFORM laplace_source_attribution(ARRAY[a]);
     RAISE EXCEPTION 'attribution accepted cyclic lineage';
@@ -538,8 +546,8 @@ END $$;
 ROLLBACK TO fisher_attribution;
 RELEASE fisher_attribution;
 -- Two-hop lineage, then a cycle: transitive copies fold; cycles fail atomically.
-UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE id = (SELECT id FROM series_sources WHERE name = 'two');
-UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE id = (SELECT id FROM series_sources WHERE name = 'three');
+UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE witness = (SELECT id FROM series_sources WHERE name = 'two');
+UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE witness = (SELECT id FROM series_sources WHERE name = 'three');
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE; expected record; before_cycle consensus%ROWTYPE;
 BEGIN
@@ -550,20 +558,20 @@ BEGIN
      (expected.rating, expected.deviation, expected.volatility, expected.matches) THEN RAISE EXCEPTION 'transitive lineage did not fold'; END IF;
   before_cycle := result;
   BEGIN
-    UPDATE witness SET lineage = (SELECT id FROM series_sources WHERE name = 'three') WHERE id = (SELECT id FROM series_sources WHERE name = 'one');
+    UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'three') WHERE witness = (SELECT id FROM series_sources WHERE name = 'one');
     PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
     RAISE EXCEPTION 'cyclic lineage was accepted';
   EXCEPTION WHEN null_value_not_allowed THEN NULL;
   END;
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF result IS DISTINCT FROM before_cycle THEN RAISE EXCEPTION 'cyclic lineage partially updated consensus'; END IF;
-  UPDATE witness SET trust = -0.85;
+  UPDATE attestation SET trust = -0.85;
   PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF abs(result.rating + before_cycle.rating - 3000) > 1e-8 OR abs(result.deviation - before_cycle.deviation) > 1e-8 THEN
     RAISE EXCEPTION 'signed trust did not reverse the outcome symmetrically';
   END IF;
-  DELETE FROM witness;
+  DELETE FROM attestation;
   PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
   IF EXISTS (SELECT FROM consensus WHERE claim = a) THEN RAISE EXCEPTION 'standing survived removal of every witness'; END IF;
 END $$;
@@ -595,9 +603,9 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
         inner_source blake3 := (SELECT id FROM series_sources WHERE name = 'one');
         outer_source blake3; deep_source blake3; found integer;
 BEGIN
-  INSERT INTO witness VALUES (inner_source,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||inner_source::text)::blake3,inner_source,NULL,1,1,1,NULL,0.85);
   outer_source := pg_temp.series_node(ARRAY[laplace_id('three'),inner_source], 'file', ARRAY[4294967296,0]::bigint[]);
-  INSERT INTO witness VALUES (outer_source,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||outer_source::text)::blake3,outer_source,NULL,1,1,1,NULL,0.85);
   UPDATE entity SET tier=1 WHERE id=outer_source;
   UPDATE physicality SET tier=1 WHERE entity=outer_source;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a,a])
@@ -607,7 +615,7 @@ BEGIN
   FOR i IN 1..70 LOOP
     deep_source := pg_temp.series_node(ARRAY[laplace_id('one'),deep_source], 'file', ARRAY[4294967296,0]::bigint[]);
   END LOOP;
-  INSERT INTO witness VALUES (deep_source,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||deep_source::text)::blake3,deep_source,NULL,1,1,1,NULL,0.85);
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a])
     WHERE witness AND trunk IN (inner_source,outer_source,deep_source) AND games=1000 AND score=1000;
   IF found<>3 THEN RAISE EXCEPTION 'deep containment truncated a registered witness'; END IF;
@@ -637,7 +645,7 @@ BEGIN
   negative:=pg_temp.series_node(ARRAY[laplace_id('noun'),a],'record',ARRAY[0,18253611008]::bigint[]);
   source_id:=pg_temp.series_node(ARRAY[laplace_id('one'),positive,positive,neutral,negative],
     'file',ARRAY[4294967296,0,0,0]::bigint[]);
-  INSERT INTO witness(id,trust) VALUES(source_id,0);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||source_id::text)::blake3,source_id,NULL,1,1,1,NULL,0);
   SELECT array_agg(outcome ORDER BY outcome),array_agg(occurrences ORDER BY outcome)
     INTO outcomes,counts FROM laplace_testimony(ARRAY[a,a],ARRAY[source_id]);
   IF outcomes IS DISTINCT FROM ARRAY[0,1,2]::smallint[] OR counts IS DISTINCT FROM ARRAY[1,1,2]::bigint[] THEN
@@ -680,7 +688,8 @@ BEGIN
   curated := pg_temp.series_node(ARRAY[c,laplace_id('two')],'record',ARRAY[1073741824,0]::bigint[]);
   first_source := pg_temp.series_node(ARRAY[laplace_id('source'),calculated,curated],'file',ARRAY[4294967296,5368709120,5368709120]::bigint[]);
   second_source := pg_temp.series_node(ARRAY[laplace_id('three'),calculated],'file',ARRAY[4294967296,5368709120]::bigint[]);
-  INSERT INTO witness VALUES (first_source,NULL,0.85),(second_source,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+    SELECT md5('attestation-witness-'||w::text)::blake3,w,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[first_source,second_source]) w;
   SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
     WHERE witness AND dependence_root=cls AND trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'contained calculation did not retain its class root and trust'; END IF;
@@ -698,6 +707,11 @@ BEGIN
   IF found<>1 THEN RAISE EXCEPTION 'source provenance created extra calculation witnesses'; END IF;
   SELECT s.* INTO expected FROM laplace_series(ARRAY[first_source,cls,cls],ARRAY[1,1,1]::bigint[],
     ARRAY[1,1,1]::float8[],ARRAY[0.85,0.70,0.70]::float8[]) s;
+  -- Publish what containment just proved: one attestation per source and
+  -- dependence scope, as the loader records it.
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+    SELECT c,trunk,dependence_root,games::bigint,greatest(tokens,games)::bigint,score/games,NULLIF("position",0),trust
+    FROM laplace_attested_series(ARRAY[c]) WHERE witness;
   CREATE UNLOGGED TABLE stage.attestation_scope_test (LIKE stage.attestation_test INCLUDING DEFAULTS);
   PERFORM laplace_attest_series('stage.attestation_scope_test',ARRAY[c]);
   SELECT * INTO actual FROM consensus WHERE claim=c;
@@ -712,6 +726,8 @@ BEGIN
      IS DISTINCT FROM ROW(float8send(expected.rating),float8send(expected.deviation),float8send(expected.volatility),expected.matches)
   THEN RAISE EXCEPTION 'cumulative multi-root source replay duplicated games or replaced calculation trust'; END IF;
   BEGIN
+    -- Containment, not the published rows, must reject an unknown class.
+    DELETE FROM attestation WHERE claim=c;
     PERFORM pg_temp.series_node(ARRAY[laplace_id('dog'),c],'record',ARRAY[7516192768,1073741824]::bigint[]);
     PERFORM * FROM laplace_attested_series(ARRAY[c]);
     RAISE EXCEPTION 'unknown dependence class accepted';
@@ -737,7 +753,8 @@ BEGIN
                                      ARRAY[1073741824,1073741824,1073741824]::bigint[]);
   source_node := pg_temp.series_node(ARRAY[laplace_id('source'),record_node],'file',
                                      ARRAY[4294967296,5368709120]::bigint[]);
-  INSERT INTO witness VALUES (source_node,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+    SELECT id,source_node,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
   CREATE UNLOGGED TABLE stage.attestation_arity_test (LIKE stage.attestation_test INCLUDING DEFAULTS);
   INSERT INTO stage.attestation_arity_test
     SELECT id,source_node,NULL,1,1,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;

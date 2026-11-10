@@ -2,6 +2,7 @@
  * edge decoding, run counts, dependence classes and tally reduction. */
 #include "pg_core.h"
 #include "geo.h"
+#include "access/table.h"
 #include "access/htup_details.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
@@ -440,6 +441,110 @@ void lp_pg_compute_attested_rows(const lp_id *claims,int n,Oid idarr,int witness
     lp_pg_compute_attested_registry(claims,n,idarr,witnessed_only,include_files,roots,known_witnesses,out,NULL,NULL,NULL);
 }
 
+typedef struct { PgAttrRows *out; const lp_idmap *roots; lp_idmap *witnesses; } PgAttestedRead;
+static void pg_attested_read_row(TupleTableSlot *slot, void *context)
+{
+    PgAttestedRead *read = context;
+    bool missing; Datum val;
+    PgAttrRow row = { .witness = 1 };
+    val = slot_getattr(slot, 1, &missing);
+    if (missing) ereport(ERROR, (errmsg("laplace attestation: null claim")));
+    memcpy(row.claim.b, DatumGetPointer(val), 16);
+    val = slot_getattr(slot, 2, &missing);
+    if (missing) ereport(ERROR, (errmsg("laplace attestation: null witness")));
+    memcpy(row.trunk.b, DatumGetPointer(val), 16);
+    if (read->roots && lp_idmap_find(read->roots, &row.trunk) < 0) return;
+    val = slot_getattr(slot, 3, &missing);
+    row.has_dependence = !missing;
+    if (!missing) memcpy(row.dependence.b, DatumGetPointer(val), 16);
+    val = slot_getattr(slot, 4, &missing);
+    int64 games = missing ? 0 : DatumGetInt64(val);
+    val = slot_getattr(slot, 5, &missing);
+    int64 tokens = missing ? games : DatumGetInt64(val);
+    val = slot_getattr(slot, 6, &missing);
+    double mean_score = missing ? 0.0 : DatumGetFloat8(val);
+    val = slot_getattr(slot, 7, &missing);
+    row.position = missing ? 0 : (uint32_t)DatumGetInt32(val);
+    val = slot_getattr(slot, 8, &missing);
+    row.trust = missing ? 0.0 : DatumGetFloat8(val);
+    row.source_trust = row.trust;
+    row.games = (double)games;
+    row.tokens = (double)(tokens >= games ? tokens : games);
+    row.score = (double)games * mean_score;
+    if (read->witnesses) {
+        bool fresh;
+        PgSeriesWitness *w = lp_idmap_get(read->witnesses, &row.trunk, &fresh);
+        if (fresh || !row.has_dependence) {
+            w->trust = row.trust;
+            w->has_lineage = row.has_dependence;
+            if (row.has_dependence) w->lineage = row.dependence;
+        }
+    }
+    lp_push(read->out, row);
+}
+
+void lp_pg_read_attestation_rows(const lp_id *claims, int n, const lp_idmap *roots, PgAttrRows *out, lp_idmap *witnesses)
+{
+    if (n <= 0) return;
+    Oid attestation = lp_pg_relation("attestation");
+    const char *selected[] = {"claim", "witness", "lineage", "games", "tokens", "score", "position", "trust"};
+    const char *column;
+    Relation parent = lp_pg_read_parent(attestation, &column, selected, 8);
+    Oid native_id = get_atttype(attestation, get_attnum(attestation, "claim"));
+    Oid idarray = get_array_type(native_id);
+    table_close(parent, NoLock);
+    PgAttestedRead read = { .out = out, .roots = roots, .witnesses = witnesses };
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_read_attestation_rows: SPI connect failed")));
+    SPIPlanPtr plan = lp_pg_prepare_cursor(
+        "SELECT claim,witness,lineage,games,tokens,score,\"position\",trust FROM @extschema@.attestation WHERE claim OPERATOR(@extschema@.=) ANY($1)",
+        1, &idarray, 0);
+    if (!plan) ereport(ERROR, (errmsg("laplace_read_attestation_rows: plan failed")));
+    size_t window = frontier_window_ids();
+    for (size_t at = 0; at < (size_t)n;) {
+        size_t amount = Min(window, (size_t)n - at);
+        ArrayType *wanted = id_array_of(native_id, claims + at, (int)amount);
+        ParamListInfo params = makeParamList(1);
+        params->params[0] = (ParamExternData){ .ptype = idarray, .value = PointerGetDatum(wanted), .pflags = 0 };
+        lp_pg_stream(plan, params, pg_attested_read_row, &read);
+        pfree(params); pfree(wanted); at += amount;
+    }
+    SPI_freeplan(plan); SPI_finish();
+    if (out->n) lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
+}
+
+/* Each claim's evidence is its stored attestations; a claim with none stored yet is
+ * still read from containment. Per claim, never per batch: one published claim must
+ * not hide the containment evidence of the others asked with it. registry, when given,
+ * receives the containment witnesses not already in it. */
+void lp_pg_attested_unstored(const lp_id *claims,int n,Oid idarr,int include_files,PgAttrRows *rows,lp_idmap *registry)
+{
+    if (n <= 0) return;
+    lp_idmap *stored = lp_idmap_new();
+    for (size_t i = 0; i < rows->n; i++) lp_idmap_put(stored, &rows->v[i].claim, NULL);
+    lp_id *rest = palloc(sizeof(lp_id) * (size_t)n); int nrest = 0;
+    lp_idmap *asked = lp_idmap_new();
+    for (int i = 0; i < n; i++) {
+        bool fresh; lp_idmap_put(asked, &claims[i], &fresh);
+        if (fresh && lp_idmap_find(stored, &claims[i]) < 0) rest[nrest++] = claims[i];
+    }
+    lp_idmap_free(asked); lp_idmap_free(stored);
+    if (nrest) {
+        PgAttrRows found = {0}; lp_idmap *witnesses = NULL;
+        lp_pg_compute_attested_registry(rest, nrest, idarr, 0, include_files, NULL, NULL, &found, registry ? &witnesses : NULL, NULL, NULL);
+        for (size_t i = 0; i < found.n; i++) lp_push(rows, found.v[i]);
+        lp_vec_free(&found);
+        if (witnesses) {
+            for (size_t i = 0; i < lp_idmap_count(witnesses); i++) {
+                bool fresh; PgSeriesWitness *w = lp_idmap_get(registry, lp_idmap_keys(witnesses) + i, &fresh);
+                if (fresh) *w = *(const PgSeriesWitness *)lp_idmap_at(witnesses, i);
+            }
+            lp_idmap_free(witnesses);
+        }
+        if (rows->n) lp_sort(rows->v, rows->n, sizeof(PgAttrRow), by_attr_row);
+    }
+    pfree(rest);
+}
+
 /* The source-facing provenance API remains one row per corpus/container. The
  * series API below retains each explicit dependence scope for Native solving. */
 void lp_pg_rollup_sources(PgAttrRows *rows){
@@ -462,7 +567,8 @@ Datum laplace_attested_series(PG_FUNCTION_ARGS){
     int n; lp_id *claims=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n); if (!n) PG_RETURN_NULL();
     Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
     PgAttrRows rows={0};
-    lp_pg_compute_attested_rows(claims,n,idarr,0,0,NULL,NULL,&rows);
+    lp_pg_read_attestation_rows(claims,n,NULL,&rows,NULL);
+    lp_pg_attested_unstored(claims,n,idarr,0,&rows,NULL);
     for (size_t i=0; i<rows.n; i++) {
         const PgAttrRow *r=rows.v+i;
         Datum v[9]={id_datum(&r->claim),id_datum(&r->trunk),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
@@ -483,7 +589,8 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     PgAttrRows rows = {0};
     int include_files = PG_NARGS() > 1 && !PG_ARGISNULL(1) && PG_GETARG_BOOL(1);
-    lp_pg_compute_attested_rows(claims, n, idarr, 0, include_files, NULL, NULL, &rows);
+    if (!include_files) lp_pg_read_attestation_rows(claims, n, NULL, &rows, NULL);
+    lp_pg_attested_unstored(claims, n, idarr, include_files, &rows, NULL);
     lp_pg_rollup_sources(&rows);
     for (size_t i = 0; i < rows.n; i++) {
         const PgAttrRow *r = &rows.v[i];

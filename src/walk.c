@@ -39,12 +39,13 @@ void lp_pg_walk_witnesses(ArrayType *roots, lp_pg_stored_path_visit visit, void 
     if (roots && ARR_NDIM(roots) > 1)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("witness roots must be a one-dimensional identity array")));
     WitnessWalk walk = {.seen = lp_idmap_new(), .visit = visit, .context = context};
-    Oid types[] = {get_array_type(get_atttype(lp_pg_relation("witness"), get_attnum(lp_pg_relation("witness"), "id")))};
+    Oid attestation = lp_pg_relation("attestation");
+    Oid types[] = {get_array_type(get_atttype(attestation, get_attnum(attestation, "witness")))};
     ParamListInfo params = makeParamList(1);
     params->params[0] = (ParamExternData){.ptype = types[0], .value = PointerGetDatum(roots), .isnull = roots == NULL};
     if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("witness traversal: SPI connect failed")));
     SPIPlanPtr plan = lp_pg_prepare_cursor(
-        "SELECT id FROM @extschema@.witness WHERE ($1 IS NULL OR id OPERATOR(@extschema@.=) ANY($1)) ORDER BY id",
+        "SELECT DISTINCT witness FROM @extschema@.attestation WHERE ($1 IS NULL OR witness OPERATOR(@extschema@.=) ANY($1)) ORDER BY witness",
         1, types, CURSOR_OPT_CUSTOM_PLAN);
     if (!plan) ereport(ERROR, (errmsg("witness traversal: cannot prepare root selection")));
     lp_pg_stream(plan, params, walk_root, &walk);

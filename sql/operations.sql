@@ -184,11 +184,15 @@ BEGIN
   -- Preserve the carried numerator across windows. Reconstructing it from a
   -- rounded mean on each update would make results depend on batch boundaries.
   EXECUTE format('WITH applied AS (
-    INSERT INTO %1$s AS p (claim,witness,lineage,games,score,trust,wins)
-    SELECT claim,witness,lineage,games,wins/games,trust,wins FROM %2$s
+    INSERT INTO %1$s AS p (claim,witness,lineage,games,tokens,score,"position",trust,wins)
+    SELECT claim,witness,lineage,games,tokens,wins/games,"position",trust,wins FROM %2$s
     ON CONFLICT (claim,witness,lineage) DO UPDATE
-      SET games=p.games+excluded.games,wins=p.wins+excluded.wins,
-          score=(p.wins+excluded.wins)/(p.games+excluded.games),trust=excluded.trust
+      SET games=p.games+excluded.games,tokens=p.tokens+excluded.tokens,wins=p.wins+excluded.wins,
+          score=(p.wins+excluded.wins)/(p.games+excluded.games),
+          "position"=CASE WHEN p."position" IS NULL OR p."position"<=0 THEN excluded."position"
+                          WHEN excluded."position" IS NULL OR excluded."position"<=0 THEN p."position"
+                          ELSE least(p."position",excluded."position") END,
+          trust=excluded.trust
     RETURNING claim) SELECT count(*) FROM applied',accumulated,incoming) INTO affected;
   RETURN affected;
 END $$;
@@ -210,10 +214,10 @@ BEGIN
   END IF;
   -- The Native accumulator already knows which cumulative series it staged.
   -- Keep that proof: update those rows and insert only genuinely new series.
-  EXECUTE format('UPDATE %1$s p SET games=s.games,score=s.score,trust=s.trust FROM %2$s s
+  EXECUTE format('UPDATE %1$s p SET games=s.games,tokens=s.tokens,score=s.score,"position"=s."position",trust=s.trust FROM %2$s s
     WHERE s.staged AND p.claim OPERATOR(@extschema@.=) s.claim AND p.witness OPERATOR(@extschema@.=) s.witness AND (p.lineage OPERATOR(@extschema@.=) s.lineage OR (p.lineage IS NULL AND s.lineage IS NULL));
-    INSERT INTO %1$s (claim,witness,lineage,games,score,trust)
-    SELECT claim,witness,lineage,games,score,trust FROM %2$s WHERE NOT staged',accumulated,incoming);
+    INSERT INTO %1$s (claim,witness,lineage,games,tokens,score,"position",trust)
+    SELECT claim,witness,lineage,games,tokens,score,"position",trust FROM %2$s WHERE NOT staged',accumulated,incoming);
   affected := @extschema@.laplace_attest_stage(pending,delta);
   EXECUTE format('TRUNCATE %s',incoming);
   RETURN affected;
@@ -328,7 +332,8 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_ensure_stage() RETURNS void
 BEGIN
   IF to_regclass('stage.entity') IS NOT NULL
      AND to_regclass('stage.physicality') IS NOT NULL
-     AND to_regclass('stage.attestation') IS NOT NULL THEN RETURN; END IF;
+     AND to_regclass('stage.attestation') IS NOT NULL
+     AND EXISTS (SELECT FROM pg_attribute WHERE attrelid = to_regclass('stage.attestation') AND attname = 'tokens' AND NOT attisdropped) THEN RETURN; END IF;
   PERFORM pg_advisory_xact_lock(1279348803, -1);
   CREATE SCHEMA IF NOT EXISTS stage;
   CREATE UNLOGGED TABLE IF NOT EXISTS stage.entity (LIKE @extschema@.entity INCLUDING DEFAULTS);
@@ -336,9 +341,13 @@ BEGIN
   CREATE UNLOGGED TABLE IF NOT EXISTS stage.attestation (
     claim @extschema@.blake3 NOT NULL, witness @extschema@.blake3 NOT NULL, lineage @extschema@.blake3,
     games bigint NOT NULL CHECK (games > 0),
+    tokens bigint NOT NULL DEFAULT 1 CHECK (tokens >= games),
     score double precision NOT NULL CHECK (score BETWEEN 0 AND 1),
+    "position" integer,
     trust double precision NOT NULL CHECK (trust BETWEEN -1 AND 1)
   );
+  ALTER TABLE stage.attestation ADD COLUMN IF NOT EXISTS tokens bigint NOT NULL DEFAULT 1 CHECK (tokens >= games);
+  ALTER TABLE stage.attestation ADD COLUMN IF NOT EXISTS "position" integer;
 END $$;
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_partitions(paths regclass) RETURNS oid[]
@@ -557,6 +566,7 @@ BEGIN
   -- PostgreSQL owns this canonical index's visibility, updates, WAL and rebuild.
   CREATE INDEX IF NOT EXISTS physicality_assertions ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops)
     WITH (gin_pending_list_limit = 32768) WHERE @extschema@.laplace_path_has_roles(path,6::smallint);
+  CREATE INDEX IF NOT EXISTS attestation_witness ON @extschema@.attestation (witness);
 END $$;
 SELECT @extschema@.laplace_schema_indexes();
 
@@ -584,14 +594,25 @@ RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_ordered_pair_counts' LANGUAGE
 -- registers another witness, changes a claim, or runs the standing solver.
 CREATE OR REPLACE PROCEDURE @extschema@.laplace_measure_attestations(roots @extschema@.blake3[] DEFAULT NULL)
 LANGUAGE plpgsql AS $$
-DECLARE selected @extschema@.blake3; measured bigint;
+DECLARE selected record;
 BEGIN
-  FOR selected IN SELECT id FROM @extschema@.witness
-      WHERE (roots IS NULL AND attestations IS NULL) OR id OPERATOR(@extschema@.=) ANY(roots)
-      ORDER BY id LOOP
-    SELECT count(DISTINCT claim) INTO measured
-      FROM @extschema@.laplace_contained_series(ARRAY[selected]);
-    UPDATE @extschema@.witness SET attestations=measured WHERE id OPERATOR(@extschema@.=) selected;
+  FOR selected IN
+    SELECT DISTINCT ON (witness) witness AS id, lineage, trust
+    FROM @extschema@.attestation
+    WHERE roots IS NULL OR witness OPERATOR(@extschema@.=) ANY(roots)
+    ORDER BY witness, lineage NULLS FIRST
+  LOOP
+    INSERT INTO @extschema@.attestation (claim, witness, lineage, games, tokens, score, "position", trust)
+    SELECT s.claim, selected.id, COALESCE(s.dependence_root, selected.lineage),
+           s.games::bigint, GREATEST(s.tokens::bigint, s.games::bigint),
+           LEAST(1.0, GREATEST(0.0, s.score / s.games)),
+           NULLIF(s."position", 0),
+           COALESCE(s.dependence_trust, selected.trust)
+    FROM @extschema@.laplace_contained_series(ARRAY[selected.id]) s
+    WHERE s.games > 0
+    ON CONFLICT (claim, witness, lineage) DO UPDATE
+      SET games = EXCLUDED.games, tokens = EXCLUDED.tokens, score = EXCLUDED.score,
+          "position" = EXCLUDED."position", trust = EXCLUDED.trust;
     COMMIT;
   END LOOP;
 END $$;
