@@ -512,6 +512,22 @@ void lp_pg_read_attestation_rows(const lp_id *claims, int n, const lp_idmap *roo
     if (out->n) lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
 }
 
+/* A stage-resident claim set stays a set: one semi-join lets PostgreSQL hash or merge
+ * the staged claims against every attestation partition, instead of binding the whole
+ * set into an array parameter that each partition re-sorts and rechecks per tuple. */
+void lp_pg_read_attestation_stage(const char *selection, PgAttrRows *out, lp_idmap *witnesses)
+{
+    PgAttestedRead read = { .out = out, .roots = NULL, .witnesses = witnesses };
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_read_attestation_stage: SPI connect failed")));
+    char *sql = psprintf("SELECT a.claim,a.witness,a.lineage,a.games,a.tokens,a.score,a.\"position\",a.trust"
+        " FROM @extschema@.attestation a WHERE EXISTS(SELECT FROM %s c WHERE c.claim OPERATOR(@extschema@.=) a.claim)", selection);
+    SPIPlanPtr plan = lp_pg_prepare_cursor(sql, 0, NULL, CURSOR_OPT_NO_SCROLL);
+    if (!plan) ereport(ERROR, (errmsg("laplace_read_attestation_stage: plan failed")));
+    lp_pg_stream(plan, NULL, pg_attested_read_row, &read);
+    SPI_freeplan(plan); pfree(sql); SPI_finish();
+    if (out->n) lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
+}
+
 /* Each claim's evidence is its stored attestations; a claim with none stored yet is
  * still read from containment. Per claim, never per batch: one published claim must
  * not hide the containment evidence of the others asked with it. registry, when given,
