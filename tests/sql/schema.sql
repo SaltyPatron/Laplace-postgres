@@ -116,7 +116,8 @@ ALTER SCHEMA "native tenant" RENAME TO "renamed native";
 ALTER SCHEMA "gis tenant" RENAME TO "renamed gis";
 DO $$ BEGIN
  IF (SELECT count(*) FROM "renamed native".laplace_containers(ARRAY["renamed native".laplace_id('ab')],'{}'::smallint[]))<>0
-  OR "renamed native".laplace_text("renamed native".laplace_id('ab'))<>'ab'
+  -- its first vertex was said to be a claim above: what a record says is no part of its text
+  OR "renamed native".laplace_text("renamed native".laplace_id('ab'))<>'b'
   OR "renamed gis".ST_AsEWKB("renamed native".laplace_coord('ab')) IS DISTINCT FROM "renamed native".laplace_coord_ewkb('ab') THEN
   RAISE EXCEPTION 'namespace rename invalidated Native or parsed SQL bindings';
  END IF;

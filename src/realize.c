@@ -5,8 +5,7 @@
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 
-typedef struct { size_t node; uint32 run; } TChild;
-typedef struct { TChild *kid; size_t nkid; bool have, rendering, tuple, opaque, claim, scalar; uint8 text_state; } TNode;
+typedef struct { lp_realize_child *kid; size_t nkid; bool have, tuple, opaque, claim, scalar; } TNode;
 static size_t tnode(lp_idmap *t, const lp_id *id){
     bool fresh; size_t i = lp_idmap_put(t, id, &fresh);
     if (fresh) *(TNode *)lp_idmap_at(t,i) = (TNode){ .have=lp_tier0_codepoint(lp_pg_tier0(),id)>=0 };
@@ -33,8 +32,11 @@ static void text_frontier_row(const lp_id *id,Datum path,Datum mask,void *contex
     if(opaque && !inspect && (file || p.n==0 || p.n>64)){
         TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));me->have=true;me->opaque=true;return;
     }
-    TChild *kid=MemoryContextAlloc(front->keep,sizeof(TChild)*(p.n?p.n:1));
-    for(size_t i=0;i<p.n;i++){lp_id child=lp_path_id(p,i);kid[i]=(TChild){tnode(front->nodes,&child),lp_path_run(p,i)};}
+    lp_realize_child *kid=MemoryContextAlloc(front->keep,sizeof(lp_realize_child)*(p.n?p.n:1));
+    for(size_t i=0;i<p.n;i++){
+        kid[i]=(lp_realize_child){lp_path_id(p,i),lp_path_run(p,i),lp_path_said(p,i)};
+        tnode(front->nodes,&kid[i].id);
+    }
     TNode *me=lp_idmap_at(front->nodes,tnode(front->nodes,id));
     me->kid=kid;me->nkid=p.n;me->have=true;me->tuple=tuple;me->opaque=opaque;me->claim=claim;me->scalar=scalar_text;
 }
@@ -71,93 +73,41 @@ static void read_levels(lp_idmap *t, MemoryContext keep, bool labels,const lp_id
     }
 }
 
-typedef struct {size_t node,child;} SurfaceFrame;
-static bool text_surface(lp_idmap *t,size_t i){
-    TNode *root=lp_idmap_at(t,i);
-    if(root->text_state==1 || root->text_state==2)return root->text_state==1;
-    if(root->opaque || (root->tuple && !root->scalar)){root->text_state=2;return false;}
-    if(root->tuple)return false;
-    if(root->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
-    if(!root->nkid){root->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,i))>=0?1:2;return root->text_state==1;}
-    lp_vec(SurfaceFrame) stack={0};lp_push(&stack,((SurfaceFrame){i,0}));
-    while(stack.n){
-        CHECK_FOR_INTERRUPTS();SurfaceFrame *frame=stack.v+stack.n-1;
-        TNode *node=lp_idmap_at(t,frame->node);
-        if(node->text_state==1 || node->text_state==2){stack.n--;continue;}
-        if(node->opaque || (node->tuple && !node->scalar)){node->text_state=2;continue;}
-        if(!node->nkid){
-            node->text_state=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,frame->node))>=0?1:2;continue;
-        }
-        node->text_state=3;
-        if(frame->child==node->nkid){node->text_state=1;continue;}
-        size_t child=node->kid[frame->child].node;TNode *next=lp_idmap_at(t,child);
-        if(next->text_state==3)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_labels: cyclic composition")));
-        if(next->text_state==2){node->text_state=2;continue;}
-        if(next->text_state==1){frame->child++;continue;}
-        lp_push(&stack,((SurfaceFrame){child,0}));
-    }
-    lp_vec_free(&stack);return ((TNode *)lp_idmap_at(t,i))->text_state==1;
+/* The walk itself is Native's (lp_realize): exact text and display labels,
+ * runs, what is no part of text, and the cycle check. This file owns the
+ * fetch: one frontier a DAG level, read before anything is rendered. */
+typedef struct { lp_idmap *nodes; StringInfo out; } TextSink;
+static int text_node(void *context,const lp_id *id,lp_realize_node *out){
+    CHECK_FOR_INTERRUPTS();
+    lp_idmap *nodes=((TextSink *)context)->nodes;int64 at=lp_idmap_find(nodes,id);
+    if(at<0)return LP_REALIZE_ABSENT;
+    TNode *node=lp_idmap_at(nodes,(size_t)at);
+    if(!node->have)return LP_REALIZE_ABSENT;
+    out->child=node->kid;out->n=node->nkid;
+    out->flags=(node->tuple?LP_REALIZE_TUPLE:0)|(node->opaque?LP_REALIZE_OPAQUE:0)|(node->scalar?LP_REALIZE_SCALAR:0);
+    return LP_REALIZE_KNOWN;
 }
-
-typedef struct {size_t node,child;uint32 repeat,suffix;bool labels,entered;} RenderFrame;
-/* Exact text and display labels share the occurrence stack. Structural labels
- * print a run once with its count; exact text emits every ordered occurrence.
- * Neither DAG altitude nor output length consumes the backend's C stack. */
-static void render_tree(lp_idmap *t,size_t root,StringInfo out,bool labels){
-    lp_vec(RenderFrame) stack={0};lp_push(&stack,((RenderFrame){.node=root,.labels=labels}));
-    while(stack.n){
-        CHECK_FOR_INTERRUPTS();RenderFrame *frame=stack.v+stack.n-1;
-        TNode *node=lp_idmap_at(t,frame->node);
-        if(!frame->entered){
-            bool structured=frame->labels && (node->tuple || (node->opaque && node->nkid>0)) && !text_surface(t,frame->node);
-            if(frame->labels && !structured){
-                if(!text_surface(t,frame->node)){
-                    char hex[33];lp_id_hex(lp_idmap_key(t,frame->node),hex);appendStringInfoString(out,hex);stack.n--;continue;
-                }
-                frame->labels=false;
-            }
-            if(!frame->labels && !node->nkid){
-                int64 cp=lp_tier0_codepoint(lp_pg_tier0(),lp_idmap_key(t,frame->node));
-                if(cp>=0){uint8 u[4];appendBinaryStringInfo(out,(const char *)u,(int)lp_utf8_put((uint32)cp,u));}
-                stack.n--;continue;
-            }
-            if(node->rendering)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_text: cyclic composition")));
-            node->rendering=true;frame->entered=true;
-            if(frame->labels)appendStringInfoChar(out,'[');
-        }
-        if(frame->labels){
-            if(frame->suffix>1)appendStringInfo(out," × %u",frame->suffix);
-            frame->suffix=0;
-            if(frame->child<node->nkid){
-                if(frame->child)appendStringInfoString(out," · ");
-                TChild child=node->kid[frame->child++];frame->suffix=child.run;
-                lp_push(&stack,((RenderFrame){.node=child.node,.labels=true}));continue;
-            }
-            appendStringInfoChar(out,']');
-        }else{
-            if(!frame->repeat && frame->child<node->nkid)frame->repeat=node->kid[frame->child++].run;
-            if(frame->repeat){
-                size_t child=node->kid[frame->child-1].node;frame->repeat--;
-                lp_push(&stack,((RenderFrame){.node=child}));continue;
-            }
-            if(frame->child<node->nkid)continue;
-        }
-        node->rendering=false;stack.n--;
-    }
-    lp_vec_free(&stack);
+static int text_bytes(void *context,const uint8_t *bytes,size_t n){
+    appendBinaryStringInfo(((TextSink *)context)->out,(const char *)bytes,(int)n);return 0;
 }
-
-static void render(lp_idmap *t,size_t i,StringInfo out){render_tree(t,i,out,false);}
-static void render_label(lp_idmap *t,size_t i,StringInfo out){render_tree(t,i,out,true);}
+static void render_mode(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo out,uint32 mode){
+    TextSink sink={t,out};lp_realize_result result;
+    if(!lp_realize(walk,lp_pg_tier0(),id,mode,text_node,text_bytes,&sink,&result))
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg(mode==LP_REALIZE_LABELS?"laplace_labels: cyclic composition":"laplace_text: cyclic composition")));
+}
+static void render(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo out){render_mode(walk,t,id,out,LP_REALIZE_TEXT);}
+static void render_label(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo out){render_mode(walk,t,id,out,LP_REALIZE_LABELS);}
 
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
     StringInfoData out; initStringInfo(&out); MemoryContext keep = CurrentMemoryContext;
-    lp_idmap *t = lp_idmap_sized(sizeof(TNode)); size_t root = tnode(t, (const lp_id *)PG_GETARG_POINTER(0));
+    const lp_id *id = (const lp_id *)PG_GETARG_POINTER(0);
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode)); lp_realizer *walk = lp_realizer_new(); tnode(t, id);
     PG_TRY();{
       read_levels(t,keep,false,NULL);
-      render(t,root,&out);
-    }PG_FINALLY();{lp_idmap_free(t);}PG_END_TRY();
+      render(walk,t,id,&out);
+    }PG_FINALLY();{lp_idmap_free(t);lp_realizer_free(walk);}PG_END_TRY();
     PG_RETURN_TEXT_P(cstring_to_text_with_len(out.data, out.len));
 }
 
@@ -165,20 +115,20 @@ static Datum realize_batch(FunctionCallInfo fcinfo,bool labels){
     TupleDesc td;Tuplestorestate *ts=set_begin(fcinfo,labels ? "laplace_labels" : "laplace_text_batch",&td);
     MemoryContext keep=CurrentMemoryContext;
     int n;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&n);
-    lp_idmap *t=lp_idmap_sized(sizeof(TNode));size_t *roots=palloc(Max(n,1)*sizeof(size_t));
+    lp_idmap *t=lp_idmap_sized(sizeof(TNode));lp_realizer *walk=lp_realizer_new();
     PG_TRY();{
-      for(int i=0;i<n;i++)roots[i]=tnode(t,ids+i);
+      for(int i=0;i<n;i++)tnode(t,ids+i);
       read_levels(t,keep,labels,NULL);
       for(int i=0;i<n;i++){
         StringInfoData out;initStringInfo(&out);
-        if(labels)render_label(t,roots[i],&out);else render(t,roots[i],&out);
+        if(labels)render_label(walk,t,ids+i,&out);else render(walk,t,ids+i,&out);
         text *content=cstring_to_text_with_len(out.data,out.len);
         Datum values[]={Int64GetDatum((int64)i+1),PointerGetDatum(ids+i),PointerGetDatum(content)};
         bool nulls[]={false,false,false};set_put(fcinfo,ts,td,values,nulls);
         pfree(content);pfree(out.data);
       }
-    }PG_FINALLY();{lp_idmap_free(t);}PG_END_TRY();
-    pfree(roots);pfree(ids);PG_RETURN_NULL();
+    }PG_FINALLY();{lp_idmap_free(t);lp_realizer_free(walk);}PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
 }
 
 PG_FUNCTION_INFO_V1(laplace_text_batch);
@@ -210,7 +160,7 @@ Datum laplace_resolve_refs(PG_FUNCTION_ARGS){
         present[i]=lp_tier0_codepoint(lp_pg_tier0(),ids+i)>=0;
     }
     lp_pg_present(ids,(size_t)count,present);
-    lp_idmap *tree=lp_idmap_sized(sizeof(TNode));MemoryContext keep=CurrentMemoryContext;
+    lp_idmap *tree=lp_idmap_sized(sizeof(TNode));MemoryContext keep=CurrentMemoryContext;lp_realizer *walk=lp_realizer_new();
     PG_TRY();{
         for(int i=0;i<count;i++){
             if(present[i] && unlabeled[i])tnode(tree,ids+i);
@@ -220,7 +170,7 @@ Datum laplace_resolve_refs(PG_FUNCTION_ARGS){
             Datum label=surfaces[i];StringInfoData text;bool rendered=false;
             if(unlabeled[i]){
                 initStringInfo(&text);rendered=true;
-                if(present[i])render_label(tree,(size_t)lp_idmap_find(tree,ids+i),&text);
+                if(present[i])render_label(walk,tree,ids+i,&text);
                 else{char hex[33];lp_id_hex(ids+i,hex);appendStringInfoString(&text,hex);}
                 label=PointerGetDatum(cstring_to_text_with_len(text.data,text.len));
             }
@@ -228,7 +178,7 @@ Datum laplace_resolve_refs(PG_FUNCTION_ARGS){
             set_put(fcinfo,rows,descriptor,output,nulls);
             if(rendered){pfree(DatumGetPointer(label));pfree(text.data);}
         }
-    }PG_FINALLY();{lp_idmap_free(tree);}PG_END_TRY();
+    }PG_FINALLY();{lp_idmap_free(tree);lp_realizer_free(walk);}PG_END_TRY();
     pfree(ids);pfree(present);pfree(values);pfree(surfaces);pfree(missing);pfree(unlabeled);PG_RETURN_NULL();
 }
 
@@ -251,7 +201,7 @@ PG_FUNCTION_INFO_V1(laplace_claim_preview);
 Datum laplace_claim_preview(PG_FUNCTION_ARGS){
     TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_claim_preview",&descriptor);
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
-    lp_idmap *tree=lp_idmap_sized(sizeof(TNode)),*selected=lp_idmap_new();
+    lp_idmap *tree=lp_idmap_sized(sizeof(TNode)),*selected=lp_idmap_new();lp_realizer *walk=lp_realizer_new();
     PG_TRY();{
         for(int i=0;i<count;i++){tnode(tree,ids+i);lp_idmap_put(selected,ids+i,NULL);}
         read_levels(tree,CurrentMemoryContext,true,selected);
@@ -259,24 +209,24 @@ Datum laplace_claim_preview(PG_FUNCTION_ARGS){
             CHECK_FOR_INTERRUPTS();TNode *node=lp_idmap_at(tree,(size_t)lp_idmap_find(tree,ids+i));
             if(!node->claim || !node->nkid)continue;
             uint64 arity=0;for(size_t k=0;k<node->nkid;k++)arity+=node->kid[k].run;
-            size_t last=node->kid[node->nkid-1].node;
-            size_t predicate=arity==3?node->kid[node->kid[0].run>=2?0:1].node:SIZE_MAX;
+            const lp_id *last=&node->kid[node->nkid-1].id;
+            const lp_id *predicate=arity==3?&node->kid[node->kid[0].run>=2?0:1].id:NULL;
             StringInfoData type,fact;initStringInfo(&type);initStringInfo(&fact);
-            if(predicate!=SIZE_MAX)render_label(tree,predicate,&type);
-            if(arity<=3)render_label(tree,last,&fact);
+            if(predicate)render_label(walk,tree,predicate,&type);
+            if(arity<=3)render_label(walk,tree,last,&fact);
             else for(size_t k=0;k<node->nkid;k++){
                 if(k)appendStringInfoString(&fact," · ");
-                render_label(tree,node->kid[k].node,&fact);
+                render_label(walk,tree,&node->kid[k].id,&fact);
                 if(node->kid[k].run>1)appendStringInfo(&fact," × %u",node->kid[k].run);
             }
             text *type_text=cstring_to_text_with_len(type.data,type.len),*fact_text=cstring_to_text_with_len(fact.data,fact.len);
             Datum values[]={Int64GetDatum((int64)i+1),PointerGetDatum(ids+i),
-                predicate==SIZE_MAX?(Datum)0:PointerGetDatum(lp_idmap_key(tree,predicate)),
-                PointerGetDatum(arity<=3?lp_idmap_key(tree,last):ids+i),PointerGetDatum(type_text),PointerGetDatum(fact_text)};
-            bool nulls[]={false,false,predicate==SIZE_MAX,false,false,false};set_put(fcinfo,rows,descriptor,values,nulls);
+                predicate?PointerGetDatum(predicate):(Datum)0,
+                PointerGetDatum(arity<=3?last:ids+i),PointerGetDatum(type_text),PointerGetDatum(fact_text)};
+            bool nulls[]={false,false,predicate==NULL,false,false,false};set_put(fcinfo,rows,descriptor,values,nulls);
             pfree(type_text);pfree(fact_text);pfree(type.data);pfree(fact.data);
         }
-    }PG_FINALLY();{lp_idmap_free(tree);lp_idmap_free(selected);}PG_END_TRY();
+    }PG_FINALLY();{lp_idmap_free(tree);lp_idmap_free(selected);lp_realizer_free(walk);}PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
 }
 
