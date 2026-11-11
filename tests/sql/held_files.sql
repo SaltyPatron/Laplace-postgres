@@ -43,7 +43,8 @@ BEGIN
   a:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[one,alpha]),body],ARRAY[meta,0]);
   b:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('two'),one]),second_line],ARRAY[meta,0]);
   c:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('three'),one]),first_line],ARRAY[meta,0]);
-  trunk:=pg_temp.held_node(ARRAY[laplace_id('source'),pg_temp.held_node(ARRAY[a,b])]);
+  -- a source trunk has its record first, said as a file has its OS record
+  trunk:=pg_temp.held_node(ARRAY[laplace_id('source'),pg_temp.held_node(ARRAY[a,b])],ARRAY[meta,0]);
   IF (SELECT array_agg(file::text||':'||keys ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma]))
        IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':3',b::text||':2',c::text||':1']) f)
   OR EXISTS(SELECT FROM laplace_held_files(ARRAY[alpha,gamma]) WHERE hubs<>0 OR cut OR levels<3) THEN

@@ -762,8 +762,9 @@ static bool held_first(TupleTableSlot *slot,void *context)
     }
     return walk->cap<0 || walk->saturated<2*lp_idmap_count(walk->keys);
 }
-/* The files under a trunk: down its spine by ID to the nodes whose first vertex is the OS record. */
-typedef struct { lp_idmap *files,*next; } HeldScope;
+/* The files under a trunk: down its spine by ID, never through a record (the trunk has its source record first as a
+ * file has its OS record), to the nodes whose first vertex is such a record. The trunk itself is always read down. */
+typedef struct { lp_idmap *files,*next;const lp_id *trunk; } HeldScope;
 static void held_scope_row(const lp_id *id,Datum value,Datum mask,void *context)
 {
     (void)mask;HeldScope *scope=context;Geo geometry=geo_of(value);
@@ -771,8 +772,8 @@ static void held_scope_row(const lp_id *id,Datum value,Datum mask,void *context)
     lp_vertex *v=palloc(sizeof(lp_vertex)*count);
     if(lp_path_decode(geometry.p,v,count)!=count)
         ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_held_files: invalid stored path")));
-    if(v[0].said==LP_SAID_METADATA)lp_idmap_put(scope->files,id,NULL);
-    else for(size_t i=0;i<count;i++)lp_idmap_put(scope->next,&v[i].id,NULL);
+    if(v[0].said==LP_SAID_METADATA && memcmp(id->b,scope->trunk->b,16))lp_idmap_put(scope->files,id,NULL);
+    else for(size_t i=0;i<count;i++)if(v[i].said!=LP_SAID_METADATA)lp_idmap_put(scope->next,&v[i].id,NULL);
     pfree(v);
 }
 PG_FUNCTION_INFO_V1(laplace_held_files);
@@ -820,8 +821,8 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
             }
         }
         if(!PG_ARGISNULL(1)){
-            HeldScope down={lp_idmap_new(),lp_idmap_new()};
             const lp_id *trunk=(const lp_id *)DatumGetPointer(PG_GETARG_DATUM(1));
+            HeldScope down={lp_idmap_new(),lp_idmap_new(),trunk};
             lp_idmap *front=lp_idmap_new();lp_idmap_put(front,trunk,NULL);
             for(int depth=0;depth<64 && lp_idmap_count(front);depth++){
                 lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),false,held_scope_row,&down);
