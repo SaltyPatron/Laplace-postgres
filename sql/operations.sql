@@ -76,6 +76,13 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[
     AS 'MODULE_PATHNAME', 'laplace_holders';
 COMMENT ON FUNCTION @extschema@.laplace_holders(@extschema@.blake3[],@extschema@.blake3[],boolean,smallint,bigint,smallint)
     IS 'Exact direct overlap containment, optionally requiring every required ID. Union mode uses ordinal 0; per-part mode preserves duplicate request ordinals. floor is exclusive; kinds 1=claims, 2=observations, 3=both. cap=-1 returns complete sets. A nonnegative per-part cap classifies each kind separately: overflow returns one hub row (null carrier), never an arbitrary subset. All-key containment is laplace_containers.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_held_files(keys @extschema@.blake3[],
+    trunk @extschema@.blake3 DEFAULT NULL, cap bigint DEFAULT -1, max_nodes bigint DEFAULT 400000,
+    OUT file @extschema@.blake3, OUT keys bigint, OUT hubs bigint, OUT levels integer, OUT cut boolean) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_held_files';
+COMMENT ON FUNCTION @extschema@.laplace_held_files(@extschema@.blake3[],@extschema@.blake3,bigint,bigint)
+    IS 'Up the container index from keys to the files that hold them, in one call: level zero is the capped laplace_holders nomination (a key past cap holders of a kind is a hub and is not walked), each later level one direct-container frontier, never through a file record. keys is the bit set of the keys (first 64) below the file. trunk keeps the files under that trunk. One row a file; none reached gives one row with a null file.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_standings(ids @extschema@.blake3[],
     OUT ordinal bigint, OUT claim @extschema@.blake3, OUT rating double precision,
     OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record

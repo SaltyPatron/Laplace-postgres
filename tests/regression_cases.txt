@@ -15,5 +15,6 @@ stage_routing
 path_annotations
 ordered
 container_frontier
+held_files
 frontier_runtime
 function_bindings

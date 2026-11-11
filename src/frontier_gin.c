@@ -690,3 +690,159 @@ PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){return read_claims(fcinfo,true);}
+
+/* laplace_held_files(keys, trunk, cap, max_nodes): up the container index from keys to the files that hold them, in
+ * one call. A node holds the keys below it (bit k: keys[k], k < 64), propagated up as they arrive, through every path
+ * that holds a node as content; never through the OS record of a file, and a holder whose first vertex is that record
+ * is a file, where the walk stops. Level zero is the capped GIN nomination of laplace_holders: a key held directly by
+ * more than cap paths of a kind is a hub, its bit is set in hubs, and it is not walked. Every later level is one
+ * direct-container frontier. trunk, when given, keeps the files under it (read down its spine by ID). One row a file;
+ * a walk that reaches none returns one row with a null file, so hubs, levels and cut are always answered. */
+typedef struct { uint64 keys; bool file; } HeldNode;
+typedef struct { uint64 epoch,held[2]; } HeldKey;
+typedef struct { lp_id holder,key; Datum path; } HeldFirst;
+typedef struct {
+    lp_idmap *nodes,*front,*next,*keys;AttrNumber id,path,mask;int64 cap;uint64 epoch,saturated;
+    lp_vec(HeldFirst) first;lp_vec(lp_vertex) vertices;size_t max_nodes;bool cut;MemoryContext owner;
+} HeldWalk;
+static HeldNode *held_node(HeldWalk *walk,const lp_id *id,bool *fresh)
+{
+    HeldNode *node=lp_idmap_get(walk->nodes,id,fresh);
+    if(*fresh)*node=(HeldNode){0};
+    return node;
+}
+/* One holder of the front: it takes the keys of every front node it holds as content. */
+static void held_holder(HeldWalk *walk,const lp_id *holder,Datum value)
+{
+    Geo geometry=geo_of(value);size_t count=geometry.p.n;if(!count)return;
+    lp_vec_reserve(&walk->vertices,count);lp_vertex *v=walk->vertices.v;
+    if(lp_path_decode(geometry.p,v,count)!=count)
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_held_files: invalid stored path")));
+    bool file=v[0].said==LP_SAID_METADATA,held=false;uint64 gained=0;
+    for(size_t k=0;k<count;k++){
+        if(v[k].said==LP_SAID_METADATA)continue;
+        if(lp_idmap_find(walk->front,&v[k].id)<0)continue;
+        HeldNode *child=lp_idmap_lookup(walk->nodes,&v[k].id);
+        if(child){gained|=child->keys;held=true;}
+    }
+    if(!held)return;
+    if(lp_idmap_find(walk->nodes,holder)<0 && lp_idmap_count(walk->nodes)>=walk->max_nodes){walk->cut=true;return;}
+    bool fresh;HeldNode *node=held_node(walk,holder,&fresh);
+    uint64 before=node->keys;node->keys|=gained;node->file|=file;
+    if(!file && (fresh || node->keys!=before))lp_idmap_put(walk->next,holder,NULL);
+}
+static void held_level(const lp_id *id,Datum path,Datum mask,void *context){(void)mask;held_holder(context,id,path);}
+/* Level zero: each key with its direct holders through the capped nomination; a hub is dropped once the scan ends. */
+static bool held_first(TupleTableSlot *slot,void *context)
+{
+    HeldWalk *walk=context;bool missing;
+    Datum mask=slot_getattr(slot,walk->mask,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native holder mask is null")));
+    int kind=(lp_pg_mask_native(mask)&UINT64_C(1))?1:0;
+    Datum id=slot_getattr(slot,walk->id,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native holder ID is null")));
+    Datum path=slot_getattr(slot,walk->path,&missing);
+    if(missing)ereport(ERROR,(errmsg("Native holder path is null")));
+    Geo geometry=geo_of(path);
+    if(++walk->epoch==0){
+        for(size_t i=0;i<lp_idmap_count(walk->keys);i++)((HeldKey *)lp_idmap_at(walk->keys,i))->epoch=0;
+        walk->epoch=1;
+    }
+    for(size_t i=0;i<geometry.p.n;i++){
+        lp_id child=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(walk->keys,&child);if(at<0)continue;
+        HeldKey *key=lp_idmap_at(walk->keys,(size_t)at);
+        if(key->epoch==walk->epoch)continue;key->epoch=walk->epoch;
+        if(walk->cap>=0){
+            if(key->held[kind]>(uint64)walk->cap)continue;
+            if(++key->held[kind]>(uint64)walk->cap){walk->saturated++;continue;}
+        }
+        MemoryContext previous=MemoryContextSwitchTo(walk->owner);
+        HeldFirst first={*(const lp_id *)DatumGetPointer(id),child,PointerGetDatum(PG_DETOAST_DATUM_COPY(path))};
+        lp_push(&walk->first,first);MemoryContextSwitchTo(previous);
+    }
+    return walk->cap<0 || walk->saturated<2*lp_idmap_count(walk->keys);
+}
+/* The files under a trunk: down its spine by ID to the nodes whose first vertex is the OS record. */
+typedef struct { lp_idmap *files,*next; } HeldScope;
+static void held_scope_row(const lp_id *id,Datum value,Datum mask,void *context)
+{
+    (void)mask;HeldScope *scope=context;Geo geometry=geo_of(value);
+    size_t count=geometry.p.n;if(!count)return;
+    lp_vertex *v=palloc(sizeof(lp_vertex)*count);
+    if(lp_path_decode(geometry.p,v,count)!=count)
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace_held_files: invalid stored path")));
+    if(v[0].said==LP_SAID_METADATA)lp_idmap_put(scope->files,id,NULL);
+    else for(size_t i=0;i<count;i++)lp_idmap_put(scope->next,&v[i].id,NULL);
+    pfree(v);
+}
+PG_FUNCTION_INFO_V1(laplace_held_files);
+Datum laplace_held_files(PG_FUNCTION_ARGS)
+{
+    if(PG_ARGISNULL(0))PG_RETURN_NULL();
+    TupleDesc descriptor;Tuplestorestate *output=set_begin(fcinfo,"laplace_held_files",&descriptor);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    int64 cap=PG_ARGISNULL(2)?-1:PG_GETARG_INT64(2),most=PG_ARGISNULL(3)?400000:PG_GETARG_INT64(3);
+    if(cap<-1 || most<1)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_held_files: cap is -1 or more, max_nodes 1 or more")));
+    HeldWalk walk={.nodes=lp_idmap_sized(sizeof(HeldNode)),.front=lp_idmap_new(),.next=lp_idmap_new(),
+        .keys=lp_idmap_sized(sizeof(HeldKey)),.cap=cap,.max_nodes=(size_t)most,.owner=CurrentMemoryContext};
+    lp_idmap *scope=NULL;uint64 hubs=0;int levels=0;
+    PG_TRY();{
+        for(int i=0;i<count;i++){
+            bool fresh;HeldKey *key=lp_idmap_get(walk.keys,ids+i,&fresh);if(fresh)*key=(HeldKey){0};
+            HeldNode *node=held_node(&walk,ids+i,&fresh);if(i<64)node->keys|=UINT64_C(1)<<i;
+        }
+        if(count){
+            const char *selected[]={"entity","path","tier","mask"},*column;Oid target=lp_pg_relation("physicality");
+            Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
+            walk.id=get_attnum(target,"entity");walk.path=get_attnum(target,"path");walk.mask=get_attnum(target,"mask");
+            uint64 h_cap=cap>=0?((UINT64_C(3)<<60)|((uint64)cap+1)):0;
+            scan_container_rows(parent,column,walk.keys,3,NULL,false,0,NULL,0,false,h_cap,held_first,&walk);
+            table_close(parent,NoLock);
+            for(int i=0;i<count && i<64;i++){
+                HeldKey *key=lp_idmap_lookup(walk.keys,ids+i);
+                if(cap>=0 && (key->held[0]>(uint64)cap || key->held[1]>(uint64)cap))hubs|=UINT64_C(1)<<i;
+            }
+            /* level zero: each holder takes the keys it holds that are not hubs */
+            for(size_t i=0;i<walk.first.n;i++){
+                const HeldFirst *first=walk.first.v+i;
+                HeldKey *key=lp_idmap_lookup(walk.keys,&first->key);
+                if(cap>=0 && (key->held[0]>(uint64)cap || key->held[1]>(uint64)cap))continue;
+                lp_idmap_clear(walk.front);lp_idmap_put(walk.front,&first->key,NULL);
+                held_holder(&walk,&first->holder,first->path);
+            }
+            levels=1;
+            while(lp_idmap_count(walk.next) && levels<128 && !walk.cut){
+                CHECK_FOR_INTERRUPTS();
+                lp_idmap_free(walk.front);walk.front=walk.next;walk.next=lp_idmap_new();
+                lp_pg_lookup_containers(lp_idmap_keys(walk.front),lp_idmap_count(walk.front),false,false,held_level,&walk);
+                levels++;
+            }
+        }
+        if(!PG_ARGISNULL(1)){
+            HeldScope down={lp_idmap_new(),lp_idmap_new()};
+            const lp_id *trunk=(const lp_id *)DatumGetPointer(PG_GETARG_DATUM(1));
+            lp_idmap *front=lp_idmap_new();lp_idmap_put(front,trunk,NULL);
+            for(int depth=0;depth<64 && lp_idmap_count(front);depth++){
+                lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),false,held_scope_row,&down);
+                lp_idmap_free(front);front=down.next;down.next=lp_idmap_new();
+            }
+            lp_idmap_free(front);lp_idmap_free(down.next);scope=down.files;
+        }
+        size_t emitted=0;
+        for(size_t i=0;i<lp_idmap_count(walk.nodes);i++){
+            const HeldNode *node=lp_idmap_at(walk.nodes,i);const lp_id *id=lp_idmap_key(walk.nodes,i);
+            if(!node->file || !node->keys || (scope && lp_idmap_find(scope,id)<0))continue;
+            Datum values[]={id_datum(id),Int64GetDatum((int64)node->keys),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut)};
+            bool nulls[lengthof(values)]={false};set_put(fcinfo,output,descriptor,values,nulls);emitted++;
+        }
+        if(!emitted){
+            Datum values[]={(Datum)0,Int64GetDatum(0),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut)};
+            bool nulls[lengthof(values)]={true,false,false,false,false};set_put(fcinfo,output,descriptor,values,nulls);
+        }
+    }PG_FINALLY();{
+        lp_idmap_free(walk.nodes);lp_idmap_free(walk.front);lp_idmap_free(walk.next);lp_idmap_free(walk.keys);
+        lp_vec_free(&walk.vertices);lp_vec_free(&walk.first);if(scope)lp_idmap_free(scope);
+    }PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
+}
