@@ -698,8 +698,9 @@ Datum laplace_claims_each(PG_FUNCTION_ARGS){return read_claims(fcinfo,true);}
  * more than cap paths of a kind is a hub, its bit is set in hubs, and it is not walked. Every later level is one
  * direct-container frontier. trunk, when given, keeps the files under it (read down its spine by ID). Each file comes
  * with its unit, the lowest node of its content that holds every key the file holds (their common ancestor, never a key
- * itself), that node's path length (its constituents, runs counted), and how many times each key stands below it (the
- * walked DAG's multiplicity). One row a file; a walk that reaches none returns one row with a null file, so hubs, levels
+ * itself), that node's path length (its constituents, runs counted) and tier (its height: a file's path is only its
+ * record and its content, so the tier is what tells a whole file from a line), and how many times each key stands
+ * below it (the walked DAG's multiplicity). One row a file; a walk that reaches none returns one row with a null file, so hubs, levels
  * and cut are always answered. */
 typedef struct { uint64 keys; bool file; } HeldNode;
 typedef struct { uint64 epoch,held[2]; } HeldKey;
@@ -827,6 +828,13 @@ static uint32 held_unit(HeldWalk *walk,HeldDown *down,uint32 file)
     return at;
 }
 typedef struct { lp_idmap *length; } HeldLength;
+typedef struct { AttrNumber tier;int16 *tiers; } HeldTiers;
+static void held_tier_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
+{
+    HeldTiers *out=context;bool missing;Datum tier=slot_getattr(slot,out->tier,&missing);
+    if(missing)ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native entity tier is null")));
+    out->tiers[key->ordinal-1]=DatumGetInt16(tier);
+}
 static void held_length_row(const lp_id *id,Datum value,Datum mask,void *context)
 {
     (void)mask;HeldLength *read=context;Geo geometry=geo_of(value);bool fresh;
@@ -911,7 +919,17 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
             uint32 unit=held_unit(&walk,&down,(uint32)i);
             lp_push(&files,(uint32)i);lp_push(&units,unit);lp_push(&unit_ids,*lp_idmap_key(walk.nodes,unit));
         }
-        if(unit_ids.n)lp_pg_lookup_paths(unit_ids.v,unit_ids.n,false,held_length_row,&lengths);
+        int16 *tiers=palloc0(sizeof(int16)*Max(unit_ids.n,1));
+        if(unit_ids.n){
+            lp_pg_lookup_paths(unit_ids.v,unit_ids.n,false,held_length_row,&lengths);
+            const char *selected[]={"id","tier"},*column;Oid target=lp_pg_relation("entity");
+            Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
+            HeldTiers read={get_attnum(target,"tier"),tiers};
+            PresenceKey *keys=palloc_extended(unit_ids.n*sizeof(*keys),MCXT_ALLOC_HUGE);
+            for(size_t i=0;i<unit_ids.n;i++)keys[i]=(PresenceKey){.id=unit_ids.v[i],.ordinal=(int64)i+1};
+            lp_pg_indexed_keys(parent,column,keys,unit_ids.n,held_tier_row,&read);
+            pfree(keys);table_close(parent,NoLock);
+        }
         for(size_t f=0;f<files.n;f++){
             CHECK_FOR_INTERRUPTS();
             const HeldNode *node=lp_idmap_at(walk.nodes,files.v[f]);
@@ -921,13 +939,14 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
             ArrayType *array=construct_array(cells,(int)down.keys,INT8OID,8,FLOAT8PASSBYVAL,TYPALIGN_DOUBLE);
             int64 *length=lp_idmap_lookup(lengths.length,&unit_ids.v[f]);
             Datum values[]={id_datum(lp_idmap_key(walk.nodes,files.v[f])),Int64GetDatum((int64)node->keys),Int64GetDatum((int64)hubs),
-                Int32GetDatum(levels),BoolGetDatum(walk.cut),id_datum(&unit_ids.v[f]),Int64GetDatum(length?*length:0),PointerGetDatum(array)};
+                Int32GetDatum(levels),BoolGetDatum(walk.cut),id_datum(&unit_ids.v[f]),Int64GetDatum(length?*length:0),PointerGetDatum(array),
+                Int16GetDatum(tiers[f])};
             bool nulls[lengthof(values)]={false};set_put(fcinfo,output,descriptor,values,nulls);
             pfree(cells);
         }
         if(!files.n){
-            Datum values[]={(Datum)0,Int64GetDatum(0),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut),(Datum)0,(Datum)0,(Datum)0};
-            bool nulls[lengthof(values)]={true,false,false,false,false,true,true,true};set_put(fcinfo,output,descriptor,values,nulls);
+            Datum values[]={(Datum)0,Int64GetDatum(0),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut),(Datum)0,(Datum)0,(Datum)0,(Datum)0};
+            bool nulls[lengthof(values)]={true,false,false,false,false,true,true,true,true};set_put(fcinfo,output,descriptor,values,nulls);
         }
         lp_vec_free(&files);lp_vec_free(&units);lp_vec_free(&unit_ids);
     }PG_FINALLY();{

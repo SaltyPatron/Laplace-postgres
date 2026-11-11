@@ -52,9 +52,9 @@ BEGIN
   END IF;
   -- each file's unit: the lowest node of its content holding every key the file holds, its path length, and how
   -- many times each key stands below it
-  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma]))
-       IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':'||body::text||':2:{1,1}',
-         b::text||':'||second_line::text||':2:{0,1}',c::text||':'||first_line::text||':2:{1,0}']) f) THEN
+  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text||':'||unit_tier ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma]))
+       IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':'||body::text||':2:{1,1}:3',
+         b::text||':'||second_line::text||':2:{0,1}:2',c::text||':'||first_line::text||':2:{1,0}:2']) f) THEN
     RAISE EXCEPTION 'Native held files: units changed';
   END IF;
   -- a key said twice in a run stands twice below its unit, and the run counts in the unit's length
