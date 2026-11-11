@@ -908,5 +908,33 @@ BEGIN
 END $$;
 
 SELECT 'attestation: large frontier preserves exact witness attribution';
+
+-- A witness's declared trust is its first lineage row (NULL lineage first), read by index,
+-- for the asked IDs that are witnesses or, given NULL, every witness exactly once.
+DO $$
+DECLARE w1 blake3 := md5('witness-trust-one')::blake3; w2 blake3 := md5('witness-trust-two')::blake3;
+        derived blake3 := md5('witness-trust-lineage')::blake3; stranger blake3 := md5('witness-trust-none')::blake3;
+        got double precision; n bigint;
+BEGIN
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+  SELECT md5('witness-trust-claim-'||g)::blake3, w1, CASE WHEN g % 2 = 0 THEN derived END, 1, 1, 1, NULL,
+         CASE WHEN g % 2 = 0 THEN 0.25 ELSE 0.9 END
+  FROM generate_series(1, 200) g;
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+  VALUES (md5('witness-trust-claim-x')::blake3, w2, derived, 1, 1, 1, NULL, 0.4);
+  SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w1, stranger]) WHERE witness = w1;
+  IF got IS DISTINCT FROM 0.9 THEN RAISE EXCEPTION 'witness trust did not come from the NULL-lineage row: %', got; END IF;
+  IF EXISTS (SELECT FROM laplace_witness_trust(ARRAY[stranger])) THEN
+    RAISE EXCEPTION 'an ID with no testimony was reported as a witness';
+  END IF;
+  SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w2]);
+  IF got IS DISTINCT FROM 0.4 THEN RAISE EXCEPTION 'a witness with only a derived lineage lost its trust: %', got; END IF;
+  SELECT count(*) INTO n FROM laplace_witness_trust() WHERE witness IN (w1, w2);
+  IF n <> 2 THEN RAISE EXCEPTION 'every-witness form did not list each witness once: %', n; END IF;
+  IF (SELECT count(*) FROM laplace_witness_trust()) <> (SELECT count(DISTINCT witness) FROM attestation) THEN
+    RAISE EXCEPTION 'every-witness form disagrees with the distinct witnesses';
+  END IF;
+END $$;
+SELECT 'attestation: witness trust reads one first-lineage row per witness';
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';
