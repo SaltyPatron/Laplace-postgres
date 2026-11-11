@@ -2,4 +2,5 @@
 t
 dependence: source witness retained; stored and cumulative class-rooted series agree exactly
 attestation: large frontier preserves exact witness attribution
+attestation: witness trust reads one first-lineage row per witness
 attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed

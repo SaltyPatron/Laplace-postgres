@@ -566,7 +566,11 @@ BEGIN
   -- PostgreSQL owns this canonical index's visibility, updates, WAL and rebuild.
   CREATE INDEX IF NOT EXISTS physicality_assertions ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops)
     WITH (gin_pending_list_limit = 32768) WHERE @extschema@.laplace_path_has_roles(path,6::smallint);
-  CREATE INDEX IF NOT EXISTS attestation_witness ON @extschema@.attestation (witness);
+  -- A witness's declared trust is its first lineage row. A few witnesses hold millions of
+  -- rows each, so a (witness) index alone sorted all of them per question; this key
+  -- answers "first lineage of witness w" with one probe.
+  CREATE INDEX IF NOT EXISTS attestation_witness_lineage ON @extschema@.attestation (witness, lineage NULLS FIRST) INCLUDE (trust);
+  DROP INDEX IF EXISTS @extschema@.attestation_witness;
 END $$;
 SELECT @extschema@.laplace_schema_indexes();
 
@@ -590,6 +594,26 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_ordered_pair_counts(vocab @extsch
  roots @extschema@.blake3[] DEFAULT NULL,separators @extschema@.blake3[] DEFAULT @extschema@.laplace_separator_ids(),
  OUT container @extschema@.blake3,OUT gap integer,OUT subject @extschema@.blake3,OUT object @extschema@.blake3,OUT occurrences bigint)
 RETURNS SETOF record AS 'MODULE_PATHNAME','laplace_ordered_pair_counts' LANGUAGE C STABLE PARALLEL RESTRICTED;
+-- Each witness and its declared trust (its first lineage row): the given IDs that are
+-- witnesses, or every witness when ids is NULL. Witnesses are found by skip scan and each
+-- trust by one index probe, so neither form reads a witness's testimony rows.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_witness_trust(ids @extschema@.blake3[] DEFAULT NULL,
+    OUT witness @extschema@.blake3, OUT lineage @extschema@.blake3, OUT trust double precision)
+    RETURNS SETOF record LANGUAGE sql STABLE PARALLEL SAFE BEGIN ATOMIC
+  WITH RECURSIVE every(w) AS (
+    (SELECT a.witness FROM @extschema@.attestation a WHERE ids IS NULL ORDER BY a.witness LIMIT 1)
+    UNION ALL
+    SELECT (SELECT a.witness FROM @extschema@.attestation a
+             WHERE a.witness OPERATOR(@extschema@.>) every.w ORDER BY a.witness LIMIT 1)
+    FROM every WHERE every.w IS NOT NULL),
+  asked(w) AS (SELECT every.w FROM every WHERE every.w IS NOT NULL
+               UNION SELECT u FROM unnest(ids) u WHERE ids IS NOT NULL)
+  SELECT asked.w, first.lineage, first.trust FROM asked
+  CROSS JOIN LATERAL (SELECT a.lineage, a.trust FROM @extschema@.attestation a
+                      WHERE a.witness OPERATOR(@extschema@.=) asked.w
+                      ORDER BY a.lineage NULLS FIRST LIMIT 1) first;
+END;
+
 -- Recover missing operational measurements from stored testimony. This never
 -- registers another witness, changes a claim, or runs the standing solver.
 CREATE OR REPLACE PROCEDURE @extschema@.laplace_measure_attestations(roots @extschema@.blake3[] DEFAULT NULL)
@@ -597,10 +621,7 @@ LANGUAGE plpgsql AS $$
 DECLARE selected record;
 BEGIN
   FOR selected IN
-    SELECT DISTINCT ON (witness) witness AS id, lineage, trust
-    FROM @extschema@.attestation
-    WHERE roots IS NULL OR witness OPERATOR(@extschema@.=) ANY(roots)
-    ORDER BY witness, lineage NULLS FIRST
+    SELECT witness AS id, lineage, trust FROM @extschema@.laplace_witness_trust(roots)
   LOOP
     INSERT INTO @extschema@.attestation (claim, witness, lineage, games, tokens, score, "position", trust)
     SELECT s.claim, selected.id, COALESCE(s.dependence_root, selected.lineage),
