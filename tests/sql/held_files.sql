@@ -5,7 +5,7 @@ SET client_min_messages=warning;
 -- Up the container index from keys to the files that hold them, in one call:
 -- through content only, never through a file's record, stopping at files.
 BEGIN;
-CREATE TEMP TABLE held_words AS SELECT unnest(ARRAY['alpha','beta','gamma','delta','one','two','three','source']) AS content;
+CREATE TEMP TABLE held_words AS SELECT unnest(ARRAY['alpha','beta','gamma','delta','one','two','three','source','epsilon']) AS content;
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT laplace_id(content),laplace_tier(content),laplace_coord(content),laplace_hilbert(content) FROM held_words;
 INSERT INTO physicality(entity,tier,hilbert,path)
@@ -34,7 +34,7 @@ DO $$
 DECLARE alpha blake3:=laplace_id('alpha'); beta blake3:=laplace_id('beta'); gamma blake3:=laplace_id('gamma');
         delta blake3:=laplace_id('delta'); one blake3:=laplace_id('one');
         meta bigint:=4294967296;  -- LP_SAID_METADATA in a vertex's M
-        first_line blake3; second_line blake3; body blake3; a blake3; b blake3; c blake3; trunk blake3;
+        first_line blake3; second_line blake3; body blake3; a blake3; b blake3; c blake3; d blake3; twice blake3; trunk blake3;
 BEGIN
   first_line:=pg_temp.held_node(ARRAY[alpha,beta]);
   second_line:=pg_temp.held_node(ARRAY[gamma,delta]);
@@ -49,6 +49,20 @@ BEGIN
        IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':3',b::text||':2',c::text||':1']) f)
   OR EXISTS(SELECT FROM laplace_held_files(ARRAY[alpha,gamma]) WHERE hubs<>0 OR cut OR levels<3) THEN
     RAISE EXCEPTION 'Native held files: content walk changed';
+  END IF;
+  -- each file's unit: the lowest node of its content holding every key the file holds, its path length, and how
+  -- many times each key stands below it
+  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma]))
+       IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':'||body::text||':2:{1,1}',
+         b::text||':'||second_line::text||':2:{0,1}',c::text||':'||first_line::text||':2:{1,0}']) f) THEN
+    RAISE EXCEPTION 'Native held files: units changed';
+  END IF;
+  -- a key said twice in a run stands twice below its unit, and the run counts in the unit's length
+  twice:=pg_temp.held_node(ARRAY[laplace_id('epsilon'),laplace_id('epsilon'),delta]);
+  d:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('two'),laplace_id('three')]),twice],ARRAY[meta,0]);
+  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text) FROM laplace_held_files(ARRAY[laplace_id('epsilon')]))
+       IS DISTINCT FROM ARRAY[d::text||':'||twice::text||':3:{2}'] THEN
+    RAISE EXCEPTION 'Native held files: occurrence counts changed';
   END IF;
   -- a trunk keeps the files under its spine
   IF (SELECT array_agg(file::text ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma],trunk))

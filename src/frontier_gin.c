@@ -696,13 +696,17 @@ Datum laplace_claims_each(PG_FUNCTION_ARGS){return read_claims(fcinfo,true);}
  * that holds a node as content; never through the OS record of a file, and a holder whose first vertex is that record
  * is a file, where the walk stops. Level zero is the capped GIN nomination of laplace_holders: a key held directly by
  * more than cap paths of a kind is a hub, its bit is set in hubs, and it is not walked. Every later level is one
- * direct-container frontier. trunk, when given, keeps the files under it (read down its spine by ID). One row a file;
- * a walk that reaches none returns one row with a null file, so hubs, levels and cut are always answered. */
+ * direct-container frontier. trunk, when given, keeps the files under it (read down its spine by ID). Each file comes
+ * with its unit, the lowest node of its content that holds every key the file holds (their common ancestor, never a key
+ * itself), that node's path length (its constituents, runs counted), and how many times each key stands below it (the
+ * walked DAG's multiplicity). One row a file; a walk that reaches none returns one row with a null file, so hubs, levels
+ * and cut are always answered. */
 typedef struct { uint64 keys; bool file; } HeldNode;
 typedef struct { uint64 epoch,held[2]; } HeldKey;
 typedef struct { lp_id holder,key; Datum path; } HeldFirst;
+typedef struct { uint64 times,visit; } HeldEdgeTimes;
 typedef struct {
-    lp_idmap *nodes,*front,*next,*keys;AttrNumber id,path,mask;int64 cap;uint64 epoch,saturated;
+    lp_idmap *nodes,*front,*next,*keys;lp_strmap *edges;AttrNumber id,path,mask;int64 cap;uint64 epoch,saturated,visit;
     lp_vec(HeldFirst) first;lp_vec(lp_vertex) vertices;size_t max_nodes;bool cut;MemoryContext owner;
 } HeldWalk;
 static HeldNode *held_node(HeldWalk *walk,const lp_id *id,bool *fresh)
@@ -711,7 +715,8 @@ static HeldNode *held_node(HeldWalk *walk,const lp_id *id,bool *fresh)
     if(*fresh)*node=(HeldNode){0};
     return node;
 }
-/* One holder of the front: it takes the keys of every front node it holds as content. */
+/* One holder of the front: it takes the keys of every front node it holds as content, and each such child is an edge
+ * of the walk with the times the holder says it (its runs, summed over the vertices that name it). */
 static void held_holder(HeldWalk *walk,const lp_id *holder,Datum value)
 {
     Geo geometry=geo_of(value);size_t count=geometry.p.n;if(!count)return;
@@ -729,6 +734,15 @@ static void held_holder(HeldWalk *walk,const lp_id *holder,Datum value)
     if(lp_idmap_find(walk->nodes,holder)<0 && lp_idmap_count(walk->nodes)>=walk->max_nodes){walk->cut=true;return;}
     bool fresh;HeldNode *node=held_node(walk,holder,&fresh);
     uint64 before=node->keys;node->keys|=gained;node->file|=file;
+    uint32 parent=(uint32)lp_idmap_find(walk->nodes,holder);walk->visit++;
+    for(size_t k=0;k<count;k++){
+        if(v[k].said==LP_SAID_METADATA || lp_idmap_find(walk->front,&v[k].id)<0)continue;
+        int64 child=lp_idmap_find(walk->nodes,&v[k].id);if(child<0)continue;
+        uint32 pair[2]={parent,(uint32)child};bool added;
+        HeldEdgeTimes *edge=lp_strmap_get(walk->edges,pair,sizeof pair,&added);
+        if(added || edge->visit!=walk->visit){edge->times=0;edge->visit=walk->visit;}
+        edge->times+=v[k].run?v[k].run:1;
+    }
     if(!file && (fresh || node->keys!=before))lp_idmap_put(walk->next,holder,NULL);
 }
 static void held_level(const lp_id *id,Datum path,Datum mask,void *context){(void)mask;held_holder(context,id,path);}
@@ -776,6 +790,48 @@ static void held_scope_row(const lp_id *id,Datum value,Datum mask,void *context)
     else for(size_t i=0;i<count;i++)if(v[i].said!=LP_SAID_METADATA)lp_idmap_put(scope->next,&v[i].id,NULL);
     pfree(v);
 }
+/* The walk read down: each node's children among the walked nodes, with the times each is said. */
+typedef struct { uint32 *head,*next,*child;uint64 *times;size_t keys,all;lp_idmap *memo; } HeldDown;
+/* How many times each key stands below a node, by the multiplicity of the walked DAG (saturating). A key is a leaf. */
+static const uint64 *held_counts(HeldWalk *walk,HeldDown *down,uint32 node,int depth)
+{
+    const lp_id *id=lp_idmap_key(walk->nodes,node);
+    uint64 *memo=lp_idmap_lookup(down->memo,id);if(memo)return memo;
+    uint64 *counts=palloc0(sizeof(uint64)*down->keys);
+    if(node<down->keys)counts[node]=1;
+    else if(depth<256)for(uint32 e=down->head[node];e!=UINT32_MAX;e=down->next[e]){
+        const uint64 *below=held_counts(walk,down,down->child[e],depth+1);
+        for(size_t k=0;k<down->keys;k++){
+            uint64 add=below[k]*down->times[e];
+            if(below[k] && (add/below[k]!=down->times[e] || counts[k]+add<counts[k]))counts[k]=UINT64_MAX;
+            else counts[k]+=add;
+        }
+    }
+    bool fresh;memcpy(lp_idmap_get(down->memo,id,&fresh),counts,sizeof(uint64)*down->keys);pfree(counts);
+    return lp_idmap_lookup(down->memo,id);
+}
+/* A file's unit: down from it, while a walked child holds every key the file holds and is no key itself, to the lowest
+ * such node, the keys' lowest common ancestor in its content. */
+static uint32 held_unit(HeldWalk *walk,HeldDown *down,uint32 file)
+{
+    uint64 want=((const HeldNode *)lp_idmap_at(walk->nodes,file))->keys;uint32 at=file;
+    for(int depth=0;depth<256;depth++){
+        uint32 next=UINT32_MAX;
+        for(uint32 e=down->head[at];e!=UINT32_MAX;e=down->next[e]){
+            uint32 child=down->child[e];
+            if(child>=down->all && ((const HeldNode *)lp_idmap_at(walk->nodes,child))->keys==want){next=child;break;}
+        }
+        if(next==UINT32_MAX)break;
+        at=next;
+    }
+    return at;
+}
+typedef struct { lp_idmap *length; } HeldLength;
+static void held_length_row(const lp_id *id,Datum value,Datum mask,void *context)
+{
+    (void)mask;HeldLength *read=context;Geo geometry=geo_of(value);bool fresh;
+    *(int64 *)lp_idmap_get(read->length,id,&fresh)=(int64)lp_path_len(geometry.p);
+}
 PG_FUNCTION_INFO_V1(laplace_held_files);
 Datum laplace_held_files(PG_FUNCTION_ARGS)
 {
@@ -785,9 +841,14 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
     int64 cap=PG_ARGISNULL(2)?-1:PG_GETARG_INT64(2),most=PG_ARGISNULL(3)?400000:PG_GETARG_INT64(3);
     if(cap<-1 || most<1)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_held_files: cap is -1 or more, max_nodes 1 or more")));
+    for(int i=0;i<count;i++)for(int j=0;j<i;j++)if(!memcmp(ids[i].b,ids[j].b,16))
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_held_files: keys are distinct")));
     HeldWalk walk={.nodes=lp_idmap_sized(sizeof(HeldNode)),.front=lp_idmap_new(),.next=lp_idmap_new(),
-        .keys=lp_idmap_sized(sizeof(HeldKey)),.cap=cap,.max_nodes=(size_t)most,.owner=CurrentMemoryContext};
+        .keys=lp_idmap_sized(sizeof(HeldKey)),.edges=lp_strmap_sized(sizeof(HeldEdgeTimes)),.cap=cap,.max_nodes=(size_t)most,
+        .owner=CurrentMemoryContext};
     lp_idmap *scope=NULL;uint64 hubs=0;int levels=0;
+    HeldDown down={.keys=(size_t)Min(count,64),.all=(size_t)Max(count,0),.memo=lp_idmap_sized(sizeof(uint64)*(size_t)Max(Min(count,64),1))};
+    HeldLength lengths={lp_idmap_sized(sizeof(int64))};
     PG_TRY();{
         for(int i=0;i<count;i++){
             bool fresh;HeldKey *key=lp_idmap_get(walk.keys,ids+i,&fresh);if(fresh)*key=(HeldKey){0};
@@ -822,27 +883,56 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
         }
         if(!PG_ARGISNULL(1)){
             const lp_id *trunk=(const lp_id *)DatumGetPointer(PG_GETARG_DATUM(1));
-            HeldScope down={lp_idmap_new(),lp_idmap_new(),trunk};
+            HeldScope scan={lp_idmap_new(),lp_idmap_new(),trunk};
             lp_idmap *front=lp_idmap_new();lp_idmap_put(front,trunk,NULL);
             for(int depth=0;depth<64 && lp_idmap_count(front);depth++){
-                lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),false,held_scope_row,&down);
-                lp_idmap_free(front);front=down.next;down.next=lp_idmap_new();
+                lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),false,held_scope_row,&scan);
+                lp_idmap_free(front);front=scan.next;scan.next=lp_idmap_new();
             }
-            lp_idmap_free(front);lp_idmap_free(down.next);scope=down.files;
+            lp_idmap_free(front);lp_idmap_free(scan.next);scope=scan.files;
         }
-        size_t emitted=0;
-        for(size_t i=0;i<lp_idmap_count(walk.nodes);i++){
+        /* the walk read down: children by parent, with their times */
+        size_t nodes=lp_idmap_count(walk.nodes),edges=lp_strmap_count(walk.edges);
+        down.head=palloc_extended(sizeof(uint32)*Max(nodes,1),MCXT_ALLOC_HUGE);
+        down.next=palloc_extended(sizeof(uint32)*Max(edges,1),MCXT_ALLOC_HUGE);
+        down.child=palloc_extended(sizeof(uint32)*Max(edges,1),MCXT_ALLOC_HUGE);
+        down.times=palloc_extended(sizeof(uint64)*Max(edges,1),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<nodes;i++)down.head[i]=UINT32_MAX;
+        for(size_t e=0;e<edges;e++){
+            size_t length;const uint32 *pair=(const uint32 *)lp_strmap_key(walk.edges,e,&length);
+            down.child[e]=pair[1];down.times[e]=((const HeldEdgeTimes *)lp_strmap_at(walk.edges,e))->times;
+            down.next[e]=down.head[pair[0]];down.head[pair[0]]=(uint32)e;
+        }
+        /* each file of the scope that holds a key, and its unit; the units' lengths in one read by ID */
+        lp_vec(uint32) files={0},units={0};lp_vec(lp_id) unit_ids={0};
+        for(size_t i=0;i<nodes;i++){
             const HeldNode *node=lp_idmap_at(walk.nodes,i);const lp_id *id=lp_idmap_key(walk.nodes,i);
             if(!node->file || !node->keys || (scope && lp_idmap_find(scope,id)<0))continue;
-            Datum values[]={id_datum(id),Int64GetDatum((int64)node->keys),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut)};
-            bool nulls[lengthof(values)]={false};set_put(fcinfo,output,descriptor,values,nulls);emitted++;
+            uint32 unit=held_unit(&walk,&down,(uint32)i);
+            lp_push(&files,(uint32)i);lp_push(&units,unit);lp_push(&unit_ids,*lp_idmap_key(walk.nodes,unit));
         }
-        if(!emitted){
-            Datum values[]={(Datum)0,Int64GetDatum(0),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut)};
-            bool nulls[lengthof(values)]={true,false,false,false,false};set_put(fcinfo,output,descriptor,values,nulls);
+        if(unit_ids.n)lp_pg_lookup_paths(unit_ids.v,unit_ids.n,false,held_length_row,&lengths);
+        for(size_t f=0;f<files.n;f++){
+            CHECK_FOR_INTERRUPTS();
+            const HeldNode *node=lp_idmap_at(walk.nodes,files.v[f]);
+            const uint64 *counts=held_counts(&walk,&down,units.v[f],0);
+            Datum *cells=palloc(sizeof(Datum)*Max(down.keys,1));
+            for(size_t k=0;k<down.keys;k++)cells[k]=Int64GetDatum(counts[k]>(uint64)PG_INT64_MAX?PG_INT64_MAX:(int64)counts[k]);
+            ArrayType *array=construct_array(cells,(int)down.keys,INT8OID,8,FLOAT8PASSBYVAL,TYPALIGN_DOUBLE);
+            int64 *length=lp_idmap_lookup(lengths.length,&unit_ids.v[f]);
+            Datum values[]={id_datum(lp_idmap_key(walk.nodes,files.v[f])),Int64GetDatum((int64)node->keys),Int64GetDatum((int64)hubs),
+                Int32GetDatum(levels),BoolGetDatum(walk.cut),id_datum(&unit_ids.v[f]),Int64GetDatum(length?*length:0),PointerGetDatum(array)};
+            bool nulls[lengthof(values)]={false};set_put(fcinfo,output,descriptor,values,nulls);
+            pfree(cells);
         }
+        if(!files.n){
+            Datum values[]={(Datum)0,Int64GetDatum(0),Int64GetDatum((int64)hubs),Int32GetDatum(levels),BoolGetDatum(walk.cut),(Datum)0,(Datum)0,(Datum)0};
+            bool nulls[lengthof(values)]={true,false,false,false,false,true,true,true};set_put(fcinfo,output,descriptor,values,nulls);
+        }
+        lp_vec_free(&files);lp_vec_free(&units);lp_vec_free(&unit_ids);
     }PG_FINALLY();{
         lp_idmap_free(walk.nodes);lp_idmap_free(walk.front);lp_idmap_free(walk.next);lp_idmap_free(walk.keys);
+        lp_strmap_free(walk.edges);lp_idmap_free(down.memo);lp_idmap_free(lengths.length);
         lp_vec_free(&walk.vertices);lp_vec_free(&walk.first);if(scope)lp_idmap_free(scope);
     }PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
