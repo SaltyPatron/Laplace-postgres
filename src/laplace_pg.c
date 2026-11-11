@@ -255,19 +255,22 @@ Datum laplace_series(PG_FUNCTION_ARGS){
     if ((size_t)counts[0] > MaxAllocSize / sizeof(lp_series_entry))
         ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("laplace_series: too many observations")));
     lp_series_entry *entries = palloc(sizeof(*entries) * (counts[0] ? counts[0] : 1));
+    size_t used = 0;
     for (int i = 0; i < counts[0]; i++) {
         for (int k = 0; k < 4; k++) if (nulls[k][i])
             ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace_series: null observation or cyclic witness lineage")));
         int64 games = DatumGetInt64(values[1][i]);
         double score = DatumGetFloat8(values[2][i]), trust = DatumGetFloat8(values[3][i]);
-        if (games < 0 || games > INT64CONST(9007199254740992) || !isfinite(score) || score < 0 || score > 1
-            || !isfinite(trust) || trust < 0 || trust > 1)
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_series: invalid games, mean score or trust")));
+        if (games == 0) continue;                                   /* an observation of no games says nothing */
         lp_id root; memcpy(root.b, DatumGetPointer(values[0][i]), sizeof root.b);
-        entries[i] = lp_series_observation(root, (uint64_t)games, (double)games * score, trust);
+        /* the one law for an attestation row, signed trust included (lp_series_attested) */
+        if (!isfinite(score) || score < 0 || score > 1
+            || !lp_series_attested(root, (double)games, (double)games * score, trust, &entries[used]))
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_series: invalid games, mean score or trust")));
+        used++;
     }
     lp_standing standing;
-    if (!lp_series(entries, (size_t)counts[0], &standing) || standing.matches > PG_INT64_MAX || standing.witnesses > PG_INT64_MAX)
+    if (!lp_series(entries, used, &standing) || standing.matches > PG_INT64_MAX || standing.witnesses > PG_INT64_MAX)
         ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("laplace_series: invalid or non-convergent rooted series")));
     pfree(entries);
     TupleDesc td;

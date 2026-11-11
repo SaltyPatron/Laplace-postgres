@@ -200,11 +200,10 @@ static void compute_attribution_rows(const lp_id *claims,int n,Oid idarr,const l
         for(size_t k=i;k<j;k++){
             const PgAttrRow *r=rows->v+k;const PgSeriesWitness *w=lp_idmap_lookup(batch->witnesses,&r->trunk);
             double trust=r->has_dependence?r->trust:w->trust;
-            if(!isfinite(r->games)||r->games<=0||r->games>9007199254740992.0||floor(r->games)!=r->games
-               ||!isfinite(r->score)||r->score<0||r->score>r->games||!isfinite(trust)||fabs(trust)>1)pg_series_invalid();
             lp_id root=pg_series_root(batch,r->has_dependence?r->dependence:w->has_lineage?w->lineage:r->trunk);
-            double score=r->score/r->games;if(trust<0)score=1-score;
-            lp_push(&batch->entries,lp_series_observation(root,(uint64_t)r->games,r->games*score,fabs(trust)));
+            lp_series_entry entry;                            /* the one law for an attestation row (lp_series_attested) */
+            if(!lp_series_attested(root,r->games,r->score,trust,&entry))pg_series_invalid();
+            lp_push(&batch->entries,entry);
         }
         lp_series_information *information=solved?NULL:palloc((j-i)*sizeof *information);size_t written=0;lp_standing standing;
         lp_rating prior=lp_rating_stock();
@@ -419,8 +418,8 @@ Datum laplace_series_snapshot(PG_FUNCTION_ARGS)
             while (at<batch->observations.n && lp_id_eq(&batch->observations.v[at].claim,ordered+i)) {
                 const PgSeriesObservation *o=batch->observations.v+at++;
                 lp_id root=pg_series_root(batch,o->has_lineage?o->lineage:o->witness);
-                double score=o->trust<0?1-o->score:o->score;
-                lp_series_entry entry=lp_series_observation(root,o->games,(double)o->games*score,fabs(o->trust));
+                lp_series_entry entry;                        /* the one law for an attestation row (lp_series_attested) */
+                if(!lp_series_attested(root,(double)o->games,(double)o->games*o->score,o->trust,&entry))pg_series_invalid();
                 lp_push(&batch->entries,entry);
             }
             Datum values[5]={id_datum(ordered+i),0,0,0,0}; bool missing[5]={false,true,true,true,true};
