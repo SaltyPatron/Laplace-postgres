@@ -241,24 +241,11 @@ BEGIN
     SELECT array_agg(c ORDER BY c) INTO claims FROM (SELECT DISTINCT unnest(changed) AS c) selected;
   END IF;
   IF claims IS NULL THEN RETURN 0; END IF;
-
-  PERFORM pg_advisory_xact_lock(1279348803, h)
-  FROM (SELECT DISTINCT get_byte(decode(left(c::text, 2), 'hex'), 0) / 16 AS h
-        FROM unnest(claims) c ORDER BY h) buckets;
-
-  WITH evaluated AS MATERIALIZED (SELECT * FROM @extschema@.laplace_series_snapshot(pending,claims)),
-  updated AS (
-    UPDATE @extschema@.consensus old SET rating=e.rating,deviation=e.deviation,
-      volatility=e.volatility,matches=e.matches FROM evaluated e
-    WHERE e.rating IS NOT NULL AND old.claim OPERATOR(@extschema@.=) e.claim RETURNING old.claim
-  ), inserted AS (
-    INSERT INTO @extschema@.consensus (claim,rating,deviation,volatility,matches)
-    SELECT e.claim,e.rating,e.deviation,e.volatility,e.matches FROM evaluated e
-    WHERE e.rating IS NOT NULL AND NOT EXISTS(SELECT FROM updated u WHERE u.claim OPERATOR(@extschema@.=) e.claim)
-    ORDER BY e.claim RETURNING claim
-  ), removed AS (
-    DELETE FROM @extschema@.consensus old USING evaluated e WHERE old.claim OPERATOR(@extschema@.=) e.claim AND e.rating IS NULL RETURNING old.claim
-  ) SELECT (SELECT count(*) FROM updated)+(SELECT count(*) FROM inserted)+(SELECT count(*) FROM removed) INTO affected;
+  -- One standing write: the claims as a changed set, through laplace_attest_stage.
+  CREATE TEMP TABLE IF NOT EXISTS laplace_attest_changed (claim @extschema@.blake3 PRIMARY KEY) ON COMMIT DROP;
+  TRUNCATE laplace_attest_changed;
+  INSERT INTO laplace_attest_changed SELECT DISTINCT c FROM unnest(claims) c;
+  affected := @extschema@.laplace_attest_stage(pending, 'pg_temp.laplace_attest_changed'::regclass);
   RETURN affected;
 END $$;
 

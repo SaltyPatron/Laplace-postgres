@@ -18,7 +18,7 @@ typedef lp_vec(PgWNode) PgWNodes;
 typedef lp_vec(PgEdge)  PgEdges;
 typedef lp_vec(uint64_t) PgOrdinals;
 typedef struct { lp_idmap *m; PgWNodes n; PgEdges e; } PgDag;
-typedef struct { double games, tokens, score; uint32_t position; lp_id claim, dependence; double dependence_trust; uint8_t has_dependence; } PgTally;
+typedef struct { lp_tally t; lp_id claim, dependence; double dependence_trust; uint8_t has_dependence; } PgTally;
 
 static size_t pg_dag_node(PgDag *d, const lp_id *id, int *fresh_out)
 {
@@ -52,12 +52,23 @@ static void *pg_down_array(size_t count,size_t width,bool zero)
 }
 
 /* Source roots share one containment DAG. Its adjacency and topological order
- * do not depend on which root is being counted; prepare them once, rather than
- * rebuilding both over the entire estate for each witness. */
+ * do not depend on which root is being counted; prepare them once (Native
+ * lp_dag_order), then count under each root (Native lp_dag_count, which
+ * allocates nothing, so an interrupt between edges leaks nothing). */
+typedef struct { const PgDag *d; const size_t *head; size_t calls; bool interruptible; } PgEdgeReader;
+static int pg_edge_next(void *context, size_t node, size_t *cursor, size_t *child, uint64_t *times)
+{
+    PgEdgeReader *r = context;
+    if (r->interruptible && !(++r->calls & 4095)) CHECK_FOR_INTERRUPTS();
+    size_t k = *cursor ? r->d->e.v[*cursor - 1].next : r->head[node];
+    if (k == PG_NONE) return 1;
+    *cursor = k + 1; *child = r->d->e.v[k].c; *times = r->d->e.v[k].times;
+    return 0;
+}
+
 static PgDown pg_down_prepare(PgDag *d)
 {
     size_t n = d->n.n;
-    int *indeg = pg_down_array(n,sizeof *indeg,true);
     size_t *head = pg_down_array(n,sizeof *head,false);
     for (size_t i = 0; i < n; i++) head[i] = PG_NONE;
     for (size_t k = 0; k < d->e.n; k++) {
@@ -66,36 +77,20 @@ static PgDown pg_down_prepare(PgDag *d)
          * Civil Comments alone has over 290 million containment edges. */
         d->e.v[k].next = head[d->e.v[k].p];
         head[d->e.v[k].p] = k;
-        indeg[d->e.v[k].c]++;
     }
-    size_t *q = pg_down_array(n,sizeof *q,false), qh = 0, qt = 0;
-    for (size_t i = 0; i < n; i++) if (!indeg[i]) q[qt++] = i;
-    while (qh < qt) {
-        if (!(qh & 4095)) CHECK_FOR_INTERRUPTS();
-        size_t p = q[qh++];
-        for (size_t k = head[p]; k != PG_NONE; k = d->e.v[k].next) {
-            size_t c = d->e.v[k].c;
-            if (!--indeg[c]) q[qt++] = c;
-        }
-    }
-    pfree(indeg);
-    return (PgDown){head,q,qt};
+    size_t *order = pg_down_array(n,sizeof *order,false);
+    PgEdgeReader r = { .d=d,.head=head };
+    if (!lp_dag_order(n, pg_edge_next, &r, order))
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace containment is not a DAG: %m")));
+    return (PgDown){head,order,n};
 }
 
 static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
 {
-    size_t n = d->n.n;
-    double *cnt = pg_down_array(n,sizeof *cnt,true);
-    cnt[top] = 1.0;
-    for (size_t i = 0; i < walk->n; i++) {
-        if (!(i & 4095)) CHECK_FOR_INTERRUPTS();
-        size_t p = walk->order[i];
-        /* Topology is already established, so an unreachable parent needs no
-         * edge arithmetic. Reachable additions retain their original order. */
-        if (cnt[p] == 0) continue;
-        for (size_t k = walk->head[p]; k != PG_NONE; k = d->e.v[k].next)
-            cnt[d->e.v[k].c] += cnt[p] * (double)d->e.v[k].times;
-    }
+    double *cnt = pg_down_array(d->n.n,sizeof *cnt,false);
+    PgEdgeReader r = { .d=d,.head=walk->head,.interruptible=true };
+    if (!lp_dag_count(d->n.n, pg_edge_next, &r, walk->order, top, cnt))
+        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace containment count failed: %m")));
     return cnt;
 }
 
@@ -111,17 +106,13 @@ static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_cla
         const PgEdge *e = &d->e.v[k];
         if (!e->claim) continue;
         double c = cnt[e->p]; if (c <= 0) continue;
-        double g = e->rec ? c * (double)e->times : c;
-        double tk = c * (double)e->times;
-        double s = g * lp_outcome_score(e->outcome, e->spare);
         bool fresh;
         uint8_t key[32]={0}; memcpy(key,d->n.v[e->c].id.b,16);
         if (e->has_dependence) memcpy(key+16,e->dependence.b,16);
         PgTally *t = lp_strmap_get(per_claim,key,sizeof key,&fresh);
         if (fresh) *t = (PgTally){ .claim=d->n.v[e->c].id,.dependence=e->dependence,
             .dependence_trust=e->dependence_trust,.has_dependence=e->has_dependence };
-        t->games += g; t->tokens += tk; t->score += s;
-        if (e->position && (!t->position || e->position < t->position)) t->position = e->position;
+        lp_tally_edge(&t->t, c, e->times, e->rec, e->outcome, e->spare, e->position);
     }
 }
 
@@ -277,9 +268,9 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         double *counts=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
         pg_tally_under(&d,counts,per_claim);
         for(size_t j=0;j<lp_strmap_count(per_claim);j++){
-            const PgTally *t=lp_strmap_at(per_claim,j);if(t->games<=0)continue;
-            Datum values[8]={id_datum(root),id_datum(&t->claim),Float8GetDatum(t->games),Float8GetDatum(t->tokens),
-                Float8GetDatum(t->score),Int32GetDatum((int32)t->position),
+            const PgTally *t=lp_strmap_at(per_claim,j);if(t->t.games<=0)continue;
+            Datum values[8]={id_datum(root),id_datum(&t->claim),Float8GetDatum(t->t.games),Float8GetDatum(t->t.tokens),
+                Float8GetDatum(t->t.wins),Int32GetDatum((int32)t->t.position),
                 t->has_dependence?id_datum(&t->dependence):(Datum)0,
                 t->has_dependence?Float8GetDatum(t->dependence_trust):(Datum)0};
             bool nulls[8]={false,false,false,false,false,false,!t->has_dependence,!t->has_dependence};
@@ -416,9 +407,9 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
         pg_tally_under(&d, cnt, per_claim);
         for (size_t i = 0; i < lp_strmap_count(per_claim); i++) {
             const PgTally *tl = lp_strmap_at(per_claim, i);
-            if (tl->games <= 0) continue;
-            PgAttrRow row = { .claim=tl->claim,.trunk=tid,.games=tl->games,.tokens=tl->tokens,.score=tl->score,
-                .position=tl->position,.trust=tl->has_dependence ? tl->dependence_trust : tr,.witness=is_w,
+            if (tl->t.games <= 0) continue;
+            PgAttrRow row = { .claim=tl->claim,.trunk=tid,.games=tl->t.games,.tokens=tl->t.tokens,.score=tl->t.wins,
+                .position=tl->t.position,.trust=tl->has_dependence ? tl->dependence_trust : tr,.witness=is_w,
                 .dependence=tl->dependence,.source_trust=tr,.has_dependence=tl->has_dependence };
             lp_push(out, row);
         }
@@ -641,19 +632,12 @@ static void pg_testimony_root(const void *dag_ptr,const void *walk_ptr,const uin
     const PgDag *d=dag_ptr;const PgDown *walk=walk_ptr;
     PgTestimony *out=context;const lp_id *source=&d->n.v[top].id;
     if(out->sources && lp_idmap_find(out->sources,source)<0)return;
-    if(walk->n!=d->n.n)
-        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("Native testimony containment is cyclic")));
-    uint64_t *counts=pg_down_array(d->n.n,sizeof(*counts),true);counts[top]=1;
-    for(size_t i=0;i<walk->n;i++){
-        if(!(i&4095))CHECK_FOR_INTERRUPTS();
-        size_t p=walk->order[i];if(!counts[p])continue;
-        for(size_t k=walk->head[p];k!=PG_NONE;k=d->e.v[k].next){
-            const PgEdge *e=d->e.v+k;uint64_t n=pg_testimony_product(counts[p],e->times);
-            if(counts[e->c]>(uint64_t)PG_INT64_MAX-n)
-                ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony multiplicity exceeds bigint")));
-            counts[e->c]+=n;
-        }
-    }
+    uint64_t *counts=pg_down_array(d->n.n,sizeof(*counts),false);
+    PgEdgeReader reader={.d=d,.head=walk->head,.interruptible=true};
+    if(!lp_dag_count_exact(d->n.n,pg_edge_next,&reader,walk->order,top,counts))
+        ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony multiplicity exceeds bigint")));
+    for(size_t i=0;i<d->n.n;i++)if(counts[i]>(uint64_t)PG_INT64_MAX)
+        ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("Native testimony multiplicity exceeds bigint")));
     for(size_t k=0;k<d->e.n;k++){
         if(!(k&4095))CHECK_FOR_INTERRUPTS();
         const PgEdge *e=d->e.v+k;if(!e->claim || !counts[e->p])continue;
