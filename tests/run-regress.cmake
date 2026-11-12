@@ -63,14 +63,14 @@ if(WIN32)
   execute_process(COMMAND "${pwsh}" -NoLogo -NoProfile -File "${SOURCE}/tests/run-regress.ps1"
     -PgRegress "${PG_REGRESS}" -PgBin "${PG_BINDIR}" -InputRoot "${SOURCE}/tests"
     -BuildRoot "${build_root}" -Config "${config}"
-    WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 150)
+    WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 600)
 else()
 execute_process(COMMAND "${PG_REGRESS}" "--bindir=${PG_BINDIR}"
   "--inputdir=${SOURCE}/tests" "--outputdir=${output}"
   "--temp-instance=${instance}" "--temp-config=${config}"
   --no-locale --encoding=UTF8 --load-extension=postgis --load-extension=laplace
   ${regression_cases}
-  WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 150)
+  WORKING_DIRECTORY "${build_root}" RESULT_VARIABLE result TIMEOUT 600)
 endif()
 # Stop a private server even when the driver times out before its own teardown.
 # Both paths are fixed children of this verified build root; installed clusters
