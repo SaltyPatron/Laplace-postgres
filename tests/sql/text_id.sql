@@ -35,6 +35,13 @@ BEGIN
      OR laplace_text_id('') IS NOT NULL OR laplace_text_id(NULL) IS NOT NULL THEN
     RAISE EXCEPTION 'grapheme composition, byte preservation or empty-content semantics failed';
   END IF;
+  -- Periodic blocks factor through Native lp_factor: banana is b [an]x2 a; a run of one codepoint stays flat.
+  IF laplace_text_id('banana') <> laplace_compose(ARRAY[laplace_cp_id(98),
+         laplace_compose(ARRAY[laplace_cp_id(97),laplace_cp_id(110)]),
+         laplace_compose(ARRAY[laplace_cp_id(97),laplace_cp_id(110)]),laplace_cp_id(97)])
+     OR laplace_text_id('aaaa') <> laplace_compose(ARRAY[laplace_cp_id(97),laplace_cp_id(97),laplace_cp_id(97),laplace_cp_id(97)]) THEN
+    RAISE EXCEPTION 'periodic blocks did not factor as the Native segmentation law says';
+  END IF;
   FOREACH content IN ARRAY ARRAY['banana','mississippi',E'First sentence.\nSecond sentence.',E'a\n\nb','  punctuation; and spaces!  '] LOOP
     IF laplace_text_id(content) <> laplace_id(content) THEN
       RAISE EXCEPTION 'Native composition routes disagree for %', content;
