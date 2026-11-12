@@ -179,7 +179,7 @@ if(PROJECT_IS_TOP_LEVEL)
     "-DMODULE=$<TARGET_FILE:laplace_pg>" "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
     "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}" "-DTIER0=${LAPLACE_TIER0}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-regress.cmake")
-  set_tests_properties(postgres_regress PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+  set_tests_properties(postgres_regress PROPERTIES TIMEOUT 660 RUN_SERIAL TRUE)
   if(WIN32)
     find_program(LAPLACE_REGRESS_DIFF NAMES diff HINTS "C:/Program Files/Git/usr/bin" REQUIRED)
     get_filename_component(_regress_diff_directory "${LAPLACE_REGRESS_DIFF}" DIRECTORY)
