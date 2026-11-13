@@ -9,9 +9,14 @@ on:
   push:
     branches: [main]
   pull_request:
+# A newer push or PR update supersedes an older run of the same ref; a manual run is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 jobs:
   extension:
     runs-on: [self-hosted, laplace, Laplace-postgres]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with: { path: Laplace-postgres }
@@ -45,6 +50,7 @@ jobs:
     needs: extension
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, laplace, Laplace-postgres]
+    timeout-minutes: 10
     steps:
       - name: hart-server deploys main (Laplace-Operations)
         env:
