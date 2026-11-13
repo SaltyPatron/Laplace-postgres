@@ -114,7 +114,8 @@ DO $$ DECLARE merged record; said public.blake3:=public.laplace_compose(ARRAY[pu
  IF (SELECT fact FROM public.laplace_claim_preview(ARRAY[said]))<>'b' THEN
   RAISE EXCEPTION 'namespace claim preview changed selected content';
  END IF;
- IF public.laplace_attest_series('stage.check_schema_attestation',ARRAY[public.laplace_id('lpcheckschema')])<>0 THEN
+ -- The claim this block made (a series is published for claim paths; a bare word is refused as no claim).
+ IF public.laplace_attest_series('stage.check_schema_attestation',ARRAY[said])<>0 THEN
   RAISE EXCEPTION 'namespace publication created evidence';
  END IF;
 END $$;
