@@ -426,6 +426,10 @@ CREATE FUNCTION @extschema@.laplace_parts(text) RETURNS @extschema@.blake3[]
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_parts';
 
+CREATE FUNCTION @extschema@.laplace_segments(text, OUT i bigint, OUT segment text, OUT id @extschema@.blake3) RETURNS SETOF record
+    LANGUAGE c IMMUTABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_segments';
+
 CREATE FUNCTION @extschema@.laplace_path_ewkb(@extschema@.blake3[]) RETURNS bytea
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_path_ewkb';
@@ -1023,6 +1027,8 @@ COMMENT ON FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blak
 COMMENT ON FUNCTION @extschema@.laplace_enrich_stage(input regclass, target regclass) IS 'Enrich existing Native carriers from an UNLOGGED stage set, routing copied keys by destination partition with work_mem-sized SPI buffers. Parent-table privileges, guards and transaction boundaries are preserved.';
 
 COMMENT ON FUNCTION @extschema@.laplace_curves(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT curve_ewkb bytea) IS 'Each input occurrence''s realized curve: the LINESTRING ZM EWKB through its constituents'' real coordinates (Tier-0 floor for atoms, entity.coord otherwise) in path order with every repetition, as laplace_couple realizes the curves it measures. Give these curves to laplace_frechet4d, laplace_hausdorff4d, laplace_dtw4d or laplace_edr4d; the packed path carries identity, never shape. NULL for an atom, an absent entity, more than 1024 constituents, or fewer than two realized vertices.';
+
+COMMENT ON FUNCTION @extschema@.laplace_segments(text, OUT i bigint, OUT segment text, OUT id @extschema@.blake3) IS 'The decomposer''s word segments of a text in source order, whitespace and punctuation included (tailored UAX #29, the segmentation laplace_id composes): each segment''s surface and identity. The surfaces concatenate to the text byte for byte; invalid or empty UTF-8 has none.';
 
 COMMENT ON FUNCTION @extschema@.laplace_ensure_stage() IS 'Prepare three UNLOGGED column templates once; readiness does not loop over partitions, scan pending rows, or truncate data.';
 

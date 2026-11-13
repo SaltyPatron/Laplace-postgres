@@ -122,6 +122,7 @@ laplace_resolve_ref	false
 laplace_resolve_refs	false
 laplace_project_path	false
 laplace_said	false
+laplace_segments	false
 laplace_series	false
 laplace_series_snapshot	true
 laplace_stage_compatible	false
