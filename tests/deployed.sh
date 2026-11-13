@@ -68,15 +68,21 @@ trap 'rm -rf "$work"' EXIT
   { echo 'deployed.sh: extension laplace is not installed in schema public' >&2; exit 1; }
 sql <<'SQL'
 DO $$ BEGIN
-  IF NOT (SELECT count(*) > 0 AND bool_and(p.probin = '$libdir/laplace')
+  -- The build names the module by its content (cmake/PackageModule.cmake: $libdir/laplace_<20 hex>).
+  IF NOT (SELECT count(*) > 0 AND count(DISTINCT p.probin) = 1
+                 AND bool_and(p.probin ~ '^\$libdir/laplace(_[0-9a-f]{20})?$')
           FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
           JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
           WHERE e.extname='laplace' AND d.deptype='e' AND p.probin IS NOT NULL) THEN
-    RAISE EXCEPTION 'extension functions are not bound to the installed module $libdir/laplace';
+    RAISE EXCEPTION 'extension functions are not all bound to one installed laplace module: %',
+      (SELECT string_agg(DISTINCT p.probin, ', ')
+       FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
+       JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
+       WHERE e.extname='laplace' AND d.deptype='e' AND p.probin IS NOT NULL);
   END IF;
 END $$;
 SQL
-echo 'PASS extension functions are bound to $libdir/laplace'
+echo 'PASS extension functions are bound to one installed laplace module'
 
 # Regression cases. Results go to scratch; psql's relative include of the
 # shared geometry fixture resolves against the driver's working directory.
