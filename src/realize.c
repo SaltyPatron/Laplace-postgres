@@ -250,8 +250,9 @@ Datum laplace_paths(PG_FUNCTION_ARGS){
 
 /* Ordered packed constituents of a set, decoded by the owner of the Native
  * carrier. Generic PostGIS/legacy mantissa decoders do not share this layout. */
-static void constituent_output_row(const lp_id *id,Datum path,Datum mask,void *context){
-    PathOutput *output=context;Geo geometry=geo_of(path);lp_path p=geometry.p;
+typedef struct { PathOutput output; int32 depth; lp_idmap *expanded; lp_vec(lp_id) next; } BelowOutput;
+static void constituent_rows(PathOutput *output,const lp_id *id,Datum path,Datum mask,BelowOutput *below){
+    Geo geometry=geo_of(path);lp_path p=geometry.p;
     bool is_tuple=(lp_pg_mask_native(mask)&lp_pg_kind_mask("tuple"))!=0;
     if(p.n>PG_INT32_MAX)ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("too many packed constituents")));
     for(size_t i=0;i<p.n;i++){
@@ -260,10 +261,15 @@ static void constituent_output_row(const lp_id *id,Datum path,Datum mask,void *c
         uint64 bits=lp_m_bits(m);
         if(is_tuple && !lp_m_said(m))bits|=(uint64)LP_SAID_TUPLE<<LP_M_RUN_BITS;
         Datum values[]={id_datum(id),Int32GetDatum((int32)i+1),id_datum(&child),
-            Int32GetDatum((int32)lp_path_run(p,i)),Int64GetDatum((int64)bits)};
-        bool nulls[]={false,false,false,false,false};
+            Int32GetDatum((int32)lp_path_run(p,i)),Int64GetDatum((int64)bits),Int32GetDatum(below?below->depth:0)};
+        bool nulls[]={false,false,false,false,false,false};
         set_put(output->call,output->rows,output->descriptor,values,nulls);
+        if(below){bool fresh;lp_idmap_put(below->expanded,&child,&fresh);if(fresh)lp_push(&below->next,child);}
     }
+}
+static void constituent_output_row(const lp_id *id,Datum path,Datum mask,void *context){constituent_rows(context,id,path,mask,NULL);}
+static void below_output_row(const lp_id *id,Datum path,Datum mask,void *context){
+    BelowOutput *below=context;constituent_rows(&below->output,id,path,mask,below);
 }
 PG_FUNCTION_INFO_V1(laplace_constituents);
 Datum laplace_constituents(PG_FUNCTION_ARGS){
@@ -274,5 +280,25 @@ Datum laplace_constituents(PG_FUNCTION_ARGS){
         PathOutput output={fcinfo,rows,descriptor};
         lp_pg_lookup_paths(lp_idmap_keys(unique),lp_idmap_count(unique),true,constituent_output_row,&output);
     }PG_FINALLY();{lp_idmap_free(unique);}PG_END_TRY();
+    pfree(ids);PG_RETURN_NULL();
+}
+
+/* laplace_below(ids, depth): the downward closure of laplace_constituents. Depth 1 is each input's constituents, each
+ * later depth the constituents of the children not yet expanded; every parent expanded once, one path read a depth. */
+PG_FUNCTION_INFO_V1(laplace_below);
+Datum laplace_below(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;Tuplestorestate *rows=set_begin(fcinfo,"laplace_below",&descriptor);
+    int32 depth=PG_GETARG_INT32(1);
+    if(depth<0)ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_below: depth must not be negative")));
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    BelowOutput below={{fcinfo,rows,descriptor},0,lp_idmap_new(),{0}};lp_vec(lp_id) frontier={0};
+    PG_TRY();{
+        for(int i=0;i<count;i++){bool fresh;lp_idmap_put(below.expanded,ids+i,&fresh);if(fresh)lp_push(&frontier,ids[i]);}
+        for(int32 d=1;d<=depth && frontier.n;d++){
+            CHECK_FOR_INTERRUPTS();below.depth=d;below.next.n=0;
+            lp_pg_lookup_paths(frontier.v,frontier.n,true,below_output_row,&below);
+            frontier.n=0;for(size_t i=0;i<below.next.n;i++)lp_push(&frontier,below.next.v[i]);
+        }
+    }PG_FINALLY();{lp_idmap_free(below.expanded);lp_vec_free(&below.next);lp_vec_free(&frontier);}PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
 }

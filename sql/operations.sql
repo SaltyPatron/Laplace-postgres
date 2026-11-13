@@ -107,6 +107,46 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_constituents(ids @extschema@.blak
     LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_constituents';
 
+-- Walks over the stored DAG and the rated claims: each one Native frontier, one set read a level.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_precedes(@extschema:postgis@.geometry, @extschema@.blake3[]) RETURNS @extschema@.blake3[]
+    AS 'MODULE_PATHNAME', 'laplace_precedes' LANGUAGE C IMMUTABLE STRICT COST 1000 PARALLEL SAFE;
+COMMENT ON FUNCTION @extschema@.laplace_precedes(@extschema:postgis@.geometry, @extschema@.blake3[])
+    IS 'Antecedents: the ID of the constituent before every run of the phrase inside the path (within a run its own constituent), the mirror of laplace_follows; NULL when nothing precedes. Packed vertices are compared as identities, never as geometry.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_below(ids @extschema@.blake3[], depth integer DEFAULT 1,
+    OUT parent @extschema@.blake3, OUT ordinal integer, OUT child @extschema@.blake3,
+    OUT run_length integer, OUT flags bigint, OUT depth integer) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_below';
+COMMENT ON FUNCTION @extschema@.laplace_below(@extschema@.blake3[], integer)
+    IS 'Downward closure of laplace_constituents: depth 1 is each input''s constituents (vertex ordinal, run and flags as laplace_constituents gives them), each later depth the constituents of the children not yet expanded. Every parent is expanded once; one path read a depth.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_above(ids @extschema@.blake3[], hops integer DEFAULT 1, cap bigint DEFAULT 1000,
+    OUT entity @extschema@.blake3, OUT tier smallint, OUT hops integer) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_above';
+COMMENT ON FUNCTION @extschema@.laplace_above(@extschema@.blake3[], integer, bigint)
+    IS 'Upward containment closure: hop 1 every direct container of the IDs through the container index (no mask), each later hop the direct containers of the previous hop''s new entities. Every entity once, at the first hop it is met; inputs excluded. At most cap rows, in hop order then ID order; one container read a hop and one tier read a call.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_pull(seeds @extschema@.blake3[], goals @extschema@.blake3[] DEFAULT NULL,
+    hops integer DEFAULT 4, fan bigint DEFAULT 64, nodes bigint DEFAULT 4096,
+    middle @extschema@.blake3[] DEFAULT NULL, refuse @extschema@.blake3[] DEFAULT '{}',
+    k double precision DEFAULT 2, per_hop double precision DEFAULT 0.05,
+    OUT ordinal bigint, OUT id @extschema@.blake3, OUT seed @extschema@.blake3, OUT via @extschema@.blake3,
+    OUT claim @extschema@.blake3, OUT relation @extschema@.blake3, OUT rating double precision,
+    OUT deviation double precision, OUT cost double precision, OUT hops integer, OUT hub boolean,
+    OUT goal boolean, OUT chain @extschema@.blake3[], OUT claims @extschema@.blake3[]) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256
+    AS 'MODULE_PATHNAME', 'laplace_pull';
+COMMENT ON FUNCTION @extschema@.laplace_pull(@extschema@.blake3[], @extschema@.blake3[], integer, bigint, bigint, @extschema@.blake3[], @extschema@.blake3[], double precision, double precision)
+    IS 'Best-first search over rated claims (Native lp_frontier, crossing cost lp_cost(rating, k, per_hop)), the law of the Engine''s pull: seeds open at cost 0; open entities of least cost close in batches; each closed short of hops is read through its claims of three constituents (laplace_claims_each, either end, middle qualified by middle, refusals out) at most fan an entity, crossing from one end to the other. An entity holding more than fan claims is a hub, reached and not crossed; a seed is crossed through its fan lowest-ID claims. Stops when nothing is open, nodes entities are closed, or every goal is closed. One row a closed entity in close order with its seed, the entity and claim it was reached through, that claim''s middle and standing, the chain cost, hops, and the chain of entities and claims from its seed.';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_chains(roots @extschema@.blake3[], steps @extschema@.blake3[],
+    programs integer[], depths integer[], inverse boolean[], cap bigint DEFAULT 4096,
+    OUT root integer, OUT program integer, OUT path bigint, OUT depth integer, OUT claim @extschema@.blake3,
+    OUT entity @extschema@.blake3, OUT relation @extschema@.blake3, OUT rating double precision,
+    OUT deviation double precision, OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256
+    AS 'MODULE_PATHNAME', 'laplace_chains';
+COMMENT ON FUNCTION @extschema@.laplace_chains(@extschema@.blake3[], @extschema@.blake3[], integer[], integer[], boolean[], bigint)
+    IS 'Declared paths over rated claims: every root walks every program, one claim of three constituents a depth. Step i allows middle steps[i] at 0-based depth depths[i] of 1-based program programs[i], read from the subject (the path starts with the node) or, inverse, from the object. One set read a depth for the whole frontier; only complete paths are returned, one row a step with a per-call path index. A frontier or a depth''s reading larger than cap is an error and returns nothing partial.';
+
 -- A load owns its private relations through a session lock on the control
 -- connection. Catalog comments retain that ownership after a client crash;
 -- neither a timer nor a currently idle writer proves a load is abandoned.
