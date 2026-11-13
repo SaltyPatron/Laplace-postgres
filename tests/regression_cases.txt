@@ -21,3 +21,4 @@ held_files
 frontier_runtime
 function_bindings
 walks
+chess

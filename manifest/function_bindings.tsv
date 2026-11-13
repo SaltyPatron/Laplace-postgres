@@ -29,6 +29,10 @@ laplace_centroid4d_step	false
 laplace_claims	false
 laplace_claims_each	false
 laplace_claim_preview	false
+laplace_chess_at	false
+laplace_chess_fingerprint	false
+laplace_chess_next	false
+laplace_chess_records_ewkb	false
 laplace_constituents	false
 laplace_clean_stage	true
 laplace_stage_partitions	true

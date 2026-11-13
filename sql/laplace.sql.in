@@ -171,6 +171,29 @@ CREATE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[], fan bi
 
     AS 'MODULE_PATHNAME', 'laplace_claims_each';
 
+CREATE FUNCTION @extschema@.laplace_chess_at(section text, slots integer[], OUT ordinal integer, OUT id @extschema@.blake3) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_chess_at';
+
+CREATE FUNCTION @extschema@.laplace_chess_fingerprint() RETURNS text
+    LANGUAGE c STABLE PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_chess_fingerprint';
+
+CREATE FUNCTION @extschema@.laplace_chess_next(positions @extschema@.blake3[], moves @extschema@.blake3[], OUT ordinal integer, OUT next @extschema@.blake3) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_chess_next';
+
+CREATE FUNCTION @extschema@.laplace_chess_records_ewkb(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord bytea, OUT hilbert bigint) RETURNS SETOF record
+    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_chess_records_ewkb';
+
+CREATE FUNCTION @extschema@.laplace_chess_records(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord @extschema:postgis@.geometry, OUT hilbert bigint) RETURNS SETOF record
+    LANGUAGE sql STABLE STRICT ROWS 64 PARALLEL SAFE
+    BEGIN ATOMIC
+ SELECT r.ordinal, r.section, r.slot, r.tier, @extschema:postgis@.st_geomfromewkb(r.coord) AS coord, r.hilbert
+   FROM @extschema@.laplace_chess_records_ewkb(ids) r;
+END;
+
 CREATE FUNCTION @extschema@.laplace_clean_stage(paths regclass) RETURNS bigint
     LANGUAGE c STRICT
 
@@ -1059,6 +1082,12 @@ COMMENT ON FUNCTION @extschema@.laplace_series_snapshot(pending regclass, change
 COMMENT ON FUNCTION @extschema@.laplace_stage_snapshot(pending regclass, changed regclass, OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) IS 'One Native calculation for the supplied stage-resident claim set, sharing indexed carrier proofs, witness registry, lineage resolution and containment DAG; no fixed claim slicing or recursive SQL.';
 
 COMMENT ON FUNCTION @extschema@.laplace_text_batch(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) IS 'Realize selected Native identities together, preserving input occurrences and runs while reading shared DAG descendants once. Transfer windows follow work_mem and PostgreSQL array capacity.';
+
+COMMENT ON FUNCTION @extschema@.laplace_chess_records(@extschema@.blake3[]) IS 'The chess perf-cache (laplace.chess, written by laplace chess): for each requested ID the module holds, its section, slot, tier, real coordinate and stored Hilbert key. O(1) expected per ID through the module''s ID index; a miss is no row and no statement of absence.';
+
+COMMENT ON FUNCTION @extschema@.laplace_chess_next(@extschema@.blake3[], @extschema@.blake3[]) IS 'The chess perf-cache''s deterministic (position, move) -> position for admitted transitions: O(log n) binary search on the full 32-byte key per pair; a miss is no row.';
+
+COMMENT ON FUNCTION @extschema@.laplace_chess_at(text, integer[]) IS 'The chess perf-cache''s records by direct address: the IDs at these slots of a section (square, piece_square, side, number, castling, en_passant, move; board, position, transition). O(1) per slot.';
 
 COMMENT ON FUNCTION @extschema@.laplace_text_id(text) IS 'Canonical Native UAX #29 codepoint/grapheme/word/phrase composition, identical to Engine text ingestion. Empty content returns NULL; source bytes are not normalized.';
 
