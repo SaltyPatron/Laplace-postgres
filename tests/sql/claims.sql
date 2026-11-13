@@ -3,12 +3,16 @@
 \pset tuples_only on
 SET client_min_messages=warning;
 -- Selected claims share Native set access, including qualification before fan.
+-- The database is shared: leaves are IDs no other content holds, and every
+-- statement is rolled back.
 BEGIN;
+CREATE FUNCTION pg_temp.leaf(n integer) RETURNS blake3 LANGUAGE sql IMMUTABLE
+RETURN md5('Laplace check regression claims leaf '||n)::blake3;
 CREATE TEMP TABLE selected_claim_fixture AS
 SELECT label,ids,laplace_compose(ids) id FROM
  (VALUES('ab',ARRAY[97,98]),('acb',ARRAY[97,99,98]),('adb',ARRAY[97,100,98]),
         ('abb',ARRAY[97,98,98]),('af',ARRAY[97,102])) v(label,codepoints)
-CROSS JOIN LATERAL (SELECT array_agg(laplace_cp_id(cp) ORDER BY ordinal) ids
+CROSS JOIN LATERAL (SELECT array_agg(pg_temp.leaf(cp) ORDER BY ordinal) ids
  FROM unnest(codepoints) WITH ORDINALITY u(cp,ordinal)) p;
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT id,laplace_tier(label),laplace_coord(label),laplace_hilbert(label) FROM selected_claim_fixture;
@@ -18,7 +22,7 @@ FROM selected_claim_fixture f JOIN entity e ON e.id=f.id;
 -- An unscored claim exists but cannot consume a scored responder's place.
 INSERT INTO consensus SELECT id,1550,60,0.06,5000000001 FROM selected_claim_fixture WHERE label<>'af';
 DO $$
-DECLARE a blake3:=laplace_cp_id(97); b blake3:=laplace_cp_id(98); c blake3:=laplace_cp_id(99);
+DECLARE a blake3:=pg_temp.leaf(97); b blake3:=pg_temp.leaf(98); c blake3:=pg_temp.leaf(99);
         keys blake3[];bits smallint[]:=ARRAY[laplace_bank_bit('kind','claim')];expected blake3;
 BEGIN
  keys:=ARRAY[a,'00000000000000000000000000000000'::blake3,a,b];
@@ -83,14 +87,14 @@ BEGIN
  EXCEPTION WHEN invalid_parameter_value THEN NULL;
  END;
  IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c]))<>3
- OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c,laplace_cp_id(100)]))<>6
+ OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[c,pg_temp.leaf(100)]))<>6
  OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[b]))<>3
  OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,ARRAY[a]))
  OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,'{}'::blake3[]))
  OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL::blake3[]))<>12
  OR (SELECT count(*) FROM laplace_claims_each(keys,1,bits,'{}',1::smallint,ARRAY[c]))<>2
  OR (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,
-        ARRAY(SELECT laplace_cp_id(i) FROM generate_series(1000,1600) i)||ARRAY[c]))<>3 THEN
+        ARRAY(SELECT pg_temp.leaf(i) FROM generate_series(1000,1600) i)||ARRAY[c]))<>3 THEN
   RAISE EXCEPTION 'Native indexed middle selection lost union, endpoint/RLE qualification, complete operand windows or fan';
  END IF;
  IF (SELECT count(*) FROM laplace_claims_each(keys,NULL,bits,'{}',3::smallint,NULL,3))<>9

@@ -2,6 +2,8 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
+-- Temporary tables only; the transaction is rolled back.
+BEGIN;
 \ir geometry_cases.sql
 DO $$
 DECLARE r record; actual blake3[];
@@ -65,4 +67,5 @@ BEGIN
     END;
   END LOOP;
 END $$;
+ROLLBACK;
 SELECT 'geometry: all seven ZM families, 2/3/8 vertices, RLE, empties and EWKB roundtrip passed';

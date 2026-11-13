@@ -2,48 +2,47 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages=warning;
+-- The database is shared: the words are content no source holds, the role,
+-- grants and stage tables are this case's own, and the transaction is rolled back.
 BEGIN;
-\if :{?writer}
-\else
-SELECT 'laplace_routing_'||pg_backend_pid() AS writer \gset
+SELECT 'laplace_check_routing_'||pg_backend_pid() AS writer \gset
 CREATE ROLE :"writer";
-\endif
 SET LOCAL work_mem = '64kB';
 SELECT laplace_ensure_stage();
 CREATE TEMP TABLE routing_words AS
-SELECT 'stageenrich' || chr(97+i%26) || chr(97+(i/26)%26) || chr(97+(i/676)%26) AS content
+SELECT 'lpcheckstageenrich' || chr(97+i%26) || chr(97+(i/26)%26) || chr(97+(i/676)%26) AS content
 FROM generate_series(0,2048) i;
-CREATE UNLOGGED TABLE stage.routing_entities (LIKE stage.entity INCLUDING DEFAULTS);
-CREATE UNLOGGED TABLE stage.routing_paths (LIKE stage.physicality INCLUDING DEFAULTS);
+CREATE UNLOGGED TABLE stage.check_routing_entities (LIKE stage.entity INCLUDING DEFAULTS);
+CREATE UNLOGGED TABLE stage.check_routing_paths (LIKE stage.physicality INCLUDING DEFAULTS);
 CREATE FUNCTION pg_temp.routing_batch() RETURNS void LANGUAGE SQL AS $$
-  INSERT INTO stage.routing_entities(id,tier,coord,hilbert)
+  INSERT INTO stage.check_routing_entities(id,tier,coord,hilbert)
     SELECT laplace_id(content),laplace_tier(content),laplace_coord(content),laplace_hilbert(content) FROM routing_words;
-  INSERT INTO stage.routing_paths(entity,tier,hilbert,path)
+  INSERT INTO stage.check_routing_paths(entity,tier,hilbert,path)
     SELECT laplace_id(content),laplace_tier(content),laplace_hilbert(content),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(content,'') c)) FROM routing_words;
 $$;
 SELECT pg_temp.routing_batch();
 DO $$ DECLARE result record; BEGIN
-  SELECT * INTO result FROM laplace_merge_stage('stage.routing_entities','stage.routing_paths');
+  SELECT * INTO result FROM laplace_merge_stage('stage.check_routing_entities','stage.check_routing_paths');
   IF result.entity_rows<>2049 OR result.physicality_rows<>2049 OR result.updated_rows<>0 THEN
     RAISE EXCEPTION 'partition routing changed insertion counts: %',result;
   END IF;
 END $$;
 SELECT pg_temp.routing_batch();
-UPDATE stage.routing_entities SET mask=laplace_mask_slot('kind','record');
-UPDATE stage.routing_paths SET mask=laplace_mask_slot('kind','tuple');
+UPDATE stage.check_routing_entities SET mask=laplace_mask_slot('kind','record');
+UPDATE stage.check_routing_paths SET mask=laplace_mask_slot('kind','tuple');
 -- Parent UPDATE privileges must suffice even though routing prunes child
 -- targets. The maintenance-test role has no UPDATE grant on any child.
 GRANT USAGE ON SCHEMA stage TO :"writer";
-GRANT SELECT ON stage.routing_entities,stage.routing_paths TO :"writer";
+GRANT SELECT ON stage.check_routing_entities,stage.check_routing_paths TO :"writer";
 GRANT SELECT,INSERT,UPDATE ON public.entity,public.physicality TO :"writer";
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
-  IF laplace_enrich_stage('stage.routing_entities','public.entity')<>2049
-     OR laplace_enrich_stage('stage.routing_paths','public.physicality')<>2049 THEN
+  IF laplace_enrich_stage('stage.check_routing_entities','public.entity')<>2049
+     OR laplace_enrich_stage('stage.check_routing_paths','public.physicality')<>2049 THEN
     RAISE EXCEPTION 'small-memory routing lost a changed carrier';
   END IF;
-  PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.routing_paths'));
+  PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.check_routing_paths'));
 END $$;
 RESET SESSION AUTHORIZATION;
 DO $$ BEGIN
@@ -59,15 +58,15 @@ END $$;
 -- Column UPDATE/SELECT grants on the parent remain sufficient as well.
 REVOKE SELECT,UPDATE ON public.entity FROM :"writer";
 GRANT SELECT(id,tier,mask),UPDATE(tier,mask) ON public.entity TO :"writer";
-UPDATE stage.routing_entities SET mask=mask|laplace_mask_slot('kind','tuple');
+UPDATE stage.check_routing_entities SET mask=mask|laplace_mask_slot('kind','tuple');
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
   IF (SELECT array_agg(ordinal ORDER BY ordinal) FROM laplace_present_ids(
-      ARRAY[(SELECT id FROM public.entity ORDER BY id LIMIT 1),laplace_id('not in this routing fixture'),
-            (SELECT id FROM public.entity ORDER BY id LIMIT 1)])) IS DISTINCT FROM ARRAY[1,3]::bigint[] THEN
+      ARRAY[laplace_id('lpcheckstageenrichaaa'),laplace_id('not in this routing fixture'),
+            laplace_id('lpcheckstageenrichaaa')])) IS DISTINCT FROM ARRAY[1,3]::bigint[] THEN
     RAISE EXCEPTION 'Native presence lost duplicate ordinals, admitted an absent ID or required child grants';
   END IF;
-  IF laplace_enrich_stage('stage.routing_entities','public.entity')<>2049 THEN
+  IF laplace_enrich_stage('stage.check_routing_entities','public.entity')<>2049 THEN
     RAISE EXCEPTION 'parent column grants were not preserved';
   END IF;
 END $$;
@@ -83,10 +82,10 @@ END $$;
 RESET SESSION AUTHORIZATION;
 REVOKE UPDATE(tier,mask) ON public.entity FROM :"writer";
 GRANT SELECT ON public.entity TO :"writer";
-TRUNCATE stage.routing_entities,stage.routing_paths;
+TRUNCATE stage.check_routing_entities,stage.check_routing_paths;
 SELECT pg_temp.routing_batch();
 DO $$ DECLARE result record; BEGIN
-  SELECT * INTO result FROM laplace_merge_stage('stage.routing_entities','stage.routing_paths');
+  SELECT * INTO result FROM laplace_merge_stage('stage.check_routing_entities','stage.check_routing_paths');
   IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>0 THEN
     RAISE EXCEPTION 'routed replay changed existing carriers: %',result;
   END IF;
@@ -95,19 +94,19 @@ DO $$ DECLARE result record; BEGIN
     RAISE EXCEPTION 'public input accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
   BEGIN
-    PERFORM laplace_enrich_stage('stage.routing_entities','stage.routing_paths');
+    PERFORM laplace_enrich_stage('stage.check_routing_entities','stage.check_routing_paths');
     RAISE EXCEPTION 'noncanonical destination accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
-CREATE UNLOGGED TABLE stage.routing_wrong_type(id text,tier smallint,mask bit(64));
-CREATE UNLOGGED TABLE stage.routing_null_id AS SELECT NULL::blake3 AS id,1::smallint AS tier,B'0'::bit(64) AS mask;
+CREATE UNLOGGED TABLE stage.check_routing_wrong_type(id text,tier smallint,mask bit(64));
+CREATE UNLOGGED TABLE stage.check_routing_null_id AS SELECT NULL::blake3 AS id,1::smallint AS tier,B'0'::bit(64) AS mask;
 DO $$ BEGIN
   BEGIN
-    PERFORM laplace_enrich_stage('stage.routing_wrong_type','public.entity');
+    PERFORM laplace_enrich_stage('stage.check_routing_wrong_type','public.entity');
     RAISE EXCEPTION 'non-Native ID type accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
   BEGIN
-    IF laplace_enrich_stage('stage.routing_null_id','public.entity')<>0 THEN
+    IF laplace_enrich_stage('stage.check_routing_null_id','public.entity')<>0 THEN
       RAISE EXCEPTION 'null input acquired a destination';
     END IF;
   EXCEPTION WHEN null_value_not_allowed THEN NULL; END;
@@ -117,11 +116,11 @@ REVOKE UPDATE ON public.entity,public.physicality FROM :"writer";
 SET SESSION AUTHORIZATION :"writer";
 DO $$ BEGIN
   BEGIN
-    PERFORM laplace_enrich_stage('stage.routing_entities','public.entity');
+    PERFORM laplace_enrich_stage('stage.check_routing_entities','public.entity');
     RAISE EXCEPTION 'unchanged input bypassed destination UPDATE privileges';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   BEGIN
-    PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.routing_paths'));
+    PERFORM laplace_clean_partitions(laplace_stage_partitions('stage.check_routing_paths'));
     RAISE EXCEPTION 'deferred maintenance bypassed destination write privileges';
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
 END $$;

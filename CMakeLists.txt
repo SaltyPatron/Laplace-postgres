@@ -169,21 +169,5 @@ if(PROJECT_IS_TOP_LEVEL)
     "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}" "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/configure-incremental.cmake")
   set_tests_properties(configure_incremental PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
-  find_program(LAPLACE_PG_REGRESS NAMES pg_regress
-               HINTS "${LAPLACE_PG_DIR}/lib/pgxs/src/test/regress" "${LAPLACE_PG_DIR}/bin")
-  if(NOT LAPLACE_PG_REGRESS)
-    message(FATAL_ERROR "PostgreSQL regression driver not found under LAPLACE_PG_DIR")
-  endif()
-  add_test(NAME postgres_regress COMMAND ${CMAKE_COMMAND}
-    "-DPG_REGRESS=${LAPLACE_PG_REGRESS}" "-DPG_BINDIR=${PG_bindir}"
-    "-DMODULE=$<TARGET_FILE:laplace_pg>" "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
-    "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}" "-DTIER0=${LAPLACE_TIER0}"
-    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run-regress.cmake")
-  set_tests_properties(postgres_regress PROPERTIES TIMEOUT 660 RUN_SERIAL TRUE)
-  if(WIN32)
-    find_program(LAPLACE_REGRESS_DIFF NAMES diff HINTS "C:/Program Files/Git/usr/bin" REQUIRED)
-    get_filename_component(_regress_diff_directory "${LAPLACE_REGRESS_DIFF}" DIRECTORY)
-    set_tests_properties(postgres_regress PROPERTIES
-      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_regress_diff_directory}")
-  endif()
+  # Database regressions run against the deployed extension: tests/deployed.sh.
 endif()

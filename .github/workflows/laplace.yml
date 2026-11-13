@@ -1,5 +1,6 @@
-# Build and qualify the candidate extension in a private package directory and scratch database.
-# Shared installation and declared-database migration belong to Operations deployment after merge.
+# Build the candidate extension and run the checks that need no database: no step here starts a server, makes a
+# database or connects to one. Installation belongs to Operations' deployment after merge, and the regression cases
+# (tests/deployed.sh) run there, against the deployed database and the installed extension (laplace.yml, job tests).
 name: Laplace-postgres
 env:
   LAPLACE_CONNINFO: ""   # laplace.env's
@@ -32,10 +33,12 @@ jobs:
             -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_OPERATIONS:PATH="$GITHUB_WORKSPACE/Laplace-Operations"
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
           ctest --test-dir "$LAPLACE_BUILD/Laplace-postgres/icx-release" --output-on-failure
-      - name: Install and execute the candidate in an isolated database
+      - name: Function bindings declared by the build
+        run: node Laplace-postgres/tools/check-function-bindings.mjs "$LAPLACE_BUILD/Laplace-postgres/icx-release"
+      - name: The database checks parse (they run after deployment, in Laplace-Operations)
         run: |
-          . Laplace-Operations/laplace.env
-          bash Laplace-postgres/tests/extension-install.sh "$LAPLACE_BUILD/Laplace-postgres/icx-release"
+          bash -n Laplace-postgres/tests/deployed.sh
+          python3 -m py_compile Laplace-postgres/tests/stage-lifecycle.py
   # Every merge to main that passes deploys hart-server: Laplace-Operations' deployment runs with every repository at its
   # main (its laplace.yml, on a repository_dispatch main-merged; the token is the secret LAPLACE_CHECKOUT, agents.sh's).
   deploy:

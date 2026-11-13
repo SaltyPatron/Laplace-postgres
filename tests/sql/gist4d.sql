@@ -2,7 +2,9 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
-SET search_path = laplace, public;
+-- Temporary tables only; the transaction is rolled back.
+BEGIN;
+SET LOCAL search_path = laplace, public;
 CREATE TEMP TABLE curves (id integer PRIMARY KEY, trajectory geometry);
 -- Most curves have the query's box and endpoints, but visit its interior in
 -- the wrong order. Their bound is zero while their exact distance is large.
@@ -57,29 +59,12 @@ BEGIN
     RAISE EXCEPTION 'native fourth-axis or PostGIS 2D operator semantics changed';
   END IF;
 END $$;
-RESET search_path;
--- Exercise an actual install into an independently owned application schema.
--- Transaction rollback restores the regression database's extension and data.
-BEGIN;
-DROP EXTENSION laplace CASCADE;
+-- The installed identity type and the Native 4D operator in its own namespace.
 DO $$ BEGIN
-  IF to_regnamespace('laplace') IS NULL THEN CREATE SCHEMA laplace; END IF;
-END $$;
-CREATE TABLE laplace.install_owner_probe (id integer PRIMARY KEY);
-INSERT INTO laplace.install_owner_probe VALUES (17);
-CREATE EXTENSION laplace WITH SCHEMA public;
-DO $$
-BEGIN
-  IF (SELECT count(*) FROM laplace.install_owner_probe WHERE id=17) <> 1
-     OR EXISTS (SELECT FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid
-                WHERE d.classid='pg_namespace'::regclass AND d.objid='laplace'::regnamespace
-                  AND d.refclassid='pg_extension'::regclass AND d.deptype='e' AND e.extname='laplace') THEN
-    RAISE EXCEPTION 'Native install changed the existing application namespace';
-  END IF;
   IF (SELECT typlen FROM pg_type WHERE oid='public.blake3'::regtype) <> 16
      OR to_regtype('public.blake3[]') IS NULL
      OR ST_MakePoint(0,0,0,0) OPERATOR(laplace.<->) ST_MakePoint(0,0,0,1) <> 1 THEN
-    RAISE EXCEPTION 'Native identity or 4D operator is unavailable after shared-schema install';
+    RAISE EXCEPTION 'Native identity or 4D operator is unavailable in the installed schema';
   END IF;
 END $$;
 ROLLBACK;
