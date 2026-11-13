@@ -300,6 +300,15 @@ Datum laplace_follows(PG_FUNCTION_ARGS){
     if (k == 0) PG_RETURN_NULL();
     PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, out, (int)(k < cap ? k : cap)));
 }
+/* Antecedents: the ID before every run of the phrase inside the path. */
+PG_FUNCTION_INFO_V1(laplace_precedes);
+Datum laplace_precedes(PG_FUNCTION_ARGS){
+    Geo g = geo_of(PG_GETARG_DATUM(0)); int np; lp_id *phrase = ids_of(PG_GETARG_ARRAYTYPE_P(1), &np);
+    size_t cap = g.p.n * 4 + 16; lp_id *out = palloc(sizeof(lp_id) * cap);
+    size_t k = lp_path_precedes(g.p, phrase, (size_t)np, out, cap);
+    if (k == 0) PG_RETURN_NULL();
+    PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, out, (int)(k < cap ? k : cap)));
+}
 
 /* ---------------------------------------------------------------- 4D geometry on real coordinates */
 PG_FUNCTION_INFO_V1(laplace_distance4d);

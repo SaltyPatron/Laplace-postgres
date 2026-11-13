@@ -148,3 +148,8 @@ laplace_standings	false
 laplace_source_attribution	true
 laplace_source_standings	true
 laplace_path_has_roles	false
+laplace_above	false
+laplace_below	false
+laplace_chains	true
+laplace_precedes	false
+laplace_pull	true
