@@ -596,6 +596,14 @@ CREATE FUNCTION @extschema@.laplace_text_id(text) RETURNS @extschema@.blake3
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_text_id';
 
+CREATE FUNCTION @extschema@.laplace_text_id(bytea) RETURNS @extschema@.blake3
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_text_id';
+
+CREATE FUNCTION @extschema@.laplace_text_is(text, text, text) RETURNS boolean
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_text_is';
+
 CREATE FUNCTION @extschema@.laplace_tier(text) RETURNS smallint
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_tier';
@@ -1041,5 +1049,9 @@ COMMENT ON FUNCTION @extschema@.laplace_stage_snapshot(pending regclass, changed
 COMMENT ON FUNCTION @extschema@.laplace_text_batch(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) IS 'Realize selected Native identities together, preserving input occurrences and runs while reading shared DAG descendants once. Transfer windows follow work_mem and PostgreSQL array capacity.';
 
 COMMENT ON FUNCTION @extschema@.laplace_text_id(text) IS 'Canonical Native UAX #29 codepoint/grapheme/word/phrase composition, identical to Engine text ingestion. Empty content returns NULL; source bytes are not normalized.';
+
+COMMENT ON FUNCTION @extschema@.laplace_text_id(bytea) IS 'The same composition of UTF-8 content given as bytes, which carries U+0000 where text cannot. Empty, malformed or noncanonical UTF-8 returns NULL.';
+
+COMMENT ON FUNCTION @extschema@.laplace_text_is(text, text, text) IS 'Whether every codepoint of the text has the Unicode property value (laplace_is per codepoint), e.g. White_Space Yes for a text of white space only. Empty text returns NULL.';
 
 COMMENT ON OPERATOR laplace.<-> (@extschema:postgis@.geometry, @extschema:postgis@.geometry) IS 'Native 4D discrete Frechet distance, equal to chord distance for two points. Use OPERATOR(laplace.<->).';

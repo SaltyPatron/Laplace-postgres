@@ -129,6 +129,7 @@ laplace_text_batch	false
 laplace_text_coord_ewkb	false
 laplace_text_hilbert	false
 laplace_text_id	false
+laplace_text_is	false
 laplace_tier	false
 laplace_type	false
 laplace_type_edges	false

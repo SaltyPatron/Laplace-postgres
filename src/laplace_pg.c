@@ -381,11 +381,15 @@ static Datum said(int64 cp, text *property){
     const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(property); uint32 v = lp_flags_get(l, (uint32)cp, f);
     return PointerGetDatum(cstring_to_text(f->nvalues ? l->value[f->first + v].say : v ? "Yes" : "No"));
 }
+static uint32 value_of(const lp_layout *l, const lp_field *f, text *value){
+    char *vn = text_to_cstring(value); int32 want = lp_flags_value(l, f, vn);
+    if (want < 0) ereport(ERROR, (errmsg("laplace: the standard lists no value \"%s\" for %s", vn, f->say)));
+    return (uint32)want;
+}
 static int is(int64 cp, text *property, text *value){
     if (cp < 0 || cp >= LP_NCP) return -1;
-    const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(property); char *vn = text_to_cstring(value); int32 want = lp_flags_value(l, f, vn);
-    if (want < 0) ereport(ERROR, (errmsg("laplace: the standard lists no value \"%s\" for %s", vn, f->say)));
-    return lp_flags_get(l, (uint32)cp, f) == (uint32)want;
+    const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(property);
+    return lp_flags_get(l, (uint32)cp, f) == value_of(l, f, value);
 }
 PG_FUNCTION_INFO_V1(laplace_cp_flags);
 Datum laplace_cp_flags(PG_FUNCTION_ARGS){
@@ -400,6 +404,19 @@ PG_FUNCTION_INFO_V1(laplace_cp_is);
 Datum laplace_cp_is(PG_FUNCTION_ARGS){ int r = is(PG_GETARG_INT32(0), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
 PG_FUNCTION_INFO_V1(laplace_is);
 Datum laplace_is(PG_FUNCTION_ARGS){ int r = is(cp_of_id((const uint8 *)PG_GETARG_POINTER(0)), PG_GETARG_TEXT_PP(1), PG_GETARG_TEXT_PP(2)); if (r < 0) PG_RETURN_NULL(); PG_RETURN_BOOL(r); }
+/* Whether every codepoint of a text has the value: laplace_text_is(s, 'White_Space', 'Yes') is a text of white space
+ * only. NULL for empty text, as for laplace_text_id. */
+PG_FUNCTION_INFO_V1(laplace_text_is);
+Datum laplace_text_is(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); const uint8 *s = (const uint8 *)VARDATA_ANY(t); size_t n = VARSIZE_ANY_EXHDR(t), i = 0;
+    if (n == 0) PG_RETURN_NULL();
+    const lp_layout *l = lp_pg_flags(); const lp_field *f = field_of(PG_GETARG_TEXT_PP(1)); uint32 want = value_of(l, f, PG_GETARG_TEXT_PP(2));
+    while (i < n) {
+        uint32_t cp; if (!lp_utf8_next(s, n, &i, &cp) || cp >= LP_NCP) PG_RETURN_NULL();
+        if (lp_flags_get(l, cp, f) != want) PG_RETURN_BOOL(false);
+    }
+    PG_RETURN_BOOL(true);
+}
 PG_FUNCTION_INFO_V1(laplace_codepoint);
 Datum laplace_codepoint(PG_FUNCTION_ARGS){ int64 cp = cp_of_id((const uint8 *)PG_GETARG_POINTER(0)); if (cp < 0) PG_RETURN_NULL(); PG_RETURN_INT32((int32)cp); }
 
