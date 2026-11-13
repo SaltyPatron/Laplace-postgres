@@ -45,6 +45,7 @@ laplace_cp_flags	false
 laplace_cp_id	false
 laplace_cp_is	false
 laplace_cp_said	false
+laplace_curves	true
 laplace_direction4d_ewkb	false
 laplace_distance4d	false
 laplace_dtw4d	false

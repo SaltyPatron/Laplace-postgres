@@ -9,6 +9,7 @@ gist4d
 text_id
 realization_depth
 projection
+curves
 attestation
 stage
 stage_routing

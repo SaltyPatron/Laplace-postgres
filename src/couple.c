@@ -218,12 +218,18 @@ static void emit(Field *f, const lp_id *id, int occ, int route, const lp_rating 
     if (vert) o[10] = PointerGetDatum(id_array_of(f->el, vert, nvert)); else { nl[10] = true; o[10] = 0; }
     set_put(f->fcinfo, f->ts, f->td, o, nl);
 }
-/* Every ID's real coordinate, in one read: a map from ID to its four doubles, those with none left out. */
+/* Every ID's real coordinate: an atom's from the Tier-0 floor, every other one from its entity row in one read; a map
+ * from ID to its four doubles, those with neither left out. */
 typedef struct { double x[4]; bool has; } Coord4;
 static void coords_spi(Oid idarr, lp_idmap *at){
     size_t n = lp_idmap_count(at); if (!n) return;
-    Datum a[1] = { PointerGetDatum(id_array_of(get_element_type(idarr), lp_idmap_keys(at), (int)n)) }; Oid t[1] = { idarr };
-    if (lp_pg_execute_args("SELECT e.id, e.coord FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: coordinates")));
+    const lp_tier0_record *floor = lp_pg_tier0(); lp_id *rest = palloc(sizeof(lp_id) * n); int nr = 0;
+    for (size_t i = 0; i < n; i++) { Coord4 *c = lp_idmap_at(at, i); const lp_tier0_record *atom = lp_tier0_find(floor, lp_idmap_key(at, i));
+        if (atom) { lp_coord k; memcpy(k.m, atom->m, sizeof k.m); lp_coord_xyzm(&k, c->x); c->has = true; } else rest[nr++] = *lp_idmap_key(at, i); }
+    if (!nr) { pfree(rest); return; }
+    Datum a[1] = { PointerGetDatum(id_array_of(get_element_type(idarr), rest, nr)) }; Oid t[1] = { idarr };
+    pfree(rest);
+    if (lp_pg_execute_args("SELECT e.id, e.coord FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace: coordinates")));
     for (uint64 r = 0; r < SPI_processed; r++) {
         bool nl; Datum g = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl); if (nl) continue;
         Coord4 *c = lp_idmap_lookup(at, (const lp_id *)DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)));
@@ -310,5 +316,50 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
     }
     lp_idmap_free(seen); lp_vec_free(&cv);
     SPI_finish();
+    PG_RETURN_NULL();
+}
+
+/* ---------------------------------------------------------------- CURVES, the shape a trajectory realizes
+ * laplace_curves(ids): each entity's realized curve, the LINESTRING ZM through its constituents' real coordinates in
+ * path order, every repetition kept, as COUPLE realizes the curves it measures (2 to 1024 constituents; a constituent
+ * with no coordinate is left out). The curve is what the shape measures (laplace_frechet4d, laplace_hausdorff4d,
+ * laplace_dtw4d, laplace_edr4d) are given; the packed path's carrier doubles are identity, never shape. One row an
+ * input occurrence, in input order; curve_ewkb is null for an atom, an absent entity, or fewer than two realized
+ * vertices. */
+typedef struct { lp_id *v; int nv; } CurveSlot;
+typedef struct { lp_idmap *slots; MemoryContext keep; } CurveRead;
+static void curve_path(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask; CurveRead *r = context; CurveSlot *s = lp_idmap_lookup(r->slots, id); if (!s || s->v) return;
+    Geo g = geo_of(path); size_t n = lp_path_len(g.p); if (n < 2 || n > 1024) return;
+    MemoryContext previous = MemoryContextSwitchTo(r->keep);
+    s->v = palloc(sizeof(lp_id) * n); s->nv = (int)lp_path_expand(g.p, s->v, n);
+    MemoryContextSwitchTo(previous);
+}
+PG_FUNCTION_INFO_V1(laplace_curves);
+Datum laplace_curves(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_curves", &td);
+    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
+    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    CurveRead r = { lp_idmap_sized(sizeof(CurveSlot)), CurrentMemoryContext };
+    for (int i = 0; i < n; i++) lp_idmap_put(r.slots, &ids[i], NULL);
+    lp_pg_lookup_paths(lp_idmap_keys(r.slots), lp_idmap_count(r.slots), false, curve_path, &r);
+    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_curves: SPI_connect")));
+    lp_idmap *kc = lp_idmap_sized(sizeof(Coord4)); size_t most = 0;
+    for (size_t s = 0; s < lp_idmap_count(r.slots); s++) { CurveSlot *c = lp_idmap_at(r.slots, s);
+        for (int k = 0; k < c->nv; k++) lp_idmap_put(kc, &c->v[k], NULL); if ((size_t)c->nv > most) most = (size_t)c->nv; }
+    coords_spi(idarr, kc);
+    SPI_finish();
+    double *b = palloc(sizeof(double) * 4 * (most ? most : 1));
+    for (int i = 0; i < n; i++) {
+        const CurveSlot *c = lp_idmap_lookup(r.slots, &ids[i]); int nb = 0;
+        for (int k = 0; c && k < c->nv; k++) { const Coord4 *x = lp_idmap_lookup(kc, &c->v[k]); if (x && x->has) memcpy(b + 4 * nb++, x->x, 32); }
+        Datum o[3]; bool nl[3] = { false, false, nb < 2 };
+        o[0] = Int64GetDatum((int64)i + 1); o[1] = id_datum(&ids[i]); o[2] = (Datum)0;
+        if (nb >= 2) { size_t need = lp_ewkb_line_zm(b, (size_t)nb, NULL, NULL, 0); bytea *e = palloc(VARHDRSZ + need); SET_VARSIZE(e, VARHDRSZ + need);
+            if (lp_ewkb_line_zm(b, (size_t)nb, NULL, (uint8 *)VARDATA(e), need) != need) ereport(ERROR, (errmsg("laplace_curves: curve encoding failed")));
+            o[2] = PointerGetDatum(e); }
+        set_put(fcinfo, ts, td, o, nl);
+    }
+    lp_idmap_free(kc); lp_idmap_free(r.slots);
     PG_RETURN_NULL();
 }
