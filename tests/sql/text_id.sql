@@ -48,7 +48,26 @@ BEGIN
     IF laplace_text_id(content) <> laplace_id(content) THEN
       RAISE EXCEPTION 'Native composition routes disagree for %', content;
     END IF;
+    IF laplace_text_id(convert_to(content, 'UTF8')) IS DISTINCT FROM laplace_text_id(content) THEN
+      RAISE EXCEPTION 'UTF-8 bytes and text compose differently for %', content;
+    END IF;
   END LOOP;
+  -- Bytes carry U+0000, which text cannot; malformed or empty bytes have no identity.
+  IF laplace_text_id('\x00'::bytea) IS DISTINCT FROM laplace_cp_id(0)
+     OR laplace_text_id('\x610062'::bytea) IS NULL
+     OR laplace_text_id('\x610062'::bytea) = laplace_text_id('ab')
+     OR laplace_text_id('\xff'::bytea) IS NOT NULL OR laplace_text_id('\xc0af'::bytea) IS NOT NULL
+     OR laplace_text_id(''::bytea) IS NOT NULL THEN
+    RAISE EXCEPTION 'byte content identity failed';
+  END IF;
+  -- A property of every codepoint of a text: one codepoint that differs makes it false.
+  IF laplace_text_is(E' \t\n' || chr(160) || chr(8199) || chr(8239), 'White_Space', 'Yes') IS NOT TRUE
+     OR laplace_text_is(' a ', 'White_Space', 'Yes') IS NOT FALSE
+     OR laplace_text_is('ab', 'White_Space', 'No') IS NOT TRUE
+     OR laplace_text_is('', 'White_Space', 'Yes') IS NOT NULL
+     OR laplace_text_is(' ', 'White_Space', 'Yes') IS DISTINCT FROM laplace_is(32, 'White_Space', 'Yes') THEN
+    RAISE EXCEPTION 'text property law failed';
+  END IF;
 END $$;
 ROLLBACK;
 -- A second transaction reuses the backend context and its Native/ICU arenas.
