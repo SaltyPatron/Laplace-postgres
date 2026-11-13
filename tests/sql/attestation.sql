@@ -2,8 +2,12 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
+-- The case runs on the deployed database in one transaction that it rolls
+-- back. Its content, claims and witnesses are check-unique compositions, and
+-- every read and write is keyed by them; the stage schema already exists.
 BEGIN;
-CREATE SCHEMA IF NOT EXISTS stage;
+CREATE FUNCTION pg_temp.leaf(n integer) RETURNS blake3 LANGUAGE sql IMMUTABLE
+  RETURN md5('Laplace check regression attestation leaf '||n)::blake3;
 CREATE UNLOGGED TABLE stage.attestation_test (
   claim blake3 NOT NULL, witness blake3 NOT NULL, lineage blake3,
   games bigint NOT NULL, score double precision NOT NULL, trust double precision NOT NULL,
@@ -12,7 +16,7 @@ CREATE UNLOGGED TABLE stage.attestation_test (
 
 -- Real canonical content, coordinates and containment paths. Tier-0 atoms
 -- remain in the mapped cache; no codepoint rows are inserted in the database.
-CREATE TEMP TABLE series_words AS SELECT unnest(ARRAY['dog','is','noun','source','file','one','two','three']) AS content;
+CREATE TEMP TABLE series_words AS SELECT unnest(ARRAY['lpcheckxdog','lpcheckxis','lpcheckxnoun','lpcheckxsource','lpcheckxfile','lpcheckxone','lpcheckxtwo','lpcheckxthree']) AS content;
 INSERT INTO entity (id, tier, coord, hilbert)
   SELECT laplace_id(content), laplace_tier(content), laplace_coord(content), laplace_hilbert(content) FROM series_words;
 INSERT INTO physicality (entity, tier, hilbert, path)
@@ -23,8 +27,11 @@ LANGUAGE plpgsql AS $$
 DECLARE composed blake3 := laplace_compose(parts); point geometry; path geometry := laplace_path(parts);
         coord geometry; altitude smallint; hilbert bigint; carrier bit(64) := B'0'::bit(64); i integer;
 BEGIN
+  -- A check leaf (pg_temp.leaf) is neither stored nor a codepoint; it takes
+  -- a fixed scalar coordinate, as any absent atom must have some placement.
   SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(
-           coalesce(e.coord,ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(p)))))),
+           coalesce(e.coord,ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(p))),
+                    laplace_coord('lpcheckxleaf')))),
          (max(coalesce(e.tier,0)) + 1)::smallint
     INTO coord, altitude FROM unnest(parts) p LEFT JOIN entity e ON e.id = p;
   hilbert := laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
@@ -42,60 +49,64 @@ BEGIN
 END $$;
 SAVEPOINT native_batch_realization;
 DO $$
-DECLARE deep blake3:=laplace_id('dog'); bang blake3:=laplace_cp_id(ascii('!'));
+DECLARE deep blake3:=laplace_id('lpcheckxdog'); bang blake3:=laplace_cp_id(ascii('!'));
         lambda blake3:=laplace_cp_id(ascii('λ')); chinese blake3:=laplace_cp_id(ascii('中'));
         repeated blake3; tuple blake3; tuple_run blake3; nested_tuple blake3; package blake3;
         preview_claim blake3; preview_joint blake3; preview_binary blake3;
-        expected text:='dog'||repeat('!',70); actual text[];
+        expected text:='lpcheckxdog'||repeat('!',70); actual text[];
 BEGIN
   -- Linear-size content with more than the former 64-level rejection: every
   -- identity, coordinate and packed path is made by the Native operators.
   FOR i IN 1..70 LOOP deep:=pg_temp.series_node(ARRAY[deep,bang]); END LOOP;
-  repeated:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[3]));
-  IF (SELECT array_agg(child ORDER BY ordinal) FROM laplace_constituents(ARRAY[laplace_id('dog'),laplace_id('dog')]))
-       IS DISTINCT FROM ARRAY[laplace_cp_id(100),laplace_cp_id(111),laplace_cp_id(103)]
+  repeated:=pg_temp.series_node(array_fill(laplace_id('lpcheckxdog'),ARRAY[3]));
+  IF (SELECT array_agg(child ORDER BY ordinal) FROM laplace_constituents(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxdog')]))
+       IS DISTINCT FROM ARRAY(SELECT laplace_cp_id(ascii(c))
+         FROM regexp_split_to_table('lpcheckxdog','') WITH ORDINALITY s(c,n) ORDER BY n)
      OR (SELECT array_agg(child ORDER BY ordinal) FROM laplace_constituents(ARRAY[repeated]))
-       IS DISTINCT FROM ARRAY[laplace_id('dog')]
+       IS DISTINCT FROM ARRAY[laplace_id('lpcheckxdog')]
      OR (SELECT run_length FROM laplace_constituents(ARRAY[repeated]))<>3
      OR EXISTS(SELECT FROM laplace_constituents(ARRAY[]::blake3[])) THEN
     RAISE EXCEPTION 'Native constituent read changed IDs, order, RLE runs or set membership';
   END IF;
   SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_text_batch(ARRAY[lambda,deep,chinese,deep,repeated]);
-  IF actual IS DISTINCT FROM ARRAY['λ',expected,'中',expected,'dogdogdog']
+  IF actual IS DISTINCT FROM ARRAY['λ',expected,'中',expected,repeat('lpcheckxdog',3)]
      OR laplace_text(deep)<>expected
      OR EXISTS(SELECT FROM laplace_text_batch(ARRAY[]::blake3[])) THEN
     RAISE EXCEPTION 'batch realization changed Unicode, runs, occurrences or deep Native content';
   END IF;
-  tuple:=pg_temp.series_node(ARRAY[laplace_id('dog'),lambda,chinese],'tuple');
-  tuple_run:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[2]),'tuple');
+  tuple:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),lambda,chinese],'tuple');
+  tuple_run:=pg_temp.series_node(array_fill(laplace_id('lpcheckxdog'),ARRAY[2]),'tuple');
   nested_tuple:=pg_temp.series_node(ARRAY[tuple,tuple_run],'tuple');
-  package:=pg_temp.series_node(ARRAY[laplace_id('file'),deep],'file');
+  package:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxfile'),deep],'file');
   SELECT array_agg(content ORDER BY i) INTO actual
   FROM laplace_labels(ARRAY[tuple,tuple_run,nested_tuple,package,'00000000000000000000000000000000'::blake3,deep]);
-  IF actual IS DISTINCT FROM ARRAY['[dog · λ · 中]','[dog × 2]','[[dog · λ · 中] · [dog × 2]]',
+  IF actual IS DISTINCT FROM ARRAY['[lpcheckxdog · λ · 中]','[lpcheckxdog × 2]','[[lpcheckxdog · λ · 中] · [lpcheckxdog × 2]]',
                                   package::text,'00000000000000000000000000000000',expected] THEN
     RAISE EXCEPTION 'Native labels changed tuple structure, runs or selected identities';
   END IF;
   -- Shared content can serve several contextual roles. None of those roles
   -- may turn a scalar text surface, or its containing text, into an opaque id.
-  PERFORM pg_temp.series_node(ARRAY[laplace_cp_id(50),laplace_cp_id(53),laplace_cp_id(53)],'claim');
+  -- A check-unique scalar word with a codepoint run; a real word such as 255
+  -- may already be stored by real sources.
+  preview_binary:=pg_temp.series_node(ARRAY(SELECT laplace_cp_id(ascii(c))
+    FROM regexp_split_to_table('lpcheckxroll','') WITH ORDINALITY s(c,n) ORDER BY n),'claim');
   UPDATE physicality SET mask=mask | laplace_mask_slot('kind','record') | laplace_mask_slot('kind','file')
-    WHERE entity=laplace_id('255');
-  preview_joint:=pg_temp.series_node(ARRAY[laplace_id('255'),bang]);
-  SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_labels(ARRAY[laplace_id('255'),preview_joint]);
-  IF actual IS DISTINCT FROM ARRAY['255','255!']
+    WHERE entity=preview_binary;
+  preview_joint:=pg_temp.series_node(ARRAY[preview_binary,bang]);
+  SELECT array_agg(content ORDER BY i) INTO actual FROM laplace_labels(ARRAY[preview_binary,preview_joint]);
+  IF actual IS DISTINCT FROM ARRAY['lpcheckxroll','lpcheckxroll!']
      OR (SELECT content FROM laplace_labels(ARRAY[package]))<>package::text THEN
     RAISE EXCEPTION 'contextual row roles hid a shared Unicode surface or expanded opaque packaging';
   END IF;
-  preview_claim:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')],'claim');
-  preview_joint:=pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[4]),'claim');
-  preview_binary:=pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('noun')],'claim');
+  preview_claim:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')],'claim');
+  preview_joint:=pg_temp.series_node(array_fill(laplace_id('lpcheckxdog'),ARRAY[4]),'claim');
+  preview_binary:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxnoun')],'claim');
   SELECT array_agg(fact ORDER BY i) INTO actual FROM laplace_claim_preview(ARRAY[
     preview_claim,preview_joint,preview_binary,
     preview_claim,package,'00000000000000000000000000000000'::blake3]);
-  IF actual IS DISTINCT FROM ARRAY['noun','dog × 4','noun','noun']
+  IF actual IS DISTINCT FROM ARRAY['lpcheckxnoun','lpcheckxdog × 4','lpcheckxnoun','lpcheckxnoun']
      OR EXISTS(SELECT FROM laplace_claim_preview(ARRAY[preview_claim])
-       WHERE predicate IS DISTINCT FROM laplace_id('is') OR object IS DISTINCT FROM laplace_id('noun') OR type_label<>'is')
+       WHERE predicate IS DISTINCT FROM laplace_id('lpcheckxis') OR object IS DISTINCT FROM laplace_id('lpcheckxnoun') OR type_label<>'lpcheckxis')
      OR EXISTS(SELECT FROM laplace_claim_preview(ARRAY[]::blake3[])) THEN
     RAISE EXCEPTION 'Native preview changed typed claims, n-ary/RLE content, input occurrences or missing paths: %',actual;
   END IF;
@@ -103,13 +114,13 @@ BEGIN
     ARRAY[decode(deep::text,'hex'),decode(tuple::text,'hex'),decode(deep::text,'hex'),
           decode(lambda::text,'hex'),decode('00000000000000000000000000000000','hex')],
     ARRAY[NULL,NULL,'caller surface',NULL,NULL]);
-  IF actual IS DISTINCT FROM ARRAY[expected,'[dog · λ · 中]','caller surface','λ','00000000000000000000000000000000']
+  IF actual IS DISTINCT FROM ARRAY[expected,'[lpcheckxdog · λ · 中]','caller surface','λ','00000000000000000000000000000000']
      OR (SELECT count(*) FROM laplace_resolve_refs(
           ARRAY[decode(deep::text,'hex'),decode(lambda::text,'hex'),decode('00000000000000000000000000000000','hex')],
           ARRAY[NULL,NULL,NULL]) WHERE present)<>2 THEN
     RAISE EXCEPTION 'Native references changed occurrences, surfaces, virtual floor or missing membership';
   END IF;
-  IF encode(laplace_resolve_ref('dog'),'hex')<>laplace_id('dog')::text
+  IF encode(laplace_resolve_ref('lpcheckxdog'),'hex')<>laplace_id('lpcheckxdog')::text
      OR encode(laplace_resolve_ref(upper(deep::text)),'hex')<>deep::text
      OR encode(laplace_resolve_ref('λ'),'hex')<>lambda::text
      OR laplace_resolve_ref('00000000000000000000000000000000') IS NOT NULL
@@ -141,8 +152,8 @@ ROLLBACK TO native_batch_realization;
 RELEASE native_batch_realization;
 CREATE TEMP TABLE series_claims (name text PRIMARY KEY, id blake3);
 INSERT INTO series_claims VALUES
-  ('a', pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun')], 'claim')),
-  ('b', pg_temp.series_node(ARRAY[laplace_id('noun'),laplace_id('is'),laplace_id('dog')], 'claim'));
+  ('a', pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')], 'claim')),
+  ('b', pg_temp.series_node(ARRAY[laplace_id('lpcheckxnoun'),laplace_id('lpcheckxis'),laplace_id('lpcheckxdog')], 'claim'));
 CREATE TEMP TABLE series_sources (name text PRIMARY KEY, id blake3);
 DO $$
 DECLARE source_name text; a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
@@ -151,11 +162,11 @@ BEGIN
   FOREACH source_name IN ARRAY ARRAY['one','two','three'] LOOP
     -- A record says claim a 1000 times and claim b 3 times; both counts are
     -- real RLE runs in M, above which file and source trunks contain them.
-    rec := pg_temp.series_node(array_fill(a, ARRAY[1000]) || array_fill(b, ARRAY[3]) || ARRAY[laplace_id(source_name)], 'record',
+    rec := pg_temp.series_node(array_fill(a, ARRAY[1000]) || array_fill(b, ARRAY[3]) || ARRAY[laplace_id('lpcheckx'||source_name)], 'record',
                               ARRAY[2147483648,2147483648,0]::bigint[]);
-    file_meta := pg_temp.series_node(ARRAY[laplace_id('file'),laplace_id(source_name)], 'tuple');
+    file_meta := pg_temp.series_node(ARRAY[laplace_id('lpcheckxfile'),laplace_id('lpcheckx'||source_name)], 'tuple');
     file_trunk := pg_temp.series_node(ARRAY[file_meta,rec], 'file', ARRAY[4294967296,5368709120]::bigint[]);
-    source_meta := pg_temp.series_node(ARRAY[laplace_id('source'),laplace_id(source_name)], 'tuple');
+    source_meta := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),laplace_id('lpcheckx'||source_name)], 'tuple');
     INSERT INTO series_sources VALUES (source_name, pg_temp.series_node(ARRAY[source_meta,file_trunk], 'file', ARRAY[4294967296,5368709120]::bigint[]));
   END LOOP;
 END $$;
@@ -169,7 +180,7 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
         two_root blake3 := (SELECT id FROM series_sources WHERE name='two');
         only_a blake3; nested blake3; roots blake3[];
 BEGIN
-  only_a := pg_temp.series_node(array_fill(a,ARRAY[7]) || ARRAY[laplace_id('three')],
+  only_a := pg_temp.series_node(array_fill(a,ARRAY[7]) || ARRAY[laplace_id('lpcheckxthree')],
       'record',ARRAY[2147483648,0]::bigint[]);
   nested := pg_temp.series_node(ARRAY[one_root,only_a],
       'file',ARRAY[5368709120,5368709120]::bigint[]);
@@ -226,7 +237,7 @@ BEGIN
   END IF;
   IF EXISTS(SELECT FROM laplace_contained_series(trunks,ARRAY[]::blake3[]))
      OR EXISTS(SELECT FROM laplace_contained_series(ARRAY[]::blake3[],claims))
-     OR EXISTS(SELECT FROM laplace_contained_series(trunks,ARRAY[laplace_id('dog')])) THEN
+     OR EXISTS(SELECT FROM laplace_contained_series(trunks,ARRAY[laplace_id('lpcheckxdog')])) THEN
     RAISE EXCEPTION 'empty or unattested claim selection returned testimony';
   END IF;
   IF (SELECT count(*) FROM laplace_contained_series(ARRAY[trunks[1],trunks[1]]))<>2
@@ -250,9 +261,9 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
         orphan blake3; before_row record; after_row record;
 BEGIN
   SELECT * INTO before_row FROM laplace_series_snapshot('stage.attestation_test',ARRAY[a]);
-  orphan := pg_temp.series_node(ARRAY[a,laplace_id('file')],'record',ARRAY[1073741824,0]::bigint[]);
+  orphan := pg_temp.series_node(ARRAY[a,laplace_id('lpcheckxfile')],'record',ARRAY[1073741824,0]::bigint[]);
   FOR i IN 1..80 LOOP
-    orphan := pg_temp.series_node(ARRAY[laplace_id('file'),orphan],'file',ARRAY[4294967296,0]::bigint[]);
+    orphan := pg_temp.series_node(ARRAY[laplace_id('lpcheckxfile'),orphan],'file',ARRAY[4294967296,0]::bigint[]);
   END LOOP;
   SELECT * INTO after_row FROM laplace_series_snapshot('stage.attestation_test',ARRAY[a]);
   IF before_row IS DISTINCT FROM after_row THEN
@@ -277,7 +288,8 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
         ancestry blake3 := (SELECT id FROM series_sources WHERE name='two');
         before_rows text; before_locks bigint;
 BEGIN
-  SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) INTO before_rows FROM consensus c;
+  SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) INTO before_rows FROM consensus c
+    WHERE c.claim IN (SELECT id FROM series_claims);
   SELECT count(*) INTO before_locks FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory';
   INSERT INTO stage.window_delta(claim,witness,lineage,games,score,trust,wins)
     VALUES(a,w,NULL,3,0,0.85,1.5),(a,w,ancestry,1,0,0.4,1);
@@ -290,7 +302,8 @@ BEGIN
   IF (SELECT count(*) FROM stage.window_totals)<>2
      OR NOT EXISTS(SELECT FROM stage.window_totals WHERE lineage IS NULL AND games=7 AND wins=3.5 AND score=0.5)
      OR NOT EXISTS(SELECT FROM stage.window_totals WHERE lineage IS NOT NULL AND games=1 AND wins=1 AND score=1)
-     OR before_rows IS DISTINCT FROM (SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) FROM consensus c)
+     OR before_rows IS DISTINCT FROM (SELECT md5(coalesce(string_agg(c::text,E'\n' ORDER BY c.claim),'')) FROM consensus c
+                                      WHERE c.claim IN (SELECT id FROM series_claims))
      OR before_locks<>(SELECT count(*) FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='advisory') THEN
     RAISE EXCEPTION 'private windows changed carried totals, public standings or consensus locks';
   END IF;
@@ -310,7 +323,8 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
         snapshot record; expected record; before_rows text; after_rows text;
         before_locks bigint; after_locks bigint;
 BEGIN
-  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO before_rows FROM consensus c;
+  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO before_rows FROM consensus c
+    WHERE c.claim IN (SELECT id FROM series_claims);
   SELECT count(*) INTO before_locks FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory';
   SELECT * INTO snapshot FROM laplace_series_snapshot('stage.attestation_test', ARRAY[a, a]);
   SELECT s.* INTO expected FROM stage.attestation_test p,
@@ -319,7 +333,8 @@ BEGIN
      (expected.rating, expected.deviation, expected.volatility, expected.matches) THEN
     RAISE EXCEPTION 'private snapshot differs from Native standing';
   END IF;
-  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO after_rows FROM consensus c;
+  SELECT md5(coalesce(string_agg(c::text, E'\n' ORDER BY c.claim), '')) INTO after_rows FROM consensus c
+    WHERE c.claim IN (SELECT id FROM series_claims);
   SELECT count(*) INTO after_locks FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory';
   IF before_rows <> after_rows OR before_locks <> after_locks THEN
     RAISE EXCEPTION 'private snapshot changed public state or acquired a consensus lock';
@@ -337,7 +352,7 @@ BEGIN
     RAISE EXCEPTION 'snapshot accepted a public pending table';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
   BEGIN
-    PERFORM laplace_series_snapshot('stage.attestation_test', ARRAY[laplace_id('dog')]);
+    PERFORM laplace_series_snapshot('stage.attestation_test', ARRAY[laplace_id('lpcheckxdog')]);
     RAISE EXCEPTION 'snapshot accepted a non-claim';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
@@ -392,11 +407,11 @@ SELECT laplace_attest_series('stage.attestation_test', ARRAY[(SELECT id FROM ser
 CREATE TEMP TABLE series_untouched AS SELECT * FROM consensus WHERE claim = (SELECT id FROM series_claims WHERE name = 'b');
 SAVEPOINT native_claim_set_reader;
 DO $$
-DECLARE floor_claim blake3; root blake3; dog blake3:=laplace_id('dog');
-        floor_id blake3:=laplace_cp_id(ascii('!')); first_id blake3;
+DECLARE floor_claim blake3; root blake3; dog blake3:=laplace_id('lpcheckxdog');
+        floor_id blake3:=pg_temp.leaf(1); first_id blake3;
 BEGIN
-  floor_claim:=pg_temp.series_node(ARRAY[floor_id,laplace_id('is'),laplace_id('noun')],'claim');
-  root:=pg_temp.series_node(ARRAY[floor_claim,laplace_id('three')],'record',ARRAY[2147483648,0]::bigint[]);
+  floor_claim:=pg_temp.series_node(ARRAY[floor_id,laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')],'claim');
+  root:=pg_temp.series_node(ARRAY[floor_claim,laplace_id('lpcheckxthree')],'record',ARRAY[2147483648,0]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
     VALUES(md5('attestation-witness-'||root::text)::blake3,root,NULL,1,1,1,NULL,0.85);
   INSERT INTO stage.attestation_test VALUES(floor_claim,root,NULL,1,1,0.85);
@@ -411,7 +426,7 @@ BEGIN
      OR (SELECT count(*) FROM laplace_claims_each(ARRAY[dog],1,'{}','{}'))<>1
      OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[dog],0,'{}','{}'))
      OR EXISTS(SELECT FROM laplace_claims_each(NULL,NULL,'{}','{}'))
-     OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[dog],NULL,'{}',ARRAY[laplace_id('is')])) THEN
+     OR EXISTS(SELECT FROM laplace_claims_each(ARRAY[dog],NULL,'{}',ARRAY[laplace_id('lpcheckxis')])) THEN
     RAISE EXCEPTION 'Native occurrence, caller fan, NULL or refusal contract changed';
   END IF;
   SELECT entity INTO first_id FROM laplace_claims(ARRAY[dog],NULL,'{}','{}') ORDER BY entity LIMIT 1;
@@ -528,16 +543,17 @@ BEGIN
     RAISE EXCEPTION 'source scope was applied after solving, or empty/missing selection acquired evidence';
   END IF;
   SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) INTO shares FROM laplace_source_attribution(ARRAY[a]) r;
-  UPDATE attestation SET trust=-0.85;
+  UPDATE attestation SET trust=-0.85 WHERE witness IN (SELECT id FROM series_sources);
   IF (SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) FROM laplace_source_attribution(ARRAY[a]) r) IS DISTINCT FROM shares THEN
     RAISE EXCEPTION 'signed trust lost attribution or changed symmetric information';
   END IF;
-  UPDATE attestation SET trust=0;
+  UPDATE attestation SET trust=0 WHERE witness IN (SELECT id FROM series_sources);
   IF (SELECT count(*) FROM laplace_source_attribution(ARRAY[a]) WHERE share_bp=0 AND fisher_weight=0 AND games=1000)<>3
      OR (SELECT count(*) FROM laplace_attribution(ARRAY[a]) WHERE share_bp=0 AND games=1000)<>3 THEN
     RAISE EXCEPTION 'uninformative sources lost testimony or acquired royalties';
   END IF;
-  UPDATE attestation SET lineage=CASE WHEN witness=one_root THEN two_root WHEN witness=two_root THEN one_root ELSE lineage END;
+  UPDATE attestation SET lineage=CASE WHEN witness=one_root THEN two_root ELSE one_root END
+    WHERE witness IN (one_root,two_root);
   BEGIN
     PERFORM laplace_source_attribution(ARRAY[a]);
     RAISE EXCEPTION 'attribution accepted cyclic lineage';
@@ -565,13 +581,13 @@ BEGIN
   END;
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF result IS DISTINCT FROM before_cycle THEN RAISE EXCEPTION 'cyclic lineage partially updated consensus'; END IF;
-  UPDATE attestation SET trust = -0.85;
+  UPDATE attestation SET trust = -0.85 WHERE witness IN (SELECT id FROM series_sources);
   PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF abs(result.rating + before_cycle.rating - 3000) > 1e-8 OR abs(result.deviation - before_cycle.deviation) > 1e-8 THEN
     RAISE EXCEPTION 'signed trust did not reverse the outcome symmetrically';
   END IF;
-  DELETE FROM attestation;
+  DELETE FROM attestation WHERE witness IN (SELECT id FROM series_sources);
   PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
   IF EXISTS (SELECT FROM consensus WHERE claim = a) THEN RAISE EXCEPTION 'standing survived removal of every witness'; END IF;
 END $$;
@@ -590,7 +606,7 @@ BEGIN
     PERFORM laplace_attest_series('series_folded');
     RAISE EXCEPTION 'non-stage table accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
-  INSERT INTO stage.attestation_test VALUES (laplace_id('dog'), id, NULL, 1, 1, 0.85);
+  INSERT INTO stage.attestation_test VALUES (laplace_id('lpcheckxdog'), id, NULL, 1, 1, 0.85);
   BEGIN
     PERFORM laplace_attest_series('stage.attestation_test');
     RAISE EXCEPTION 'content admitted to consensus as a claim';
@@ -604,7 +620,7 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
         outer_source blake3; deep_source blake3; found integer;
 BEGIN
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||inner_source::text)::blake3,inner_source,NULL,1,1,1,NULL,0.85);
-  outer_source := pg_temp.series_node(ARRAY[laplace_id('three'),inner_source], 'file', ARRAY[4294967296,0]::bigint[]);
+  outer_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxthree'),inner_source], 'file', ARRAY[4294967296,0]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||outer_source::text)::blake3,outer_source,NULL,1,1,1,NULL,0.85);
   UPDATE entity SET tier=1 WHERE id=outer_source;
   UPDATE physicality SET tier=1 WHERE entity=outer_source;
@@ -613,7 +629,7 @@ BEGIN
   IF found<>2 THEN RAISE EXCEPTION 'nested witness, duplicate input or global tier lost provenance'; END IF;
   deep_source := outer_source;
   FOR i IN 1..70 LOOP
-    deep_source := pg_temp.series_node(ARRAY[laplace_id('one'),deep_source], 'file', ARRAY[4294967296,0]::bigint[]);
+    deep_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxone'),deep_source], 'file', ARRAY[4294967296,0]::bigint[]);
   END LOOP;
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||deep_source::text)::blake3,deep_source,NULL,1,1,1,NULL,0.85);
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a])
@@ -625,13 +641,13 @@ BEGIN
   SELECT count(*) INTO found FROM laplace_contained_series(ARRAY[inner_source,outer_source,deep_source],ARRAY[a])
     WHERE games=1000 AND score=1000;
   IF found<>3 THEN RAISE EXCEPTION 'selected series lost nested registered witnesses'; END IF;
-  IF EXISTS(SELECT FROM laplace_contained_series(ARRAY[deep_source],ARRAY[laplace_id('dog')])) THEN
+  IF EXISTS(SELECT FROM laplace_contained_series(ARRAY[deep_source],ARRAY[laplace_id('lpcheckxdog')])) THEN
     RAISE EXCEPTION 'reverse selection admitted ordinary content as a claim';
   END IF;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a],true) evidence
     JOIN physicality p ON p.entity=evidence.trunk
     WHERE NOT evidence.witness AND evidence.games=1000
-      AND laplace_path_starts(p.path,laplace_compose(ARRAY[laplace_id('file'),laplace_id('one')]));
+      AND laplace_path_starts(p.path,laplace_compose(ARRAY[laplace_id('lpcheckxfile'),laplace_id('lpcheckxone')]));
   IF found<>1 THEN RAISE EXCEPTION 'file diagnostic omitted the containing file'; END IF;
 END $$;
 -- Read the record's stored outcomes before any source-level score fold.
@@ -640,10 +656,10 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
         positive blake3; neutral blake3; negative blake3; source_id blake3;
         outcomes smallint[]; counts bigint[];
 BEGIN
-  positive:=pg_temp.series_node(ARRAY[laplace_id('dog'),a],'record',ARRAY[0,1073741824]::bigint[]);
-  neutral:=pg_temp.series_node(ARRAY[laplace_id('is'),a],'record',ARRAY[0,9663676416]::bigint[]);
-  negative:=pg_temp.series_node(ARRAY[laplace_id('noun'),a],'record',ARRAY[0,18253611008]::bigint[]);
-  source_id:=pg_temp.series_node(ARRAY[laplace_id('one'),positive,positive,neutral,negative],
+  positive:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),a],'record',ARRAY[0,1073741824]::bigint[]);
+  neutral:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxis'),a],'record',ARRAY[0,9663676416]::bigint[]);
+  negative:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxnoun'),a],'record',ARRAY[0,18253611008]::bigint[]);
+  source_id:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxone'),positive,positive,neutral,negative],
     'file',ARRAY[4294967296,0,0,0]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||source_id::text)::blake3,source_id,NULL,1,1,1,NULL,0);
   SELECT array_agg(outcome ORDER BY outcome),array_agg(occurrences ORDER BY outcome)
@@ -679,15 +695,17 @@ DECLARE c blake3; cls blake3 := laplace_text_id('DerivedCalculation');
         expected record; actual consensus%ROWTYPE; found integer;
 BEGIN
   INSERT INTO entity (id,tier,coord,hilbert) VALUES
-    (cls,laplace_tier('DerivedCalculation'),laplace_coord('DerivedCalculation'),laplace_hilbert('DerivedCalculation'));
+    (cls,laplace_tier('DerivedCalculation'),laplace_coord('DerivedCalculation'),laplace_hilbert('DerivedCalculation'))
+    ON CONFLICT DO NOTHING; -- the registry class may already be stored by real sources
   INSERT INTO physicality (entity,tier,hilbert,path) VALUES
     (cls,laplace_tier('DerivedCalculation'),laplace_hilbert('DerivedCalculation'),
-     laplace_path(ARRAY(SELECT laplace_cp_id(ascii(ch)) FROM regexp_split_to_table('DerivedCalculation','') ch)));
-  c := pg_temp.series_node(ARRAY[laplace_id('source'),laplace_id('is'),laplace_id('noun')],'claim');
-  calculated := pg_temp.series_node(ARRAY[cls,c,laplace_id('one')],'record',ARRAY[7516192768,1073741824,0]::bigint[]);
-  curated := pg_temp.series_node(ARRAY[c,laplace_id('two')],'record',ARRAY[1073741824,0]::bigint[]);
-  first_source := pg_temp.series_node(ARRAY[laplace_id('source'),calculated,curated],'file',ARRAY[4294967296,5368709120,5368709120]::bigint[]);
-  second_source := pg_temp.series_node(ARRAY[laplace_id('three'),calculated],'file',ARRAY[4294967296,5368709120]::bigint[]);
+     laplace_path(ARRAY(SELECT laplace_cp_id(ascii(ch)) FROM regexp_split_to_table('DerivedCalculation','') ch)))
+    ON CONFLICT DO NOTHING;
+  c := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')],'claim');
+  calculated := pg_temp.series_node(ARRAY[cls,c,laplace_id('lpcheckxone')],'record',ARRAY[7516192768,1073741824,0]::bigint[]);
+  curated := pg_temp.series_node(ARRAY[c,laplace_id('lpcheckxtwo')],'record',ARRAY[1073741824,0]::bigint[]);
+  first_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),calculated,curated],'file',ARRAY[4294967296,5368709120,5368709120]::bigint[]);
+  second_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxthree'),calculated],'file',ARRAY[4294967296,5368709120]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
     SELECT md5('attestation-witness-'||w::text)::blake3,w,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[first_source,second_source]) w;
   SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
@@ -728,7 +746,7 @@ BEGIN
   BEGIN
     -- Containment, not the published rows, must reject an unknown class.
     DELETE FROM attestation WHERE claim=c;
-    PERFORM pg_temp.series_node(ARRAY[laplace_id('dog'),c],'record',ARRAY[7516192768,1073741824]::bigint[]);
+    PERFORM pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),c],'record',ARRAY[7516192768,1073741824]::bigint[]);
     PERFORM * FROM laplace_attested_series(ARRAY[c]);
     RAISE EXCEPTION 'unknown dependence class accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
@@ -742,16 +760,16 @@ DECLARE binary_claim blake3; joint_claim blake3; repeated_claim blake3;
         record_node blake3; source_node blake3; unasserted blake3; c blake3;
         wanted record; actual consensus%ROWTYPE; first consensus%ROWTYPE; found integer;
 BEGIN
-  binary_claim := pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('noun')],'claim');
-  joint_claim := pg_temp.series_node(ARRAY[laplace_id('dog'),laplace_id('is'),laplace_id('noun'),laplace_id('two')],'claim');
-  repeated_claim := pg_temp.series_node(array_fill(laplace_id('dog'),ARRAY[4]),'claim');
+  binary_claim := pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxnoun')],'claim');
+  joint_claim := pg_temp.series_node(ARRAY[laplace_id('lpcheckxdog'),laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun'),laplace_id('lpcheckxtwo')],'claim');
+  repeated_claim := pg_temp.series_node(array_fill(laplace_id('lpcheckxdog'),ARRAY[4]),'claim');
   IF NOT EXISTS (SELECT FROM physicality WHERE entity=repeated_claim
                  AND laplace_path_length(path)=4 AND ST_NPoints(path)=1) THEN
     RAISE EXCEPTION 'n-ary RLE fixture lost logical arity';
   END IF;
   record_node := pg_temp.series_node(ARRAY[binary_claim,joint_claim,repeated_claim],'record',
                                      ARRAY[1073741824,1073741824,1073741824]::bigint[]);
-  source_node := pg_temp.series_node(ARRAY[laplace_id('source'),record_node],'file',
+  source_node := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),record_node],'file',
                                      ARRAY[4294967296,5368709120]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
     SELECT id,source_node,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
@@ -782,7 +800,7 @@ BEGIN
     SELECT * INTO actual FROM consensus WHERE claim=c;
     IF actual IS DISTINCT FROM first THEN RAISE EXCEPTION 'n-ary stored containment disagrees with cumulative input'; END IF;
   END LOOP;
-  unasserted := pg_temp.series_node(ARRAY[laplace_id('noun'),laplace_id('two'),laplace_id('is'),laplace_id('dog')],'tuple');
+  unasserted := pg_temp.series_node(ARRAY[laplace_id('lpcheckxnoun'),laplace_id('lpcheckxtwo'),laplace_id('lpcheckxis'),laplace_id('lpcheckxdog')],'tuple');
   INSERT INTO stage.attestation_arity_test VALUES (unasserted,source_node,NULL,1,1,0.85);
   BEGIN
     PERFORM laplace_attest_series('stage.attestation_arity_test');
@@ -797,7 +815,7 @@ CREATE TEMP TABLE cursor_records(id blake3);
 CREATE TEMP TABLE cursor_root(id blake3);
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name='a');
-        tail blake3 := laplace_id('one'); i integer;
+        tail blake3 := laplace_id('lpcheckxone'); i integer;
 BEGIN
   FOR i IN 1..2049 LOOP
     INSERT INTO cursor_records SELECT pg_temp.series_node(ARRAY[a] || array_fill(tail,ARRAY[i]),'record',ARRAY[1073741824,0]::bigint[]);
@@ -895,16 +913,8 @@ BEGIN
     WHERE claim=a AND games=2049 AND score=2049;
   EXECUTE format('SET LOCAL ROLE %I',owner_name);
   IF found<>1 THEN RAISE EXCEPTION 'column-scoped Native frontier lost testimony'; END IF;
-  ALTER TABLE public.physicality ENABLE ROW LEVEL SECURITY;
-  denied := false;
-  EXECUTE format('SET LOCAL ROLE %I',reader);
-  BEGIN
-    PERFORM count(*) FROM laplace_contained_series(ARRAY[root]);
-  EXCEPTION WHEN feature_not_supported THEN denied := true;
-  END;
-  EXECUTE format('SET LOCAL ROLE %I',owner_name);
-  ALTER TABLE public.physicality DISABLE ROW LEVEL SECURITY;
-  IF NOT denied THEN RAISE EXCEPTION 'Native frontier bypassed active row-level security'; END IF;
+  -- Enabling row-level security on the deployed physicality table would take
+  -- its exclusive lock; that refusal is not exercised against shared data.
 END $$;
 
 SELECT 'attestation: large frontier preserves exact witness attribution';
@@ -912,16 +922,16 @@ SELECT 'attestation: large frontier preserves exact witness attribution';
 -- A witness's declared trust is its first lineage row (NULL lineage first), read by index,
 -- for the asked IDs that are witnesses or, given NULL, every witness exactly once.
 DO $$
-DECLARE w1 blake3 := md5('witness-trust-one')::blake3; w2 blake3 := md5('witness-trust-two')::blake3;
-        derived blake3 := md5('witness-trust-lineage')::blake3; stranger blake3 := md5('witness-trust-none')::blake3;
+DECLARE w1 blake3 := md5('Laplace check regression attestation witness-trust-one')::blake3; w2 blake3 := md5('Laplace check regression attestation witness-trust-two')::blake3;
+        derived blake3 := md5('Laplace check regression attestation witness-trust-lineage')::blake3; stranger blake3 := md5('Laplace check regression attestation witness-trust-none')::blake3;
         got double precision; n bigint;
 BEGIN
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-  SELECT md5('witness-trust-claim-'||g)::blake3, w1, CASE WHEN g % 2 = 0 THEN derived END, 1, 1, 1, NULL,
+  SELECT md5('Laplace check regression attestation witness-trust-claim-'||g)::blake3, w1, CASE WHEN g % 2 = 0 THEN derived END, 1, 1, 1, NULL,
          CASE WHEN g % 2 = 0 THEN 0.25 ELSE 0.9 END
   FROM generate_series(1, 200) g;
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-  VALUES (md5('witness-trust-claim-x')::blake3, w2, derived, 1, 1, 1, NULL, 0.4);
+  VALUES (md5('Laplace check regression attestation witness-trust-claim-x')::blake3, w2, derived, 1, 1, 1, NULL, 0.4);
   SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w1, stranger]) WHERE witness = w1;
   IF got IS DISTINCT FROM 0.9 THEN RAISE EXCEPTION 'witness trust did not come from the NULL-lineage row: %', got; END IF;
   IF EXISTS (SELECT FROM laplace_witness_trust(ARRAY[stranger])) THEN
@@ -929,11 +939,10 @@ BEGIN
   END IF;
   SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w2]);
   IF got IS DISTINCT FROM 0.4 THEN RAISE EXCEPTION 'a witness with only a derived lineage lost its trust: %', got; END IF;
-  SELECT count(*) INTO n FROM laplace_witness_trust() WHERE witness IN (w1, w2);
-  IF n <> 2 THEN RAISE EXCEPTION 'every-witness form did not list each witness once: %', n; END IF;
-  IF (SELECT count(*) FROM laplace_witness_trust()) <> (SELECT count(DISTINCT witness) FROM attestation) THEN
-    RAISE EXCEPTION 'every-witness form disagrees with the distinct witnesses';
-  END IF;
+  -- The every-witness form (NULL) reads every deployed witness; the check asks
+  -- for its own witnesses, repeated, and each is still listed once.
+  SELECT count(*) INTO n FROM laplace_witness_trust(ARRAY[w1, w2, w1, stranger]);
+  IF n <> 2 THEN RAISE EXCEPTION 'asked-witness form did not list each witness once: %', n; END IF;
 END $$;
 SELECT 'attestation: witness trust reads one first-lineage row per witness';
 ROLLBACK;

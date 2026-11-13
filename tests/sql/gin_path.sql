@@ -2,6 +2,8 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
+-- Every fixture is a temporary table of this session; no stored row is read.
+BEGIN;
 \ir geometry_cases.sql
 -- Wide, repeated paths exercise the allocation bound and deduplication while
 -- endpoints still follow occurrence order, rather than sorted membership.
@@ -127,3 +129,4 @@ DO $$ DECLARE frontier blake3[]:=ARRAY(SELECT md5(i::text)::blake3 FROM generate
 END $$;
 RESET statement_timeout;
 SELECT 'gin_path: streamed ID sets preserve built and pending postings across repeated scans';
+ROLLBACK;

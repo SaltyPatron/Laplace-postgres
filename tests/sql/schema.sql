@@ -2,82 +2,92 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages=warning;
+-- The deployed installation's bindings, read through its own namespace with a
+-- caller search_path that names none of it. The database is shared: the
+-- fixture is unique to this case and every statement is rolled back.
 BEGIN;
-DROP EXTENSION laplace CASCADE;
-DROP EXTENSION postgis CASCADE;
-CREATE SCHEMA "native tenant";
-CREATE SCHEMA "gis tenant";
-CREATE EXTENSION postgis SCHEMA "gis tenant";
-CREATE EXTENSION laplace SCHEMA "native tenant";
-CREATE TABLE public.entity(id integer);
-CREATE TABLE public.physicality(entity integer);
-INSERT INTO public.entity VALUES(17);
-INSERT INTO "native tenant".entity(id,tier,coord,hilbert)
-SELECT "native tenant".laplace_id('ab'),"native tenant".laplace_tier('ab'),
-       "native tenant".laplace_coord('ab'),"native tenant".laplace_hilbert('ab');
-INSERT INTO "native tenant".physicality(entity,tier,hilbert,path)
-SELECT id,tier,hilbert,"native tenant".laplace_path(ARRAY["native tenant".laplace_cp_id(97),"native tenant".laplace_cp_id(98)])
-FROM "native tenant".entity;
+CREATE FUNCTION pg_temp.leaf(n integer) RETURNS public.blake3 LANGUAGE sql IMMUTABLE
+RETURN pg_catalog.md5('Laplace check regression schema leaf '||n)::public.blake3;
+-- word: a check-unique word of real codepoints. pair: two leaves no other
+-- content holds. said: the word followed by 'b', a record whose fact is 'b'.
+INSERT INTO public.entity(id,tier,coord,hilbert)
+SELECT public.laplace_id('lpcheckschema'),public.laplace_tier('lpcheckschema'),
+       public.laplace_coord('lpcheckschema'),public.laplace_hilbert('lpcheckschema');
+INSERT INTO public.physicality(entity,tier,hilbert,path)
+SELECT id,tier,hilbert,public.laplace_path(ARRAY(
+  SELECT public.laplace_cp_id(ascii(c)) FROM regexp_split_to_table('lpcheckschema','') c))
+FROM public.entity WHERE id=public.laplace_id('lpcheckschema');
+INSERT INTO public.entity(id,tier,coord,hilbert)
+SELECT public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)]),1,
+       public.laplace_coord('ab'),public.laplace_hilbert('ab');
+INSERT INTO public.physicality(entity,tier,hilbert,path)
+SELECT id,tier,hilbert,public.laplace_path(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)])
+FROM public.entity WHERE id=public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)]);
+INSERT INTO public.entity(id,tier,coord,hilbert)
+SELECT public.laplace_compose(ARRAY[e.id,public.laplace_cp_id(98)]),e.tier+1,e.coord,e.hilbert
+FROM public.entity e WHERE e.id=public.laplace_id('lpcheckschema');
+INSERT INTO public.physicality(entity,tier,hilbert,path)
+SELECT public.laplace_compose(ARRAY[e.id,public.laplace_cp_id(98)]),e.tier+1,e.hilbert,
+       public.laplace_path(ARRAY[e.id,public.laplace_cp_id(98)])
+FROM public.entity e WHERE e.id=public.laplace_id('lpcheckschema');
 SET LOCAL search_path=pg_catalog,pg_temp;
-CREATE DOMAIN pg_temp.test_blake3 AS "native tenant".blake3;
-DO $$ DECLARE id pg_temp.test_blake3:="native tenant".laplace_id('ab'); value text;
+CREATE DOMAIN pg_temp.test_blake3 AS public.blake3;
+DO $$ DECLARE id pg_temp.test_blake3:=public.laplace_id('lpcheckschema');
+  pair public.blake3:=public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)]); value text;
 BEGIN
- IF "native tenant".laplace_text(id)<>'ab' THEN RAISE EXCEPTION 'installed Native text binding failed'; END IF;
- IF "native tenant".laplace_path_length("native tenant".laplace_path(ARRAY[id,id]))<>2 THEN
+ IF public.laplace_text(id)<>'lpcheckschema' THEN RAISE EXCEPTION 'installed Native text binding failed'; END IF;
+ IF public.laplace_path_length(public.laplace_path(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed PostGIS function binding failed';
  END IF;
- IF pg_catalog.cardinality("native tenant".laplace_vertex_ids("native tenant".laplace_path(ARRAY[id,id])))<>1 THEN
+ IF pg_catalog.cardinality(public.laplace_vertex_ids(public.laplace_path(ARRAY[id,id])))<>1 THEN
   RAISE EXCEPTION 'installed PostGIS exporter binding failed';
  END IF;
- SELECT min(content) INTO STRICT value FROM "native tenant".laplace_text_batch(ARRAY[id,id]);
- IF value<>'ab' THEN RAISE EXCEPTION 'batch text changed'; END IF;
- IF pg_catalog.encode("native tenant".laplace_resolve_ref('ab'),'hex')<>id::text
-    OR pg_catalog.encode("native tenant".laplace_resolve_ref(pg_catalog.upper(id::text)),'hex')<>id::text THEN
+ SELECT min(content) INTO STRICT value FROM public.laplace_text_batch(ARRAY[id,id]);
+ IF value<>'lpcheckschema' THEN RAISE EXCEPTION 'batch text changed'; END IF;
+ IF pg_catalog.encode(public.laplace_resolve_ref('lpcheckschema'),'hex')<>id::text
+    OR pg_catalog.encode(public.laplace_resolve_ref(pg_catalog.upper(id::text)),'hex')<>id::text THEN
   RAISE EXCEPTION 'installed reference identity binding failed';
  END IF;
  IF (SELECT pg_catalog.array_agg(r.label ORDER BY r.ordinal)
-     FROM "native tenant".laplace_resolve_refs(ARRAY[pg_catalog.decode(id::text,'hex'),pg_catalog.decode(id::text,'hex')],ARRAY[NULL,'caller surface']) r)
-    IS DISTINCT FROM ARRAY['ab','caller surface'] THEN
+     FROM public.laplace_resolve_refs(ARRAY[pg_catalog.decode(id::text,'hex'),pg_catalog.decode(id::text,'hex')],ARRAY[NULL,'caller surface']) r)
+    IS DISTINCT FROM ARRAY['lpcheckschema','caller surface'] THEN
   RAISE EXCEPTION 'installed reference batch binding failed';
  END IF;
- IF (SELECT count(*) FROM "native tenant".laplace_paths(ARRAY[id]))<>1
-    OR (SELECT count(*) FROM "native tenant".laplace_present_ids(ARRAY[id,id]))<>2 THEN
+ IF (SELECT count(*) FROM public.laplace_paths(ARRAY[id]))<>1
+    OR (SELECT count(*) FROM public.laplace_present_ids(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed set binding failed';
  END IF;
  IF (SELECT pg_catalog.array_agg(ordinal ORDER BY ordinal)
-       FROM "native tenant".laplace_entities(ARRAY[id,id])) IS DISTINCT FROM ARRAY[1,2]::bigint[]
-    OR (SELECT count(*) FROM "native tenant".laplace_physicalities(ARRAY[id,id]))<>2 THEN
+       FROM public.laplace_entities(ARRAY[id,id])) IS DISTINCT FROM ARRAY[1,2]::bigint[]
+    OR (SELECT count(*) FROM public.laplace_physicalities(ARRAY[id,id]))<>2 THEN
   RAISE EXCEPTION 'installed stored-row namespace or ordinal binding failed';
  END IF;
- IF (SELECT count(*) FROM "native tenant".laplace_containers(
-       ARRAY["native tenant".laplace_cp_id(97)],'{}'::smallint[]))<>1 THEN
+ IF (SELECT count(*) FROM public.laplace_containers(ARRAY[pg_temp.leaf(1)],'{}'::smallint[]))<>1 THEN
   RAISE EXCEPTION 'installed Native all-member binding lost its virtual basis';
  END IF;
- IF (SELECT count(*) FROM "native tenant".laplace_holders(
-       ARRAY["native tenant".laplace_cp_id(97)],'{}',true))<>1
-    OR (SELECT count(*) FROM "native tenant".laplace_holders(
-       ARRAY["native tenant".laplace_cp_id(97)],'{}',true,-1::smallint,0))<>1
-    OR EXISTS(SELECT FROM "native tenant".laplace_standings(ARRAY[id,id])) THEN
+ IF (SELECT count(*) FROM public.laplace_holders(ARRAY[pg_temp.leaf(1)],'{}',true))<>1
+    OR (SELECT count(*) FROM public.laplace_holders(ARRAY[pg_temp.leaf(1)],'{}',true,-1::smallint,0))<>1
+    OR EXISTS(SELECT FROM public.laplace_standings(ARRAY[id,id])) THEN
   RAISE EXCEPTION 'installed Native holders/standings binding changed';
  END IF;
- INSERT INTO "native tenant".attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-   VALUES(pg_catalog.md5('schema-witness-'||id::text)::"native tenant".blake3,id,NULL,1,1,1,NULL,1);
- -- Exercise large-set GIN in the backend that created the indexes, before
- -- reconnecting can hide an incomplete cached operator-class support list.
- UPDATE "native tenant".physicality SET path="gis tenant".ST_SetPoint(path,0,
-   "gis tenant".ST_MakePoint(
-     "gis tenant".ST_X("gis tenant".ST_PointN(path,1)),
-     "gis tenant".ST_Y("gis tenant".ST_PointN(path,1)),
-     "gis tenant".ST_Z("gis tenant".ST_PointN(path,1)),
-     "gis tenant".ST_M("gis tenant".ST_PointN(path,1))+1073741824));
- IF (SELECT count(*) FROM "native tenant".laplace_attested(
-       ARRAY["native tenant".laplace_cp_id(97)] ||
-       ARRAY(SELECT pg_catalog.md5(i::text)::"native tenant".blake3 FROM pg_catalog.generate_series(1,600) i))
-       WHERE trunk OPERATOR("native tenant".=) id AND games=1 AND witness)<>1 THEN
-  RAISE EXCEPTION 'same-backend cold install lost exact GIN set membership';
+ INSERT INTO public.attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+   VALUES(pg_catalog.md5('schema-witness-'||pair::text)::public.blake3,pair,NULL,1,1,1,NULL,1);
+ -- Large-set GIN membership in the backend that wrote the rows.
+ UPDATE public.physicality SET path=public.ST_SetPoint(path,0,
+   public.ST_MakePoint(
+     public.ST_X(public.ST_PointN(path,1)),
+     public.ST_Y(public.ST_PointN(path,1)),
+     public.ST_Z(public.ST_PointN(path,1)),
+     public.ST_M(public.ST_PointN(path,1))+1073741824))
+ WHERE entity OPERATOR(public.=) pair;
+ IF (SELECT count(*) FROM public.laplace_attested(
+       ARRAY[pg_temp.leaf(1)] ||
+       ARRAY(SELECT pg_catalog.md5(i::text)::public.blake3 FROM pg_catalog.generate_series(1,600) i))
+       WHERE trunk OPERATOR(public.=) pair AND games=1 AND witness)<>1 THEN
+  RAISE EXCEPTION 'installed exact GIN set membership failed';
  END IF;
- IF (SELECT count(*) FROM "native tenant".laplace_ordered_pair_counts(NULL,1,1,ARRAY[id]))<>1
-    OR pg_catalog.cardinality("native tenant".laplace_separator_ids())<>85 THEN
+ IF (SELECT count(*) FROM public.laplace_ordered_pair_counts(NULL,1,1,ARRAY[pair]))<>1
+    OR pg_catalog.cardinality(public.laplace_separator_ids())<>85 THEN
   RAISE EXCEPTION 'installed ordered structure binding failed';
  END IF;
  IF EXISTS(SELECT FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
@@ -88,47 +98,35 @@ BEGIN
   RAISE EXCEPTION 'ordinary Native or SQL function retains per-call settings';
  END IF;
 END $$;
--- The same installed-object boundary covers set publication and maintenance,
--- including ID equality inside dynamic SQL. Public shadow tables stay unrelated.
-DO $$ BEGIN PERFORM "native tenant".laplace_ensure_stage(); END $$;
-CREATE UNLOGGED TABLE stage.schema_entities (LIKE "native tenant".entity);
-CREATE UNLOGGED TABLE stage.schema_paths (LIKE "native tenant".physicality);
-INSERT INTO stage.schema_entities SELECT * FROM "native tenant".entity;
-INSERT INTO stage.schema_paths SELECT * FROM "native tenant".physicality;
-DO $$ DECLARE merged record; projected record; id pg_temp.test_blake3:="native tenant".laplace_id('ab'); BEGIN
- SELECT * INTO merged FROM "native tenant".laplace_merge_stage('stage.schema_entities','stage.schema_paths');
+-- The same installed-object boundary covers set publication, including ID
+-- equality inside dynamic SQL. The stage tables are this case's own.
+CREATE UNLOGGED TABLE stage.check_schema_entities (LIKE stage.entity INCLUDING DEFAULTS);
+CREATE UNLOGGED TABLE stage.check_schema_paths (LIKE stage.physicality INCLUDING DEFAULTS);
+CREATE UNLOGGED TABLE stage.check_schema_attestation (LIKE stage.attestation INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+INSERT INTO stage.check_schema_entities SELECT * FROM public.entity
+  WHERE id OPERATOR(public.=) ANY(ARRAY[public.laplace_id('lpcheckschema'),public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)])]);
+INSERT INTO stage.check_schema_paths SELECT * FROM public.physicality
+  WHERE entity OPERATOR(public.=) ANY(ARRAY[public.laplace_id('lpcheckschema'),public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)])]);
+DO $$ DECLARE merged record; said public.blake3:=public.laplace_compose(ARRAY[public.laplace_id('lpcheckschema'),public.laplace_cp_id(98)]); BEGIN
+ SELECT * INTO merged FROM public.laplace_merge_stage('stage.check_schema_entities','stage.check_schema_paths');
  IF merged.entity_rows<>0 OR merged.physicality_rows<>0 THEN RAISE EXCEPTION 'namespace replay inserted duplicate content'; END IF;
- PERFORM "native tenant".laplace_schema_indexes();
- SELECT * INTO projected FROM "native tenant".laplace_recoordinate(false);
- IF projected.entity_rows<>0 OR projected.physicality_rows<>0 THEN RAISE EXCEPTION 'namespace audit changed canonical placement'; END IF;
- UPDATE "native tenant".physicality SET mask="native tenant".laplace_mask_slot('kind','claim') WHERE entity OPERATOR("native tenant".=) id;
- IF (SELECT fact FROM "native tenant".laplace_claim_preview(ARRAY[id]))<>'b' THEN
+ UPDATE public.physicality SET mask=public.laplace_mask_slot('kind','claim') WHERE entity OPERATOR(public.=) said;
+ IF (SELECT fact FROM public.laplace_claim_preview(ARRAY[said]))<>'b' THEN
   RAISE EXCEPTION 'namespace claim preview changed selected content';
  END IF;
- IF "native tenant".laplace_attest_series('stage.attestation',ARRAY[id])<>0 THEN
+ IF public.laplace_attest_series('stage.check_schema_attestation',ARRAY[public.laplace_id('lpcheckschema')])<>0 THEN
   RAISE EXCEPTION 'namespace publication created evidence';
  END IF;
 END $$;
+ROLLBACK;
+BEGIN;
 DO $$ BEGIN
- PERFORM count(*) FROM "native tenant".laplace_containers(ARRAY["native tenant".laplace_id('ab')],'{}'::smallint[]);
-END $$;
-ALTER SCHEMA "native tenant" RENAME TO "renamed native";
-ALTER SCHEMA "gis tenant" RENAME TO "renamed gis";
-DO $$ BEGIN
- IF (SELECT count(*) FROM "renamed native".laplace_containers(ARRAY["renamed native".laplace_id('ab')],'{}'::smallint[]))<>0
-  -- its first vertex was said to be a claim above: what a record says is no part of its text
-  OR "renamed native".laplace_text("renamed native".laplace_id('ab'))<>'b'
-  OR "renamed gis".ST_AsEWKB("renamed native".laplace_coord('ab')) IS DISTINCT FROM "renamed native".laplace_coord_ewkb('ab') THEN
-  RAISE EXCEPTION 'namespace rename invalidated Native or parsed SQL bindings';
+ IF public.laplace_path_length(public.laplace_path(ARRAY[public.laplace_cp_id(97),public.laplace_cp_id(98)]))<>2 THEN
+  RAISE EXCEPTION 'rolled-back fixture poisoned a cached PostGIS binding';
+ END IF;
+ IF pg_catalog.cardinality(public.laplace_vertex_ids(public.laplace_path(ARRAY[public.laplace_cp_id(97),public.laplace_cp_id(98)])))<>2 THEN
+  RAISE EXCEPTION 'rolled-back fixture poisoned a cached PostGIS exporter';
  END IF;
 END $$;
 ROLLBACK;
-DO $$ BEGIN
- IF public.laplace_path_length(public.laplace_path(ARRAY[public.laplace_cp_id(97),public.laplace_cp_id(98)]))<>2 THEN
-  RAISE EXCEPTION 'rolled-back extension namespace poisoned a cached PostGIS binding';
- END IF;
- IF pg_catalog.cardinality(public.laplace_vertex_ids(public.laplace_path(ARRAY[public.laplace_cp_id(97),public.laplace_cp_id(98)])))<>2 THEN
-  RAISE EXCEPTION 'rolled-back namespace poisoned a cached PostGIS exporter';
- END IF;
-END $$;
-SELECT 'schema: current install, independent PostGIS and Native namespaces, shadow tables and indexed reads passed';
+SELECT 'schema: installed namespace bindings, caller search_path independence, shadow-free publication and indexed reads passed';

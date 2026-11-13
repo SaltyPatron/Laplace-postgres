@@ -4,13 +4,21 @@
 SET client_min_messages=warning;
 -- Up the container index from keys to the files that hold them, in one call:
 -- through content only, never through a file's record, stopping at files.
+-- The deployed database holds real words with many holders. Every key here is
+-- a word of two leaves unique to this case, so each walk reaches only its rows.
 BEGIN;
-CREATE TEMP TABLE held_words AS SELECT unnest(ARRAY['alpha','beta','gamma','delta','one','two','three','source','epsilon']) AS content;
+CREATE FUNCTION pg_temp.leaf(n integer) RETURNS blake3 LANGUAGE sql IMMUTABLE
+RETURN md5('Laplace check regression held_files leaf '||n)::blake3;
+CREATE TEMP TABLE held_words AS
+SELECT content,laplace_compose(ARRAY[pg_temp.leaf(2*n::integer),pg_temp.leaf(2*n::integer+1)]) AS id,
+  laplace_path(ARRAY[pg_temp.leaf(2*n::integer),pg_temp.leaf(2*n::integer+1)]) AS path
+FROM unnest(ARRAY['alpha','beta','gamma','delta','one','two','three','source','epsilon']) WITH ORDINALITY w(content,n);
+CREATE FUNCTION pg_temp.word(label text) RETURNS blake3 LANGUAGE sql STABLE
+RETURN (SELECT id FROM held_words WHERE content=label);
 INSERT INTO entity(id,tier,coord,hilbert)
-SELECT laplace_id(content),laplace_tier(content),laplace_coord(content),laplace_hilbert(content) FROM held_words;
+SELECT id,1,laplace_coord(content),laplace_hilbert(content) FROM held_words;
 INSERT INTO physicality(entity,tier,hilbert,path)
-SELECT laplace_id(content),laplace_tier(content),laplace_hilbert(content),
-  laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(content,'') c)) FROM held_words;
+SELECT id,1,laplace_hilbert(content),path FROM held_words;
 CREATE FUNCTION pg_temp.held_node(parts blake3[],metadata bigint[] DEFAULT NULL) RETURNS blake3
 LANGUAGE plpgsql AS $$
 DECLARE composed blake3:=laplace_compose(parts); point geometry; path geometry:=laplace_path(parts);
@@ -31,8 +39,8 @@ BEGIN
   RETURN composed;
 END $$;
 DO $$
-DECLARE alpha blake3:=laplace_id('alpha'); beta blake3:=laplace_id('beta'); gamma blake3:=laplace_id('gamma');
-        delta blake3:=laplace_id('delta'); one blake3:=laplace_id('one');
+DECLARE alpha blake3:=pg_temp.word('alpha'); beta blake3:=pg_temp.word('beta'); gamma blake3:=pg_temp.word('gamma');
+        delta blake3:=pg_temp.word('delta'); one blake3:=pg_temp.word('one');
         meta bigint:=4294967296;  -- LP_SAID_METADATA in a vertex's M
         first_line blake3; second_line blake3; body blake3; a blake3; b blake3; c blake3; d blake3; twice blake3; trunk blake3;
 BEGIN
@@ -41,10 +49,10 @@ BEGIN
   body:=pg_temp.held_node(ARRAY[first_line,second_line]);
   -- each file's record names it with words of its own; file a's record also holds alpha
   a:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[one,alpha]),body],ARRAY[meta,0]);
-  b:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('two'),one]),second_line],ARRAY[meta,0]);
-  c:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('three'),one]),first_line],ARRAY[meta,0]);
+  b:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[pg_temp.word('two'),one]),second_line],ARRAY[meta,0]);
+  c:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[pg_temp.word('three'),one]),first_line],ARRAY[meta,0]);
   -- a source trunk has its record first, said as a file has its OS record
-  trunk:=pg_temp.held_node(ARRAY[laplace_id('source'),pg_temp.held_node(ARRAY[a,b])],ARRAY[meta,0]);
+  trunk:=pg_temp.held_node(ARRAY[pg_temp.word('source'),pg_temp.held_node(ARRAY[a,b])],ARRAY[meta,0]);
   IF (SELECT array_agg(file::text||':'||keys ORDER BY file::text) FROM laplace_held_files(ARRAY[alpha,gamma]))
        IS DISTINCT FROM (SELECT array_agg(f ORDER BY f) FROM unnest(ARRAY[a::text||':3',b::text||':2',c::text||':1']) f)
   OR EXISTS(SELECT FROM laplace_held_files(ARRAY[alpha,gamma]) WHERE hubs<>0 OR cut OR levels<3) THEN
@@ -58,9 +66,9 @@ BEGIN
     RAISE EXCEPTION 'Native held files: units changed';
   END IF;
   -- a key said twice in a run stands twice below its unit, and the run counts in the unit's length
-  twice:=pg_temp.held_node(ARRAY[laplace_id('epsilon'),laplace_id('epsilon'),delta]);
-  d:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[laplace_id('two'),laplace_id('three')]),twice],ARRAY[meta,0]);
-  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text) FROM laplace_held_files(ARRAY[laplace_id('epsilon')]))
+  twice:=pg_temp.held_node(ARRAY[pg_temp.word('epsilon'),pg_temp.word('epsilon'),delta]);
+  d:=pg_temp.held_node(ARRAY[pg_temp.held_node(ARRAY[pg_temp.word('two'),pg_temp.word('three')]),twice],ARRAY[meta,0]);
+  IF (SELECT array_agg(file::text||':'||unit::text||':'||unit_length||':'||counts::text) FROM laplace_held_files(ARRAY[pg_temp.word('epsilon')]))
        IS DISTINCT FROM ARRAY[d::text||':'||twice::text||':3:{2}'] THEN
     RAISE EXCEPTION 'Native held files: occurrence counts changed';
   END IF;

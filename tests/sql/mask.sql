@@ -72,52 +72,56 @@ BEGIN
   END;
 END $$;
 
-CREATE SCHEMA stage;
-CREATE UNLOGGED TABLE stage.mask_entity (LIKE public.entity INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
-CREATE UNLOGGED TABLE stage.mask_physicality (LIKE public.physicality INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+-- The database is shared: the stage schema is the deployed one, the tables
+-- below are this case's own, its leaves are IDs no other content holds, and
+-- the transaction is rolled back.
+CREATE FUNCTION pg_temp.leaf(n integer) RETURNS blake3 LANGUAGE sql IMMUTABLE
+RETURN md5('Laplace check regression mask leaf '||n)::blake3;
+CREATE UNLOGGED TABLE stage.check_mask_entity (LIKE public.entity INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
+CREATE UNLOGGED TABLE stage.check_mask_physicality (LIKE public.physicality INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
 
-INSERT INTO stage.mask_entity (id, tier, coord, hilbert, mask)
-VALUES (laplace_id('ab'), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('upos', 'NOUN'));
-INSERT INTO public.entity SELECT * FROM stage.mask_entity
+INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
+VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('upos', 'NOUN'));
+INSERT INTO public.entity SELECT * FROM stage.check_mask_entity
 ON CONFLICT (id) DO UPDATE SET mask = laplace_mask_merge(entity.mask, EXCLUDED.mask);
-TRUNCATE stage.mask_entity;
-INSERT INTO stage.mask_entity (id, tier, coord, hilbert, mask)
-VALUES (laplace_id('ab'), 9, laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('lexfile', 'noun.animal'));
-INSERT INTO public.entity SELECT * FROM stage.mask_entity
+TRUNCATE stage.check_mask_entity;
+INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
+VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), 9, laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('lexfile', 'noun.animal'));
+INSERT INTO public.entity SELECT * FROM stage.check_mask_entity
 ON CONFLICT (id) DO UPDATE SET mask = laplace_mask_merge(entity.mask, EXCLUDED.mask);
 
-INSERT INTO stage.mask_physicality (entity, tier, hilbert, path, mask)
-VALUES (laplace_id('ab'), laplace_tier('ab'), laplace_hilbert('ab'),
-        laplace_path(ARRAY[laplace_cp_id(97), laplace_cp_id(98)]), laplace_mask_slot('kind', 'claim'));
-INSERT INTO public.physicality SELECT * FROM stage.mask_physicality
+INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
+VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
+        laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_mask_slot('kind', 'claim'));
+INSERT INTO public.physicality SELECT * FROM stage.check_mask_physicality
 ON CONFLICT (entity) DO UPDATE SET mask = laplace_mask_merge(physicality.mask, EXCLUDED.mask);
-TRUNCATE stage.mask_physicality;
-INSERT INTO stage.mask_physicality (entity, tier, hilbert, path, mask)
-VALUES (laplace_id('ab'), 9, laplace_hilbert('ab'),
-        laplace_path(ARRAY[laplace_cp_id(97), laplace_cp_id(98)]),
+TRUNCATE stage.check_mask_physicality;
+INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
+VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), 9, laplace_hilbert('ab'),
+        laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]),
         laplace_mask_slot('kind', 'record') | laplace_mask_slot('deprel', 'nsubj'));
-INSERT INTO public.physicality SELECT * FROM stage.mask_physicality
+INSERT INTO public.physicality SELECT * FROM stage.check_mask_physicality
 ON CONFLICT (entity) DO UPDATE SET mask = physicality.mask | EXCLUDED.mask;
 
 SET enable_seqscan = off;
 DO $$
 DECLARE query_plan json;
 BEGIN
-  IF (SELECT count(*) FROM public.entity WHERE id = laplace_id('ab')) <> 1
+  IF (SELECT count(*) FROM public.entity WHERE id = laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)])) <> 1
      OR NOT (SELECT laplace_mask_has_value(mask, 'upos', 'NOUN') AND laplace_mask_has_value(mask, 'lexfile', 'noun.animal')
-             FROM public.entity WHERE id = laplace_id('ab')) THEN
+             FROM public.entity WHERE id = laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)])) THEN
     RAISE EXCEPTION 'global ID uniqueness or entity mask merge failed';
   END IF;
-  IF (SELECT count(*) FROM public.physicality WHERE entity = laplace_id('ab')) <> 1
+  IF (SELECT count(*) FROM public.physicality WHERE entity = laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)])) <> 1
      OR NOT (SELECT laplace_mask_has_value(mask, 'kind', 'claim') AND laplace_mask_has_value(mask, 'kind', 'record')
                     AND laplace_mask_has_value(mask, 'deprel', 'nsubj')
-             FROM public.physicality WHERE entity = laplace_id('ab')) THEN
+             FROM public.physicality WHERE entity = laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)])) THEN
     RAISE EXCEPTION 'physicality mask OR merge failed';
   END IF;
-  IF (SELECT count(*) FROM public.physicality WHERE path @> ARRAY[laplace_cp_id(97)] AND mask ? 0::smallint) <> 1 THEN
+  IF (SELECT count(*) FROM public.physicality WHERE path @> ARRAY[pg_temp.leaf(97)] AND mask ? 0::smallint) <> 1 THEN
     RAISE EXCEPTION 'the real combined path/mask GIN query failed';
   END IF;
-  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT entity FROM public.physicality WHERE path @> ARRAY[laplace_cp_id(97)] AND mask ? 0::smallint'
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT entity FROM public.physicality WHERE path @> ARRAY[pg_temp.leaf(97)] AND mask ? 0::smallint'
     INTO query_plan;
   IF query_plan::text NOT LIKE '%Bitmap Index Scan%' THEN RAISE EXCEPTION 'the query did not use its GIN index'; END IF;
 END $$;

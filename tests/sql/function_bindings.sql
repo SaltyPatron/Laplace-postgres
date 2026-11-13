@@ -2,66 +2,38 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
--- Index repair uses the same owner as cold install and upgrade. A missing
--- assertion index must be restored with all attached leaf indexes, before a
--- reader can nominate assertion parents again.
+-- The deployed database is shared: every statement runs in this rolled-back
+-- transaction, and no extension object is dropped, replaced or re-indexed.
 BEGIN;
-DROP INDEX public.physicality_assertions;
+-- The deployed assertion index is attached and valid on every canonical
+-- partition, so a reader can nominate assertion parents.
 DO $$ BEGIN
- PERFORM public.laplace_schema_indexes();
  IF (SELECT count(*) FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indexrelid
      WHERE h.inhparent='public.physicality_assertions'::regclass AND i.indisvalid AND i.indisready)<>256 THEN
-  RAISE EXCEPTION 'index repair did not restore every canonical assertion partition';
+  RAISE EXCEPTION 'the deployed assertion index is not valid on every canonical partition';
  END IF;
- PERFORM public.laplace_schema_indexes();
  PERFORM count(*) FROM public.laplace_testimony(ARRAY[public.laplace_id('index repair probe')]);
 END $$;
-ROLLBACK;
--- An upgrade must expose every declared C export, including APIs that were
--- missing from an installed predecessor. Repair is idempotent and never adopts
--- or overwrites a same-signature function owned by the host application.
-DO $$ DECLARE repaired oid; BEGIN
-  ALTER EXTENSION laplace DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
-  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
+-- Every declared C export is installed with its declared contract; repair
+-- of an intact installation is idempotent and changes no function identity.
+DO $$ DECLARE repaired oid:='public.laplace_testimony(public.blake3[],public.blake3[])'::regprocedure; BEGIN
   PERFORM public.laplace_restore_function_bindings();
-  repaired := 'public.laplace_testimony(public.blake3[],public.blake3[])'::regprocedure;
   IF NOT EXISTS(SELECT FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid
       WHERE d.classid='pg_proc'::regclass AND d.objid=repaired
         AND d.refclassid='pg_extension'::regclass AND d.deptype='e' AND e.extname='laplace')
       OR NOT EXISTS(SELECT FROM pg_proc WHERE oid=repaired AND pronargdefaults=1
         AND provolatile='s' AND proparallel='s' AND proretset) THEN
-    RAISE EXCEPTION 'missing Native API was not repaired with its declared contract';
+    RAISE EXCEPTION 'declared Native API is not installed with its declared contract';
   END IF;
   PERFORM public.laplace_restore_function_bindings();
   IF repaired <> 'public.laplace_testimony(public.blake3[],public.blake3[])'::regprocedure THEN
     RAISE EXCEPTION 'Native API repair changed an existing function identity';
   END IF;
-  ALTER EXTENSION laplace DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
-  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
-  CREATE FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]) RETURNS integer
-    LANGUAGE sql IMMUTABLE RETURN 7;
-  BEGIN
-    PERFORM public.laplace_restore_function_bindings();
-    RAISE EXCEPTION 'Native API repair adopted a foreign function';
-  EXCEPTION WHEN duplicate_object THEN NULL; END;
-  IF public.laplace_testimony(NULL,NULL)<>7 THEN
-    RAISE EXCEPTION 'Native API repair overwrote a foreign function';
-  END IF;
-  DROP FUNCTION public.laplace_testimony(public.blake3[],public.blake3[]);
-  PERFORM public.laplace_restore_function_bindings();
-  ALTER EXTENSION laplace DROP FUNCTION public.laplace_isa();
-  BEGIN
-    PERFORM public.laplace_restore_function_bindings();
-    RAISE EXCEPTION 'Native binding verification ignored a missing declared export';
-  EXCEPTION WHEN undefined_function THEN
-    IF SQLERRM <> 'Native API is missing its declared function: laplace_isa' THEN RAISE; END IF;
-  END;
-  ALTER EXTENSION laplace ADD FUNCTION public.laplace_isa();
-  PERFORM public.laplace_restore_function_bindings();
 END $$;
 DO $$ BEGIN
   -- Remove per-call scope from both a frozen-bank primitive and an already
   -- parsed SQL adapter. Native SPI readers bind installed objects explicitly.
+  -- These settings exist only inside this rolled-back transaction.
   ALTER FUNCTION public.laplace_mask_has_value(bit,text,text) SET search_path=public,pg_temp;
   ALTER FUNCTION public.laplace_coord(text) SET search_path=public,pg_temp;
   PERFORM public.laplace_restore_function_bindings();
@@ -81,35 +53,11 @@ DO $$ BEGIN
       AND (p.prosqlbody IS NULL OR EXISTS(SELECT FROM unnest(p.proconfig) s WHERE s LIKE 'search_path=%'))
   ) THEN RAISE EXCEPTION 'SQL adapters still bind names or set scope at each call'; END IF;
 END $$;
--- A loaded predecessor and its callers can remain alive during an in-place
--- update. Rebinding must preserve the function identity and all other metadata.
-DO $$ DECLARE module text; before_oid oid; before_meta jsonb; BEGIN
- SELECT probin,oid,to_jsonb(p)-'probin'-'proconfig' INTO module,before_oid,before_meta
- FROM pg_proc p WHERE oid='public.laplace_id(text)'::regprocedure;
- EXECUTE format('CREATE OR REPLACE FUNCTION public.laplace_id(text) RETURNS public.blake3 AS %L,%L LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE',module||'_peer','laplace_id');
- PERFORM public.laplace_id('loaded predecessor');
- PERFORM public.laplace_restore_function_bindings();
- IF NOT EXISTS(SELECT FROM pg_proc p WHERE oid=before_oid AND probin=module
-     AND to_jsonb(p)-'probin'-'proconfig'=before_meta) THEN
-   RAISE EXCEPTION 'module activation changed a function identity or attributes';
- END IF;
- IF public.laplace_id('loaded predecessor') IS NULL THEN
-   RAISE EXCEPTION 'rebound function failed in a backend that loaded its predecessor';
- END IF;
-END $$;
-SET search_path=pg_catalog,pg_temp;
+SET LOCAL search_path=pg_catalog,pg_temp;
 DO $$ BEGIN
   IF public.ST_AsEWKB(public.laplace_coord('A')) IS DISTINCT FROM public.laplace_coord_ewkb('A')
      OR NOT public.laplace_mask_has_value(public.laplace_mask_slot('kind','claim'),'kind','claim') THEN
     RAISE EXCEPTION 'Native adapter depends on caller search_path';
   END IF;
 END $$;
-RESET search_path;
-DO $$ DECLARE module text; BEGIN
- SELECT probin||'_peer' INTO module FROM pg_proc WHERE oid='public.laplace_cp_id(integer)'::regprocedure;
- EXECUTE format('CREATE FUNCTION pg_temp.peer_id(text) RETURNS public.blake3 AS %L,%L LANGUAGE C IMMUTABLE STRICT',module,'laplace_id');
- EXECUTE format('CREATE FUNCTION pg_temp.peer_separators() RETURNS public.blake3[] AS %L,%L LANGUAGE C IMMUTABLE',module,'laplace_separator_ids');
- IF pg_temp.peer_id('ab')<>public.laplace_id('ab') OR pg_temp.peer_separators()<>public.laplace_separator_ids() THEN
-  RAISE EXCEPTION 'loaded module generations disagree on backend-owned perf-cache configuration';
- END IF;
-END $$;
+ROLLBACK;

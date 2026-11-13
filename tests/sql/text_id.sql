@@ -2,6 +2,8 @@
 \pset format unaligned
 \pset tuples_only on
 SET client_min_messages = warning;
+-- Pure functions over a temporary table, in rolled-back transactions.
+BEGIN;
 CREATE TEMP TABLE engine_text_ids (content text, expected blake3);
 -- Captured from the locally built Engine CLI using the canonical scalar cache.
 INSERT INTO engine_text_ids VALUES
@@ -48,6 +50,14 @@ BEGIN
     END IF;
   END LOOP;
 END $$;
+ROLLBACK;
 -- A second transaction reuses the backend context and its Native/ICU arenas.
-SELECT count(*) = 5 AND bool_and(laplace_text_id(content) = expected) AS repeated_backend_calls FROM engine_text_ids;
+BEGIN;
+SELECT count(*) = 5 AND bool_and(laplace_text_id(content) = expected::blake3) AS repeated_backend_calls FROM (VALUES
+('abandon.01', '2d25f2d444594c0115ab1bdab872167b'),
+('i46360', '5bc6df9ccf51dd8f9399b33e113392ec'),
+('United States', 'ebe26b3b2d2fcd45455cdf0d61468709'),
+('leave-51.2', 'a07f2a034896c2d5a60779c4db1c5c6f'),
+('New York', '7400a4cd15dfbd2acd2ceebfbae264c9')) engine_text_ids(content, expected);
+ROLLBACK;
 SELECT 'text_id: Engine identifiers, phrases, graphemes, RLE and byte preservation passed';
