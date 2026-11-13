@@ -449,6 +449,27 @@ Datum laplace_parts(PG_FUNCTION_ARGS){
     PG_RETURN_ARRAYTYPE_P(id_array(fcinfo, ids, (int)n));
 }
 
+/* The decomposer's word segments of a text, in source order, whitespace and punctuation included (tailored UAX #29,
+ * the segmentation laplace_id composes): each segment's surface and identity. The surfaces concatenate to the text,
+ * byte for byte. Invalid or empty UTF-8 has no segments. */
+typedef struct { FunctionCallInfo fcinfo; Tuplestorestate *ts; TupleDesc td; const char *base; int64 n; } SegmentSink;
+static void segment_row(void *sink, size_t offset, size_t length, const lp_ref *value){
+    SegmentSink *s = sink; Datum v[3]; bool nl[3] = { false, false, false };
+    v[0] = Int64GetDatum(++s->n);
+    v[1] = PointerGetDatum(cstring_to_text_with_len(s->base + offset, (int)length));
+    v[2] = id_datum(&value->id);
+    set_put(s->fcinfo, s->ts, s->td, v, nl);
+}
+PG_FUNCTION_INFO_V1(laplace_segments);
+Datum laplace_segments(PG_FUNCTION_ARGS){
+    text *t = PG_GETARG_TEXT_PP(0); SegmentSink s = { fcinfo, NULL, NULL, VARDATA_ANY(t), 0 };
+    s.ts = set_begin(fcinfo, "laplace_segments", &s.td);
+    int length = VARSIZE_ANY_EXHDR(t);
+    if (length && pg_verify_mbstr(PG_UTF8, s.base, length, true))
+        lp_text_segments(lp_pg_text_context(), (const uint8_t *)s.base, (size_t)length, segment_row, &s);
+    PG_RETURN_NULL();
+}
+
 /* Which tier 0 this database computes with. */
 PG_FUNCTION_INFO_V1(laplace_fingerprint);
 Datum laplace_fingerprint(PG_FUNCTION_ARGS){ uint8 h[32]; lp_tier0_fingerprint(lp_pg_tier0(), h); PG_RETURN_TEXT_P(fingerprint_text(h)); }

@@ -7,8 +7,10 @@ geometry
 gin_path
 gist4d
 text_id
+segments
 realization_depth
 projection
+curves
 attestation
 stage
 stage_routing

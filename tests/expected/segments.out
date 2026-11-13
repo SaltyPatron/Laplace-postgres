@@ -1,0 +1,2 @@
+\set ECHO none
+segments: word-tier segments in source order, separators split, identities and byte-exact recomposition passed
