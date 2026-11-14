@@ -102,9 +102,6 @@ file(MAKE_DIRECTORY "${_sql_output}")
 # Hash the actual linked bytes; the stable laplace alias remains for older installs
 # and private-package tooling. The generated control binds new functions to the hash.
 set(_module_package "${CMAKE_CURRENT_BINARY_DIR}/package-laplace-module.cmake")
-file(GENERATE OUTPUT "${_module_package}" CONTENT
-  "set(MODULE [==[$<TARGET_FILE:laplace_pg>]==])\nset(CONTROL [==[${CMAKE_CURRENT_SOURCE_DIR}/laplace.control]==])\nset(OUTPUT [==[${_sql_output}]==])\nset(OVERRIDE [==[${LAPLACE_PG_MODULE_PATHNAME}]==])\ninclude([==[${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageModule.cmake]==])\n")
-add_custom_command(TARGET laplace_pg POST_BUILD COMMAND ${CMAKE_COMMAND} -P "${_module_package}" VERBATIM)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/laplace.control" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageModule.cmake")
 file(READ "${_sql_root}/operations.sql" _operations)
 file(READ "${_sql_root}/api.sql" _api)
@@ -120,14 +117,20 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/ope
 file(READ "${_sql_root}/path_set_match.sql" _path_set_match)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/path_set_match.sql")
 # Greenfield until something is deployed: one install script and no update paths; a database holding
-# another version of the extension is recreated.
-set(_current_version "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
+# another version of the extension is recreated. The version is the content hash of that script, so any change to
+# what CREATE EXTENSION declares is another version: a fixed number would leave a database made from an earlier
+# script holding it, without the functions and tables the installed module and its callers now expect.
 set(_input "${_sql_root}/laplace.sql.in")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_input}")
 file(READ "${_input}" _sql)
 string(REPLACE "-- @laplace_path_set_match@" "${_path_set_match}" _sql "${_sql}")
 string(REPLACE "-- @laplace_operations@" "${_operations}" _sql "${_sql}")
 string(REPLACE "-- @laplace_api@" "${_api}" _sql "${_sql}")
+string(SHA256 _current_version "${_sql}")
+string(SUBSTRING "${_current_version}" 0 16 _current_version)
+file(GENERATE OUTPUT "${_module_package}" CONTENT
+  "set(MODULE [==[$<TARGET_FILE:laplace_pg>]==])\nset(CONTROL [==[${CMAKE_CURRENT_SOURCE_DIR}/laplace.control]==])\nset(VERSION [==[${_current_version}]==])\nset(OUTPUT [==[${_sql_output}]==])\nset(OVERRIDE [==[${LAPLACE_PG_MODULE_PATHNAME}]==])\ninclude([==[${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageModule.cmake]==])\n")
+add_custom_command(TARGET laplace_pg POST_BUILD COMMAND ${CMAKE_COMMAND} -P "${_module_package}" VERBATIM)
 set(LAPLACE_EXTENSION_SQL "${_sql_output}/laplace--${_current_version}.sql")
 set(_installed_sql "")
 if(EXISTS "${LAPLACE_EXTENSION_SQL}")
