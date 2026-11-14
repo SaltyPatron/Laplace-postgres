@@ -27,9 +27,11 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "varatt.h"
+#include <sys/stat.h>
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
 #include "laplace/highway.h"
+#include "laplace/perfcache.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
 #include "pg_core.h"
@@ -109,6 +111,22 @@ const lp_highway *lp_pg_highway(void){
     if (!h) ereport(ERROR, (errmsg("laplace: cannot map the highway at \"%s\" (laplace.highway; generate it with: laplace highway)", path)));
     return h;
 }
+/* The chess perf-cache (laplace.chess). Not required: NULL when the setting is empty or no file is there. A file that is
+ * there and does not load, is not a chess module, or was composed from another tier 0 is an error, never half used. */
+static char *chess_path = NULL;
+const lp_perfcache *lp_pg_chess(bool required){
+    const char *path=GetConfigOption("laplace.chess",true,false);
+    if (!path || !*path) {
+        if (required) ereport(ERROR, (errcode(ERRCODE_CONFIG_FILE_ERROR), errmsg("laplace: no chess perf-cache is configured (laplace.chess)")));
+        return NULL;
+    }
+    if (!required) { struct stat st; if (stat(path, &st) != 0) return NULL; }
+    const lp_perfcache *c = lp_perfcache_map(path);
+    if (!c) ereport(ERROR, (errcode(ERRCODE_CONFIG_FILE_ERROR), errmsg("laplace: cannot map the chess perf-cache at \"%s\" (laplace.chess; generate it with: laplace chess)", path)));
+    if (strcmp(c->module, "chess")) ereport(ERROR, (errcode(ERRCODE_CONFIG_FILE_ERROR), errmsg("laplace: \"%s\" (laplace.chess) is a %s perf-cache module, not chess", path, c->module)));
+    if (!lp_perfcache_bound(c, lp_pg_tier0())) ereport(ERROR, (errcode(ERRCODE_CONFIG_FILE_ERROR), errmsg("laplace: the chess perf-cache at \"%s\" was composed from another tier 0 (laplace.tier0): it is stale; generate it again with: laplace chess", path)));
+    return c;
+}
 /* Native's working memory (its maps, arrays, buffers) comes from the transaction's memory: what a call holds is freed by
  * the call, and whatever an error leaves behind goes with the transaction. */
 static void *tx_grow(void *p, size_t n){ return p ? repalloc_huge(p, n) : MemoryContextAllocHuge(TopTransactionContext, n); }
@@ -127,6 +145,9 @@ void _PG_init(void){
     cache_setting("laplace.flags", "Path of the flags that go with tier 0 (1,114,112 256-bit records; their layout beside them).", &flags_path,lp_flags_path());
     cache_setting("laplace.highway", "Path of the highway perf-cache (the types the resources list, and the mappings between them; its layout beside it).", &highway_path,lp_highway_path());
     cache_setting("laplace.highway_profile", "Highway domain profile (core, wordnet, frames, lexical, full; empty uses full or LAPLACE_HIGHWAY_PROFILE).", &highway_profile, "");
+    static char chess_default[4096];
+    cache_setting("laplace.chess", "Path of the chess perf-cache (chess's vocabulary and the admitted positions and moves; laplace chess writes it).", &chess_path,
+                  lp_perfcache_beside_tier0("LAPLACE_CHESS", ".chess", chess_default, sizeof chess_default));
 }
 
 /* ---------------------------------------------------------------- identity */
@@ -540,6 +561,58 @@ Datum laplace_type_edges(PG_FUNCTION_ARGS){
 }
 PG_FUNCTION_INFO_V1(laplace_highway_fingerprint);
 Datum laplace_highway_fingerprint(PG_FUNCTION_ARGS){ uint8_t fp[32]; lp_highway_fingerprint(lp_pg_highway(), fp); PG_RETURN_TEXT_P(fingerprint_text(fp)); }
+
+/* ---------------------------------------------------------------- the chess perf-cache, in place
+ * The module laplace chess (Laplace-Engine) writes: chess's vocabulary by direct address and the admitted positions and
+ * moves, each record an ID, its real coordinate, its slot and its tier (laplace/perfcache.h). Every lookup is a vector:
+ * a request's IDs or slots in, a row for each that the module holds out, by its ordinal; a miss is no row and says
+ * nothing about whether the content exists. The lookups resolve request values into canonical keys for an indexed
+ * probe; they are never a predicate over a stored column. */
+PG_FUNCTION_INFO_V1(laplace_chess_fingerprint);
+Datum laplace_chess_fingerprint(PG_FUNCTION_ARGS){
+    const lp_perfcache *c = lp_pg_chess(false); if (!c) PG_RETURN_NULL();
+    uint8_t fp[32]; lp_perfcache_fingerprint(c, fp); PG_RETURN_TEXT_P(fingerprint_text(fp));
+}
+PG_FUNCTION_INFO_V1(laplace_chess_records_ewkb);
+Datum laplace_chess_records_ewkb(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_chess_records", &td);
+    const lp_perfcache *c = lp_pg_chess(true); int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    for (int i = 0; i < n; i++) {
+        const lp_section *s; const lp_tier0_record *r = lp_perfcache_find(c, &ids[i], &s); if (!r) continue;
+        lp_coord co; memcpy(co.m, r->m, sizeof co.m);
+        Datum v[6] = { Int32GetDatum(i + 1), PointerGetDatum(cstring_to_text(s->name)), Int32GetDatum((int32)r->rank), Int32GetDatum((int32)r->pad),
+                       PointerGetDatum(coord_ewkb(&co)), Int64GetDatum(lp_hilbert_key(r->hilbert)) };
+        bool nl[6] = { 0 }; set_put(fcinfo, ts, td, v, nl);
+    }
+    pfree(ids); PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_chess_at);
+Datum laplace_chess_at(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_chess_at", &td);
+    const lp_perfcache *c = lp_pg_chess(true); char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    const lp_section *s = lp_perfcache_section(c, name);
+    if (!s || s->kind == LP_PERFCACHE_PAIRS) ereport(ERROR, (errmsg("laplace: the chess perf-cache has no section of records named \"%s\"", name)));
+    Datum *d; bool *nulls; int n; deconstruct_array(PG_GETARG_ARRAYTYPE_P(1), INT4OID, 4, true, TYPALIGN_INT, &d, &nulls, &n);
+    for (int i = 0; i < n; i++) {
+        int32 slot = nulls[i] ? -1 : DatumGetInt32(d[i]); const lp_tier0_record *r = slot >= 0 ? lp_perfcache_at(c, s, (uint32)slot) : NULL;
+        if (!r) continue;
+        Datum v[2] = { Int32GetDatum(i + 1), id_datum(&r->id) }; bool nl[2] = { 0 }; set_put(fcinfo, ts, td, v, nl);
+    }
+    PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_chess_next);
+Datum laplace_chess_next(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_chess_next", &td);
+    const lp_perfcache *c = lp_pg_chess(true); const lp_section *s = lp_perfcache_section(c, "next");
+    if (!s || s->kind != LP_PERFCACHE_PAIRS) ereport(ERROR, (errmsg("laplace: the chess perf-cache has no (position, move) -> position table")));
+    int np, nm; lp_id *p = ids_of(PG_GETARG_ARRAYTYPE_P(0), &np), *m = ids_of(PG_GETARG_ARRAYTYPE_P(1), &nm);
+    if (np != nm) ereport(ERROR, (errmsg("laplace_chess_next: %d positions and %d moves: one move for each position", np, nm)));
+    for (int i = 0; i < np; i++) {
+        const lp_pair *pair = lp_perfcache_pair(c, s, &p[i], &m[i]); if (!pair) continue;
+        Datum v[2] = { Int32GetDatum(i + 1), id_datum(&pair->c) }; bool nl[2] = { 0 }; set_put(fcinfo, ts, td, v, nl);
+    }
+    pfree(p); pfree(m); PG_RETURN_NULL();
+}
 
 /* ---------------------------------------------------------------- observability */
 PG_FUNCTION_INFO_V1(laplace_isa);

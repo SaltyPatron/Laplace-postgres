@@ -15,6 +15,7 @@
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
 #include "laplace/highway.h"
+#include "laplace/perfcache.h"
 #include "laplace/geometry.h"
 #include "varatt.h"
 
@@ -22,6 +23,8 @@ const lp_tier0_record *lp_pg_tier0(void);
 lp_text *lp_pg_text_context(void);
 const lp_layout *lp_pg_flags(void);
 const lp_highway *lp_pg_highway(void);
+/* The chess perf-cache laplace.chess names; required: an error rather than NULL when none is configured or there. */
+const lp_perfcache *lp_pg_chess(bool required);
 lp_mask lp_pg_mask_native(Datum mask);
 lp_mask lp_pg_kind_mask(const char *role);
 bytea *lp_pg_path_export(Datum geometry);

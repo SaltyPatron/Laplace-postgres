@@ -1,0 +1,7 @@
+\set ECHO none
+t
+t
+t
+2:position:4 3:move:2 4:position:4
+t
+chess: the configured perf-cache's records are the extension's own compositions; misses are no rows
