@@ -40,7 +40,10 @@ static PgEdge *pg_dag_edge(PgDag *d, size_t p, size_t c, const lp_vertex *v)
     return &d->e.v[d->e.n-1];
 }
 
-typedef struct { size_t *head, *order, n; } PgDown;
+/* The walk down one DAG, prepared once for all its tops: each node's first outgoing edge, the topological order and
+ * each node's place in it, and the scratch a top's count over its own reach uses (lp_dag_count_reach), so counting
+ * under R tops costs their reaches, not R times the whole DAG. */
+typedef struct { size_t *head, *order, *rank, n; double *counts; uint8_t *mark; size_t *reach, *stack, *edges; } PgDown;
 typedef void (*PgTestimonyVisit)(const void *,const void *,const uint64_t *,size_t,double,void *);
 
 static void *pg_down_array(size_t count,size_t width,bool zero)
@@ -82,29 +85,45 @@ static PgDown pg_down_prepare(PgDag *d)
     PgEdgeReader r = { .d=d,.head=head };
     if (!lp_dag_order(n, pg_edge_next, &r, order))
         ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace containment is not a DAG: %m")));
-    return (PgDown){head,order,n};
+    size_t *rank = pg_down_array(n,sizeof *rank,false);
+    for (size_t i = 0; i < n; i++) rank[order[i]] = i;
+    return (PgDown){ .head=head,.order=order,.rank=rank,.n=n,
+        .counts=pg_down_array(n,sizeof(double),true),.mark=pg_down_array(n,1,true),
+        .reach=pg_down_array(n,sizeof(size_t),false),.stack=pg_down_array(n,sizeof(size_t),false),
+        .edges=pg_down_array(Max(d->e.n,(size_t)1),sizeof(size_t),false) };
 }
 
-static double *pg_down_from(const PgDag *d, const PgDown *walk, size_t top)
+/* The counts under top over its reach (walk->counts, set on walk->reach only); the reach's size. */
+static size_t pg_down_from(const PgDag *d, PgDown *walk, size_t top)
 {
-    double *cnt = pg_down_array(d->n.n,sizeof *cnt,false);
     PgEdgeReader r = { .d=d,.head=walk->head,.interruptible=true };
-    if (!lp_dag_count(d->n.n, pg_edge_next, &r, walk->order, top, cnt))
+    size_t found = lp_dag_count_reach(walk->n, pg_edge_next, &r, walk->order, walk->rank, top, walk->counts, walk->mark, walk->reach, walk->stack);
+    if (found == (size_t)-1)
         ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace containment count failed: %m")));
-    return cnt;
+    return found;
 }
+static void pg_down_done(PgDown *walk, size_t found){ lp_dag_reach_clear(walk->reach, found, walk->counts, walk->mark); }
 
 static void pg_down_free(PgDown *walk)
 {
-    pfree(walk->head); pfree(walk->order);
+    pfree(walk->head); pfree(walk->order); pfree(walk->rank); pfree(walk->counts); pfree(walk->mark);
+    pfree(walk->reach); pfree(walk->stack); pfree(walk->edges);
 }
 
-static void pg_tally_under(const PgDag *d, const double *cnt, lp_strmap *per_claim)
+static int by_edge(const void *a, const void *b){ size_t x = *(const size_t *)a, y = *(const size_t *)b; return x < y ? -1 : x > y; }
+/* Each claim edge below top, tallied in the DAG's edge order (the order every reader of it tallies in, so the sums are
+ * the same bits): the edges of the reach's nodes alone. */
+static void pg_tally_under(const PgDag *d, PgDown *walk, size_t found, lp_strmap *per_claim)
 {
-    for (size_t k = 0; k < d->e.n; k++) {
-        if (!(k & 4095)) CHECK_FOR_INTERRUPTS();
+    size_t ne = 0;
+    for (size_t i = 0; i < found; i++)
+        for (size_t k = walk->head[walk->reach[i]]; k != PG_NONE; k = d->e.v[k].next) if (d->e.v[k].claim) walk->edges[ne++] = k;
+    qsort(walk->edges, ne, sizeof *walk->edges, by_edge);
+    const double *cnt = walk->counts;
+    for (size_t j = 0; j < ne; j++) {
+        size_t k = walk->edges[j];
+        if (!(j & 4095)) CHECK_FOR_INTERRUPTS();
         const PgEdge *e = &d->e.v[k];
-        if (!e->claim) continue;
         double c = cnt[e->p]; if (c <= 0) continue;
         bool fresh;
         uint8_t key[32]={0}; memcpy(key,d->n.v[e->c].id.b,16);
@@ -265,8 +284,8 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     for(size_t i=0;i<lp_idmap_count(roots);i++){
         const lp_id *root=lp_idmap_keys(roots)+i;
         size_t top=(size_t)lp_idmap_find(d.m,root);
-        double *counts=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
-        pg_tally_under(&d,counts,per_claim);
+        size_t found=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
+        pg_tally_under(&d,&walk,found,per_claim);pg_down_done(&walk,found);
         for(size_t j=0;j<lp_strmap_count(per_claim);j++){
             const PgTally *t=lp_strmap_at(per_claim,j);if(t->t.games<=0)continue;
             Datum values[8]={id_datum(root),id_datum(&t->claim),Float8GetDatum(t->t.games),Float8GetDatum(t->t.tokens),
@@ -276,7 +295,7 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
             bool nulls[8]={false,false,false,false,false,false,!t->has_dependence,!t->has_dependence};
             set_put(fcinfo,ts,td,values,nulls);
         }
-        lp_strmap_free(per_claim);pfree(counts);
+        lp_strmap_free(per_claim);
     }
     pg_down_free(&walk);
     lp_idmap_free(selected);lp_idmap_free(roots);lp_idmap_free(seen);lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);
@@ -402,9 +421,10 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
             if(is_w)testimony(&d,&walk,ordinals.v,top,tr,testimony_context);
             continue;
         }
-        double *cnt = pg_down_from(&d, &walk, top);
+        size_t found = pg_down_from(&d, &walk, top);
         lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
-        pg_tally_under(&d, cnt, per_claim);
+        pg_tally_under(&d, &walk, found, per_claim);
+        pg_down_done(&walk, found);
         for (size_t i = 0; i < lp_strmap_count(per_claim); i++) {
             const PgTally *tl = lp_strmap_at(per_claim, i);
             if (tl->t.games <= 0) continue;
@@ -414,7 +434,6 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
             lp_push(out, row);
         }
         lp_strmap_free(per_claim);
-        pfree(cnt);
     }
     pg_down_free(&walk);
     lp_vec_free(&ordinals);
