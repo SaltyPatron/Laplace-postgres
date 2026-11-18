@@ -28,14 +28,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
         run: bash Laplace-Operations/native-inputs.sh prepare "$GITHUB_WORKSPACE/Laplace-Native"
-      - name: Verify Native source selection across reconfiguration
-        run: cmake "-DSOURCE=$GITHUB_WORKSPACE/Laplace-postgres" "-DWORK=$RUNNER_TEMP/native-source-defaults" -P Laplace-postgres/tests/native-source-defaults.cmake
+      - name: Native package (built once per Native revision, Laplace-Operations native-package.sh)
+        run: |
+          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+          prefix=$(LAPLACE_SRC=$GITHUB_WORKSPACE bash Laplace-Operations/native-package.sh "$GITHUB_WORKSPACE/Laplace-Native")
+          echo "LAPLACE_NATIVE_PACKAGE=$prefix/lib/cmake/LaplaceNative" >> "$GITHUB_ENV"
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
-          export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native
+          export LAPLACE_SRC=$GITHUB_WORKSPACE
           cmake -S Laplace-postgres -B "$LAPLACE_BUILD/Laplace-postgres/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_OPERATIONS:PATH="$GITHUB_WORKSPACE/Laplace-Operations"
+            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLaplaceNative_DIR:PATH="$LAPLACE_NATIVE_PACKAGE" -DLAPLACE_OPERATIONS:PATH="$GITHUB_WORKSPACE/Laplace-Operations"
           cmake --build "$LAPLACE_BUILD/Laplace-postgres/icx-release"
           ctest --test-dir "$LAPLACE_BUILD/Laplace-postgres/icx-release" --output-on-failure
       - name: Function bindings declared by the build
