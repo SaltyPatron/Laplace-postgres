@@ -74,7 +74,7 @@ static long enrichment_fetch_rows(void)
     return (long)Min(count, (Size)INT_MAX);
 }
 
-static int oid_cmp(const void *a, const void *b)
+static int lp_oid_cmp(const void *a, const void *b)
 {
     Oid x = *(const Oid *)a, y = *(const Oid *)b;
     return (x > y) - (x < y);
@@ -872,7 +872,7 @@ static int64 clean_partition_oid_list(const Oid *part_oids, int n)
             index_close(idx, NoLock);
         }
         list_free(idxs);
-        if (ngins > 1) qsort(gin_oids, (size_t)ngins, sizeof(Oid), oid_cmp);
+        if (ngins > 1) qsort(gin_oids, (size_t)ngins, sizeof(Oid), lp_oid_cmp);
         for (int j = 0; j < ngins; j++)
             cleaned += clean_gin_index_oid(gin_oids[j], poid, parent_oid, uid);
         pfree(gin_oids);
@@ -964,7 +964,7 @@ Datum laplace_stage_own(PG_FUNCTION_ARGS)
     }
     pfree(elems);
     pfree(nulls);
-    qsort(oids, (size_t)n, sizeof(Oid), oid_cmp);
+    qsort(oids, (size_t)n, sizeof(Oid), lp_oid_cmp);
     int uniq = 0;
     for (int i = 0; i < n; i++)
         if (uniq == 0 || oids[uniq - 1] != oids[i]) oids[uniq++] = oids[i];
@@ -998,7 +998,7 @@ static int abandoned_cmp(const void *a, const void *b)
 {
     const AbandonedLeaseRow *x = a, *y = b;
     int c = strcmp(x->desc, y->desc);
-    return c ? c : oid_cmp(&x->oid, &y->oid);
+    return c ? c : lp_oid_cmp(&x->oid, &y->oid);
 }
 
 PG_FUNCTION_INFO_V1(laplace_stage_retire);
@@ -1103,7 +1103,7 @@ typedef struct {
 static int merge_insert_cmp(const void *a, const void *b)
 {
     const MergeRow *x = a, *y = b;
-    int c = oid_cmp(&x->partition, &y->partition);
+    int c = lp_oid_cmp(&x->partition, &y->partition);
     if (c) return c;
     c = (x->hilbert > y->hilbert) - (x->hilbert < y->hilbert);
     return c ? c : memcmp(x->id.b, y->id.b, sizeof(lp_id));
@@ -1495,7 +1495,7 @@ Datum laplace_merge_stage(PG_FUNCTION_ARGS)
     Oid *po;
     while ((po = hash_seq_search(&hseq))) pending_oids[pi++] = *po;
     hash_destroy(touched_parts);
-    if (pi > 1) qsort(pending_oids, (size_t)pi, sizeof(Oid), oid_cmp);
+    if (pi > 1) qsort(pending_oids, (size_t)pi, sizeof(Oid), lp_oid_cmp);
 
     ArrayType *pending_arr = NULL;
     if (defer_index && pi > 0) {

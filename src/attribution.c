@@ -592,8 +592,8 @@ retry:
 
 static bool pg_writer_delete_tid(PgRelWriter *w, ItemPointer tid)
 {
-retry:
     TM_FailureData tmfd;
+retry:
     TM_Result res = table_tuple_delete(w->rel, tid, w->cid, w->snap, InvalidSnapshot, true, &tmfd, false);
     if (res == TM_Updated) {
         if (IsolationUsesXactSnapshot())
