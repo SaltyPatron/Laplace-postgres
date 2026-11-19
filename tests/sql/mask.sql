@@ -80,28 +80,23 @@ RETURN md5('Laplace check regression mask leaf '||n)::blake3;
 CREATE UNLOGGED TABLE stage.check_mask_entity (LIKE public.entity INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
 CREATE UNLOGGED TABLE stage.check_mask_physicality (LIKE public.physicality INCLUDING DEFAULTS INCLUDING CONSTRAINTS);
 
-INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
-VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('upos', 'NOUN'));
-INSERT INTO public.entity SELECT * FROM stage.check_mask_entity
-ON CONFLICT (id) DO UPDATE SET mask = laplace_mask_merge(entity.mask, EXCLUDED.mask);
-TRUNCATE stage.check_mask_entity;
-INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
-VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), 9, laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('lexfile', 'noun.animal'));
-INSERT INTO public.entity SELECT * FROM stage.check_mask_entity
-ON CONFLICT (id) DO UPDATE SET mask = laplace_mask_merge(entity.mask, EXCLUDED.mask);
+DO $$ BEGIN
+  INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('upos', 'NOUN'));
+  INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
+          laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_mask_slot('kind', 'claim'));
+  PERFORM laplace_merge_stage('stage.check_mask_entity', 'stage.check_mask_physicality');
 
-INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
-VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
-        laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_mask_slot('kind', 'claim'));
-INSERT INTO public.physicality SELECT * FROM stage.check_mask_physicality
-ON CONFLICT (entity) DO UPDATE SET mask = laplace_mask_merge(physicality.mask, EXCLUDED.mask);
-TRUNCATE stage.check_mask_physicality;
-INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
-VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), 9, laplace_hilbert('ab'),
-        laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]),
-        laplace_mask_slot('kind', 'record') | laplace_mask_slot('deprel', 'nsubj'));
-INSERT INTO public.physicality SELECT * FROM stage.check_mask_physicality
-ON CONFLICT (entity) DO UPDATE SET mask = physicality.mask | EXCLUDED.mask;
+  TRUNCATE stage.check_mask_entity, stage.check_mask_physicality;
+  INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('lexfile', 'noun.animal'));
+  INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
+          laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]),
+          laplace_mask_slot('kind', 'record') | laplace_mask_slot('deprel', 'nsubj'));
+  PERFORM laplace_merge_stage('stage.check_mask_entity', 'stage.check_mask_physicality');
+END $$;
 
 SET enable_seqscan = off;
 DO $$

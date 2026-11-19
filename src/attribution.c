@@ -1842,21 +1842,73 @@ static int part_id_item_cmp(const void *a, const void *b)
     return c ? c : lp_id_cmp(&x->id, &y->id);
 }
 
+static int64 delete_part_matching_ids(Oid partOid, Oid pkOid, const char *relname, Oid native_id,
+                                      const PartIdItem *items, size_t begin, size_t end, size_t array_ids)
+{
+    PgRelWriter w;
+    pg_writer_open(&w, partOid, false);
+    if (!OidIsValid(pkOid)) pkOid = RelationGetPrimaryKeyIndex(w.rel, false);
+    if (!OidIsValid(pkOid)) ereport(ERROR, (errmsg("Native %s: partition has no primary index", relname)));
+    Relation idx = index_open(pkOid, AccessShareLock);
+    Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
+    RegProcedure eq_proc = get_opcode(eq_op);
+
+    lp_vec(ItemPointerData) tids = {0};
+    for (size_t c0 = begin; c0 < end;) {
+        CHECK_FOR_INTERRUPTS();
+        size_t c1 = Min(end, c0 + array_ids);
+        size_t len = c1 - c0;
+        Datum *vals = palloc(sizeof(Datum) * len);
+        for (size_t k = 0; k < len; k++) vals[k] = PointerGetDatum(&items[c0 + k].id);
+        ArrayType *wanted = construct_array(vals, (int)len, native_id, sizeof(lp_id), false, TYPALIGN_CHAR);
+        pfree(vals);
+
+        ScanKeyData sk;
+        ScanKeyEntryInitialize(&sk, SK_SEARCHARRAY, 1, BTEqualStrategyNumber, native_id,
+                               idx->rd_indcollation[0], eq_proc, PointerGetDatum(wanted));
+        IndexScanDesc scan = index_beginscan(w.rel, idx, w.snap, NULL, 1, 0);
+        index_rescan(scan, &sk, 1, NULL, 0);
+        while (index_getnext_slot(scan, ForwardScanDirection, w.old_slot)) {
+            CHECK_FOR_INTERRUPTS();
+            lp_push(&tids, w.old_slot->tts_tid);
+            ExecClearTuple(w.old_slot);
+        }
+        index_endscan(scan);
+        pfree(wanted);
+        c0 = c1;
+    }
+    index_close(idx, NoLock);
+
+    int64 deleted = 0;
+    for (size_t k = 0; k < tids.n; k++) {
+        CHECK_FOR_INTERRUPTS();
+        if (pg_writer_delete_tid(&w, &tids.v[k]))
+            deleted++;
+    }
+    lp_vec_free(&tids);
+    pg_writer_close(&w);
+    return deleted;
+}
+
 static int64 delete_ids_from_partitioned(const char *relname, const char *col, Oid native_id,
                                          const lp_id *ids, size_t n)
 {
+    (void)col;
     if (!n) return 0;
 
     Oid relid = lp_pg_relation(relname);
     Relation parent = table_open(relid, AccessShareLock);
     PartitionKey pkey = RelationGetPartitionKey(parent);
-    PartitionDesc pdesc = pkey ? RelationGetPartitionDesc(parent, true) : NULL;
+    AttrNumber tier_att = get_attnum(relid, "tier");
+    bool by_tier = (pkey && pkey->strategy == PARTITION_STRATEGY_RANGE && pkey->partnatts == 1 &&
+                    tier_att != InvalidAttrNumber && pkey->partattrs[0] == tier_att);
+    PartitionDesc pdesc = (!by_tier && pkey) ? RelationGetPartitionDesc(parent, true) : NULL;
 
     PartIdItem *items = palloc_extended(sizeof(*items) * n, MCXT_ALLOC_HUGE);
     for (size_t i = 0; i < n; i++) {
         items[i] = (PartIdItem){
             .id = ids[i],
-            .partition = lp_pg_enrichment_partition(relid, pkey, pdesc, PointerGetDatum(&ids[i]))
+            .partition = by_tier ? InvalidOid : lp_pg_enrichment_partition(relid, pkey, pdesc, PointerGetDatum(&ids[i]))
         };
     }
     table_close(parent, NoLock);
@@ -1874,53 +1926,22 @@ static int64 delete_ids_from_partitioned(const char *relname, const char *col, O
     size_t array_ids = (MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(lp_id);
     int64 deleted = 0;
 
-    for (size_t begin = 0; begin < unique;) {
-        CHECK_FOR_INTERRUPTS();
-        size_t end = begin + 1;
-        while (end < unique && items[end].partition == items[begin].partition) end++;
-        if (end - begin > array_ids) end = begin + array_ids;
-        size_t len = end - begin;
-
-        Oid partOid = items[begin].partition;
-        PgRelWriter w;
-        pg_writer_open(&w, partOid, false);
-        Oid pkOid = InvalidOid;
-        for (int p = 0; p < nparts; p++) if (parts[p] == partOid) { pkOid = pks[p]; break; }
-        if (!OidIsValid(pkOid)) pkOid = RelationGetPrimaryKeyIndex(w.rel, false);
-        if (!OidIsValid(pkOid)) ereport(ERROR, (errmsg("Native %s: partition has no primary index", relname)));
-        Relation idx = index_open(pkOid, AccessShareLock);
-
-        Datum *vals = palloc(sizeof(Datum) * len);
-        for (size_t k = 0; k < len; k++) vals[k] = PointerGetDatum(&items[begin + k].id);
-        ArrayType *wanted = construct_array(vals, (int)len, native_id, sizeof(lp_id), false, TYPALIGN_CHAR);
-        pfree(vals);
-
-        Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
-        ScanKeyData sk;
-        ScanKeyEntryInitialize(&sk, SK_SEARCHARRAY, 1, BTEqualStrategyNumber, native_id,
-                               idx->rd_indcollation[0], get_opcode(eq_op), PointerGetDatum(wanted));
-        IndexScanDesc scan = index_beginscan(w.rel, idx, w.snap, NULL, 1, 0);
-        index_rescan(scan, &sk, 1, NULL, 0);
-
-        lp_vec(ItemPointerData) tids = {0};
-        while (index_getnext_slot(scan, ForwardScanDirection, w.old_slot)) {
+    if (by_tier) {
+        for (int p = 0; p < nparts; p++) {
             CHECK_FOR_INTERRUPTS();
-            (void)col;
-            lp_push(&tids, w.old_slot->tts_tid);
-            ExecClearTuple(w.old_slot);
+            deleted += delete_part_matching_ids(parts[p], pks[p], relname, native_id, items, 0, unique, array_ids);
         }
-        index_endscan(scan);
-        pfree(wanted);
-        index_close(idx, NoLock);
-
-        for (size_t k = 0; k < tids.n; k++) {
+    } else {
+        for (size_t begin = 0; begin < unique;) {
             CHECK_FOR_INTERRUPTS();
-            if (pg_writer_delete_tid(&w, &tids.v[k]))
-                deleted++;
+            size_t end = begin + 1;
+            while (end < unique && items[end].partition == items[begin].partition) end++;
+            Oid partOid = items[begin].partition;
+            Oid pkOid = InvalidOid;
+            for (int p = 0; p < nparts; p++) if (parts[p] == partOid) { pkOid = pks[p]; break; }
+            deleted += delete_part_matching_ids(partOid, pkOid, relname, native_id, items, begin, end, array_ids);
+            begin = end;
         }
-        lp_vec_free(&tids);
-        pg_writer_close(&w);
-        begin = end;
     }
 
     pfree(items);
