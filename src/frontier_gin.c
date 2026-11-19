@@ -4,6 +4,7 @@
 #include "geo.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
 #include "access/htup_details.h"
 #include "access/genam.h"
 #include "access/gin.h"
@@ -105,7 +106,7 @@ static bool key_active(lp_idmap *wanted,size_t at,uint64 h_kinds,uint64 nom_cap,
 }
 typedef bool (*ContainerVisit)(TupleTableSlot *slot,void *context);
 static void scan_container_rows(Relation parent,const char *column,lp_idmap *wanted,StrategyNumber strategy,
-                                 lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,bool assertions,uint64 nom_cap,ContainerVisit visit,void *context)
+                                 lp_idmap *required,bool required_any,int endpoint,lp_idmap *opposite,lp_mask bits,bool assertions,uint64 nom_cap,int16 min_floor,ContainerVisit visit,void *context)
 {
     if(GinFuzzySearchLimit)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native containment requires exact GIN search (gin_fuzzy_search_limit=0)")));
@@ -118,6 +119,14 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     }
     PartitionDesc partdesc=parent->rd_rel->relkind==RELKIND_PARTITIONED_TABLE?RelationGetPartitionDesc(parent,true):NULL;
     int nparts=partdesc?partdesc->nparts:1;
+    bool prune_tier=(min_floor>=0 && partdesc!=NULL && RelationGetNamespace(parent)==lp_pg_schema() &&
+                     strcmp(RelationGetRelationName(parent),"physicality")==0);
+    const Oid *canon_parts=NULL;const int16 *min_t=NULL,*max_t=NULL;int n_canon=0;
+    if(prune_tier){
+        n_canon=lp_pg_canonical_partitions("physicality",&canon_parts,NULL,NULL,NULL);
+        (void)lp_pg_canonical_tier_bounds("physicality",&min_t,&max_t);
+        if(!min_t || !max_t || n_canon!=nparts)prune_tier=false;
+    }
     Snapshot snapshot=GetActiveSnapshot();
     MemoryContext scratch=AllocSetContextCreate(CurrentMemoryContext,"Native GIN tuple",ALLOCSET_SMALL_SIZES);
     size_t budget=frontier_window_ids(),unique=lp_idmap_count(wanted);uint64 epoch=0;bool proceed=true;
@@ -145,6 +154,7 @@ static void scan_container_rows(Relation parent,const char *column,lp_idmap *wan
     if(cached_parent[a_slot]!=RelationGetRelid(parent)){memset(cached_idx[a_slot],0,sizeof(cached_idx[a_slot]));cached_parent[a_slot]=RelationGetRelid(parent);}
     for(int p_idx=0;p_idx<nparts;p_idx++){
         Oid relation_id=partdesc?partdesc->oids[p_idx]:RelationGetRelid(parent);
+        if(prune_tier && canon_parts[p_idx]==relation_id && max_t[p_idx]<=min_floor)continue;
         CHECK_FOR_INTERRUPTS();Relation table=table_open(relation_id,AccessShareLock);
         if(table->rd_rel->relkind==RELKIND_PARTITIONED_TABLE){table_close(table,NoLock);continue;}
         if(!table->rd_tableam || !table->rd_tableam->scan_bitmap_next_tuple)
@@ -277,10 +287,10 @@ static bool container_parent(TupleTableSlot *slot,void *context)
 {
     ContainerParents *out=context;container_remember(slot,out->id,out->parents);return true;
 }
-static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits,bool assertions)
+static void scan_containers(Relation parent,const char *column,lp_idmap *wanted,lp_idmap *parents,StrategyNumber strategy,lp_mask bits,bool assertions,int16 min_floor)
 {
     ContainerParents out={get_attnum(RelationGetRelid(parent),"entity"),parents};
-    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,assertions,0,container_parent,&out);
+    scan_container_rows(parent,column,wanted,strategy,NULL,false,0,NULL,bits,assertions,0,min_floor,container_parent,&out);
 }
 typedef struct {AttrNumber id,path,mask;lp_idmap *parents;lp_pg_path_visit visit;void *context;} DirectContainers;
 static bool direct_container_visit(TupleTableSlot *slot,void *context)
@@ -307,7 +317,7 @@ void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool asser
             get_attnum(RelationGetRelid(parent),"path"),
             masks?get_attnum(RelationGetRelid(parent),"mask"):InvalidAttrNumber,
             parents,visit,context};
-        scan_container_rows(parent,column,wanted,3,NULL,false,0,NULL,0,assertions,0,direct_container_visit,&out);
+        scan_container_rows(parent,column,wanted,3,NULL,false,0,NULL,0,assertions,0,-1,direct_container_visit,&out);
         table_close(parent,NoLock);
     }PG_FINALLY();{lp_idmap_free(wanted);lp_idmap_free(parents);}PG_END_TRY();
 }
@@ -373,7 +383,7 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
     lp_idmap *wanted=lp_idmap_sized(sizeof(uint64)),*parents=lp_idmap_sized(sizeof(CarrierLocation));
     PG_TRY();{
         for(int i=0;i<count;i++){bool fresh;size_t at=lp_idmap_put(wanted,ids+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(wanted,at)=0;}
-        scan_containers(parent,column,wanted,parents,7,out.bits,false);
+        scan_containers(parent,column,wanted,parents,7,out.bits,false,(int16)out.floor);
         size_t found=lp_idmap_count(parents);
         PresenceKey *keys=palloc_extended((found?found:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<found;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(parents,i),.ordinal=(int64)i+1};
@@ -388,11 +398,31 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
  * one hub marker and none of whichever rows the heap happened to return. */
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*required,*seen;int *links;
-    AttrNumber id,path,tier,mask;int floor,kinds,endpoint;bool per_part;int64 cap;lp_mask bits;
+    AttrNumber id,path,tier,mask;int floor,kinds,endpoint;bool per_part,count_only;int64 cap;lp_mask bits;
     uint64 epoch,required_epoch,saturated;Tuplestorestate *pending;MemoryContext owner;
+    void (*emit_hit)(const PgHolderHit *hit,Datum mask,void *ctx);
+    void *emit_ctx;
 } HolderRead;
 static void holder_emit(HolderRead *read,size_t key,Datum *values,bool *nulls)
 {
+    if(read->emit_hit){
+        PgHolderHit hit={
+            .ordinal=0,
+            .entity=nulls[1]?(lp_id){{0}}:*(const lp_id *)DatumGetPointer(values[1]),
+            .path=nulls[2]?(Datum)0:values[2],
+            .tier=nulls[3]?-1:DatumGetInt16(values[3]),
+            .kind=DatumGetInt16(values[5]),
+            .hub=DatumGetBool(values[6])
+        };
+        Datum mask=nulls[4]?(Datum)0:values[4];
+        if(!read->per_part){read->emit_hit(&hit,mask,read->emit_ctx);return;}
+        const HolderKey *part=lp_idmap_at(read->wanted,key);
+        for(int at=part->head;at>=0;at=read->links[at]){
+            hit.ordinal=(int64)at+1;
+            read->emit_hit(&hit,mask,read->emit_ctx);
+        }
+        return;
+    }
     if(!read->per_part){values[0]=Int64GetDatum(0);set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);return;}
     const HolderKey *part=lp_idmap_at(read->wanted,key);
     for(int at=part->head;at>=0;at=read->links[at]){
@@ -420,7 +450,7 @@ static bool holder_row(TupleTableSlot *slot,void *context)
     if(missing)ereport(ERROR,(errmsg("Native holder path is null")));
     Datum values[]={Int64GetDatum(0),id,path,tier,mask,Int16GetDatum((int16)kind),BoolGetDatum(false)};
     bool nulls[lengthof(values)]={false};
-    if(!read->per_part){holder_emit(read,0,values,nulls);return true;}
+    if(!read->per_part && !read->count_only){holder_emit(read,0,values,nulls);return true;}
     Geo geometry=geo_of(path);
     if(++read->epoch==0){
         for(size_t i=0;i<lp_idmap_count(read->wanted);i++)((HolderKey *)lp_idmap_at(read->wanted,i))->epoch=0;
@@ -434,6 +464,7 @@ static bool holder_row(TupleTableSlot *slot,void *context)
         lp_id child=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(read->wanted,&child);if(at<0)continue;
         HolderKey *key=lp_idmap_at(read->wanted,(size_t)at);
         if(key->epoch==read->epoch)continue;key->epoch=read->epoch;
+        if(read->count_only){key->held[kind]++;continue;}
         if(read->cap<0){holder_emit(read,(size_t)at,values,nulls);continue;}
         if(key->held[kind]>(uint64)read->cap)continue;
         if(++key->held[kind]>(uint64)read->cap){read->saturated++;continue;}
@@ -442,8 +473,98 @@ static bool holder_row(TupleTableSlot *slot,void *context)
         tuplestore_putvalues(read->pending,read->output.descriptor,values,nulls);
         MemoryContextSwitchTo(previous);
     }
+    if(read->count_only)return true;
     size_t groups=lp_idmap_count(read->wanted)*((read->kinds&1?1:0)+(read->kinds&2?1:0));
     return read->cap<0 || read->saturated<groups;
+}
+static void run_holders_query(HolderRead *read,const lp_id *ids,int count,const lp_id *required,int nrequired)
+{
+    if(!count)return;
+    const char *selected[]={"entity","path","tier","mask"},*column;Oid target=lp_pg_relation("physicality");
+    Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
+    read->id=get_attnum(target,"entity");read->path=get_attnum(target,"path");
+    read->tier=get_attnum(target,"tier");read->mask=get_attnum(target,"mask");
+    read->links=palloc_extended((Size)count*sizeof(*read->links),MCXT_ALLOC_HUGE);
+    read->wanted=lp_idmap_sized(sizeof(HolderKey));read->required=lp_idmap_sized(sizeof(uint64));read->seen=lp_idmap_new();
+    TupleDesc owned_desc=NULL;
+    if(!read->count_only && read->cap>=0){
+        if(!read->output.descriptor){
+            owned_desc=CreateTemplateTupleDesc(7);
+            TupleDescInitEntry(owned_desc,1,"ordinal",INT8OID,-1,0);
+            TupleDescInitEntry(owned_desc,2,"entity",get_atttype(target,read->id),-1,0);
+            TupleDescInitEntry(owned_desc,3,"path",get_atttype(target,read->path),-1,0);
+            TupleDescInitEntry(owned_desc,4,"tier",INT2OID,-1,0);
+            TupleDescInitEntry(owned_desc,5,"mask",get_atttype(target,read->mask),-1,0);
+            TupleDescInitEntry(owned_desc,6,"kind",INT2OID,-1,0);
+            TupleDescInitEntry(owned_desc,7,"hub",BOOLOID,-1,0);
+            read->output.descriptor=owned_desc;
+        }
+        read->pending=tuplestore_begin_heap(true,false,work_mem);
+    }
+    PG_TRY();{
+        for(int i=count-1;i>=0;i--){
+            bool fresh;size_t at=lp_idmap_put(read->wanted,ids+i,&fresh);HolderKey *key=lp_idmap_at(read->wanted,at);
+            if(fresh){memset(key,0,sizeof(*key));key->head=-1;}
+            read->links[i]=key->head;key->head=i;
+        }
+        for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read->required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read->required,at)=0;}
+        uint64 h_cap=(!read->count_only && read->cap>=0)?(((uint64)read->kinds<<60)|((uint64)read->cap+1)):0;
+        scan_container_rows(parent,column,read->wanted,3,read->required,false,read->endpoint,NULL,read->bits,false,h_cap,(int16)read->floor,holder_row,read);
+        if(read->count_only && !read->emit_hit){
+            for(int i=0;i<count;i++){
+                int64 at=lp_idmap_find(read->wanted,ids+i);
+                const HolderKey *key=lp_idmap_at(read->wanted,(size_t)at);
+                Datum idd=id_datum(ids+i);
+                Datum v[4]={Int64GetDatum((int64)i+1),idd,Int64GetDatum((int64)key->held[0]),Int64GetDatum((int64)key->held[1])};
+                bool n[4]={false,false,false,false};
+                set_put(read->output.fcinfo,read->output.output,read->output.descriptor,v,n);
+                pfree(DatumGetPointer(idd));
+            }
+        }
+        if(read->pending){
+            TupleTableSlot *slot=MakeSingleTupleTableSlot(read->output.descriptor,&TTSOpsMinimalTuple);
+            tuplestore_rescan(read->pending);
+            while(tuplestore_gettupleslot(read->pending,true,false,slot)){
+                CHECK_FOR_INTERRUPTS();slot_getallattrs(slot);
+                size_t at=(size_t)DatumGetInt64(slot->tts_values[0])-1;int kind=DatumGetInt16(slot->tts_values[5]);
+                if(((HolderKey *)lp_idmap_at(read->wanted,at))->held[kind]<=(uint64)read->cap)
+                    holder_emit(read,at,slot->tts_values,slot->tts_isnull);
+                ExecClearTuple(slot);
+            }
+            ExecDropSingleTupleTableSlot(slot);tuplestore_end(read->pending);read->pending=NULL;
+            for(size_t at=0;at<lp_idmap_count(read->wanted);at++)for(int kind=0;kind<2;kind++){
+                if(((HolderKey *)lp_idmap_at(read->wanted,at))->held[kind]<=(uint64)read->cap)continue;
+                Datum values[]={0,0,0,0,0,Int16GetDatum((int16)kind),BoolGetDatum(true)};
+                bool nulls[]={false,true,true,true,true,false,false};holder_emit(read,at,values,nulls);
+            }
+        }
+    }PG_FINALLY();{
+        if(read->pending){tuplestore_end(read->pending);read->pending=NULL;}
+        if(owned_desc)FreeTupleDesc(owned_desc);
+        lp_idmap_free(read->wanted);lp_idmap_free(read->required);lp_idmap_free(read->seen);
+    }PG_END_TRY();
+    pfree(read->links);table_close(parent,NoLock);
+}
+static void direct_holder_visit(const PgHolderHit *hit,Datum mask,void *ctx)
+{
+    typedef struct { lp_pg_holder_visit visit; void *context; } DirectHolderCtx;
+    DirectHolderCtx *d=ctx; (void)mask;
+    d->visit(hit,d->context);
+}
+void lp_pg_holders_direct(const lp_id *ids,int count,const lp_id *required,int nrequired,
+                          bool per_part,int16 floor,int64 cap,int16 kinds,
+                          lp_mask bits,int16 endpoint,lp_pg_holder_visit visit,void *context)
+{
+    if(count<=0||!visit)return;
+    if(endpoint<0||endpoint>3)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("lp_pg_holders_direct: invalid endpoint %d",endpoint)));
+    if(kinds==1)bits|=UINT64_C(1);
+    if(cap<-1||(!per_part&&cap>=0)||kinds<1||kinds>3)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("lp_pg_holders_direct: invalid cap or kinds")));
+    struct { lp_pg_holder_visit visit; void *context; } cb={visit,context};
+    HolderRead read={.owner=CurrentMemoryContext,.per_part=per_part,.floor=floor,.cap=cap,
+        .kinds=kinds,.bits=bits,.endpoint=endpoint,.emit_hit=direct_holder_visit,.emit_ctx=&cb};
+    run_holders_query(&read,ids,count,required,nrequired);
 }
 PG_FUNCTION_INFO_V1(laplace_holders);
 Datum laplace_holders(PG_FUNCTION_ARGS)
@@ -464,41 +585,156 @@ Datum laplace_holders(PG_FUNCTION_ARGS)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holders: cap requires per-part mode; kinds must select claims (1), observations (2), or both (3)")));
     int count,nrequired;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count),*required=ids_of(PG_GETARG_ARRAYTYPE_P(1),&nrequired);
     if(!count){pfree(ids);pfree(required);PG_RETURN_NULL();}
-    const char *selected[]={"entity","path","tier","mask"},*column;Oid target=lp_pg_relation("physicality");
-    Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
-    read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");
-    read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
-    read.links=palloc_extended((Size)count*sizeof(*read.links),MCXT_ALLOC_HUGE);
-    read.wanted=lp_idmap_sized(sizeof(HolderKey));read.required=lp_idmap_sized(sizeof(uint64));read.seen=lp_idmap_new();
-    read.pending=read.cap>=0?tuplestore_begin_heap(true,false,work_mem):NULL;
-    PG_TRY();{
-        for(int i=count-1;i>=0;i--){
-            bool fresh;size_t at=lp_idmap_put(read.wanted,ids+i,&fresh);HolderKey *key=lp_idmap_at(read.wanted,at);
-            if(fresh){memset(key,0,sizeof(*key));key->head=-1;}
-            read.links[i]=key->head;key->head=i;
+    run_holders_query(&read,ids,count,required,nrequired);
+    pfree(ids);pfree(required);PG_RETURN_NULL();
+}
+PG_FUNCTION_INFO_V1(laplace_holder_counts);
+Datum laplace_holder_counts(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;Tuplestorestate *out=set_begin(fcinfo,"laplace_holder_counts",&td);
+    if(PG_ARGISNULL(0))return (Datum)0;
+    HolderRead read={.output={fcinfo,out,td},.owner=CurrentMemoryContext,.per_part=true,.count_only=true,
+        .floor=PG_ARGISNULL(1)?-1:PG_GETARG_INT16(1),.cap=-1,.kinds=PG_ARGISNULL(2)?3:PG_GETARG_INT16(2)};
+    if(read.kinds<1||read.kinds>3)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holder_counts: kinds must select 1, 2, or 3")));
+    if(PG_NARGS()>3 && !PG_ARGISNULL(3) && !read_mask_bits(PG_GETARG_ARRAYTYPE_P(3),&read.bits))return (Datum)0;
+    if(PG_NARGS()>4 && !PG_ARGISNULL(4)){
+        read.endpoint=PG_GETARG_INT16(4);
+        if(read.endpoint<0||read.endpoint>3)
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holder_counts: invalid endpoint")));
+    }
+    if(read.kinds==1)read.bits|=UINT64_C(1);
+    int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    if(count>0)run_holders_query(&read,ids,count,NULL,0);
+    pfree(ids);
+    return (Datum)0;
+}
+
+typedef struct {
+    PgHolderHit hit;
+    bytea *mask_copy;
+    bytea *path_copy;
+    bool known;
+    double rating,deviation,volatility;
+    int64 matches;
+} HolderStandingRow;
+typedef struct {
+    lp_vec(HolderStandingRow) rows;
+    lp_idmap *by_entity;
+    int *links;
+    int nlinks;
+    MemoryContext ctx;
+} HolderStandingCollect;
+static void collect_holder_row(const PgHolderHit *hit,Datum mask,void *ctx)
+{
+    HolderStandingCollect *c=ctx;
+    MemoryContext old=MemoryContextSwitchTo(c->ctx);
+    HolderStandingRow r={.hit=*hit};
+    if(!hit->hub){
+        bytea *p=(bytea *)PG_DETOAST_DATUM(hit->path);
+        Size ps=VARSIZE_ANY(p);
+        r.path_copy=palloc(ps);memcpy(r.path_copy,p,ps);
+        r.hit.path=PointerGetDatum(r.path_copy);
+        if(mask){
+            bytea *m=(bytea *)PG_DETOAST_DATUM(mask);
+            Size ms=VARSIZE_ANY(m);
+            r.mask_copy=palloc(ms);memcpy(r.mask_copy,m,ms);
         }
-        for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read.required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read.required,at)=0;}
-        uint64 h_cap=read.cap>=0?(((uint64)read.kinds<<60)|((uint64)read.cap+1)):0;
-        scan_container_rows(parent,column,read.wanted,3,read.required,false,read.endpoint,NULL,read.bits,false,h_cap,holder_row,&read);
-        if(read.pending){
-            TupleTableSlot *slot=MakeSingleTupleTableSlot(read.output.descriptor,&TTSOpsMinimalTuple);
-            tuplestore_rescan(read.pending);
-            while(tuplestore_gettupleslot(read.pending,true,false,slot)){
-                CHECK_FOR_INTERRUPTS();slot_getallattrs(slot);
-                size_t at=(size_t)DatumGetInt64(slot->tts_values[0])-1;int kind=DatumGetInt16(slot->tts_values[5]);
-                if(((HolderKey *)lp_idmap_at(read.wanted,at))->held[kind]<=(uint64)read.cap)
-                    holder_emit(&read,at,slot->tts_values,slot->tts_isnull);
-                ExecClearTuple(slot);
+    }
+    lp_push(&c->rows,r);
+    MemoryContextSwitchTo(old);
+}
+static void collect_holder_standing(TupleTableSlot *slot,const PresenceKey *key,void *ctx)
+{
+    typedef struct { HolderStandingCollect *c; AttrNumber st[4]; } StCtx;
+    StCtx *sc=ctx;
+    int idx=(int)*(int64 *)lp_idmap_at(sc->c->by_entity,(size_t)(key->ordinal-1));
+    bool n0=false,n1=false,n2=false,n3=false;
+    double rt=DatumGetFloat8(slot_getattr(slot,sc->st[0],&n0));
+    double dv=DatumGetFloat8(slot_getattr(slot,sc->st[1],&n1));
+    double vl=DatumGetFloat8(slot_getattr(slot,sc->st[2],&n2));
+    int64 mt=DatumGetInt64(slot_getattr(slot,sc->st[3],&n3));
+    if(n0||n1||n2||n3)return;
+    for(int r=idx;r>=0;r=sc->c->links[r]){
+        HolderStandingRow *row=&sc->c->rows.v[r];
+        row->known=true;row->rating=rt;row->deviation=dv;row->volatility=vl;row->matches=mt;
+    }
+}
+PG_FUNCTION_INFO_V1(laplace_holders_with_standings);
+Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;Tuplestorestate *out=set_begin(fcinfo,"laplace_holders_with_standings",&td);
+    if(PG_ARGISNULL(0)||PG_ARGISNULL(1)||PG_ARGISNULL(2)||PG_ARGISNULL(3)||PG_ARGISNULL(4)||PG_ARGISNULL(5))
+        return (Datum)0;
+    HolderStandingCollect col={.by_entity=lp_idmap_sized(sizeof(int64)),
+        .ctx=AllocSetContextCreate(CurrentMemoryContext,"HolderStandingCollect",ALLOCSET_DEFAULT_SIZES)};
+    HolderRead read={.owner=CurrentMemoryContext,.per_part=PG_GETARG_BOOL(2),.floor=PG_GETARG_INT16(3),
+        .cap=PG_GETARG_INT64(4),.kinds=PG_GETARG_INT16(5),.emit_hit=collect_holder_row,.emit_ctx=&col};
+    if(PG_NARGS()>6&&!PG_ARGISNULL(6)&&!read_mask_bits(PG_GETARG_ARRAYTYPE_P(6),&read.bits)){
+        lp_idmap_free(col.by_entity);MemoryContextDelete(col.ctx);return (Datum)0;
+    }
+    if(PG_NARGS()>7&&!PG_ARGISNULL(7)){
+        read.endpoint=PG_GETARG_INT16(7);
+        if(read.endpoint<0||read.endpoint>3)
+            ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holders_with_standings: invalid endpoint")));
+    }
+    if(read.kinds==1)read.bits|=UINT64_C(1);
+    if(read.cap<-1||(!read.per_part&&read.cap>=0)||read.kinds<1||read.kinds>3)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_holders_with_standings: invalid cap or kinds")));
+    int count,nrequired;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count),*required=ids_of(PG_GETARG_ARRAYTYPE_P(1),&nrequired);
+    if(count>0){
+        run_holders_query(&read,ids,count,required,nrequired);
+        if(col.rows.n>0){
+            col.links=palloc((Size)col.rows.n*sizeof(int));
+            for(size_t i=0;i<col.rows.n;i++){
+                if(col.rows.v[i].hit.hub){col.links[i]=-1;continue;}
+                bool fresh;size_t at=lp_idmap_put(col.by_entity,&col.rows.v[i].hit.entity,&fresh);
+                int64 *head=lp_idmap_at(col.by_entity,at);
+                col.links[i]=fresh?-1:(int)*head;
+                *head=(int64)i;
             }
-            ExecDropSingleTupleTableSlot(slot);tuplestore_end(read.pending);
-            for(size_t at=0;at<lp_idmap_count(read.wanted);at++)for(int kind=0;kind<2;kind++){
-                if(((HolderKey *)lp_idmap_at(read.wanted,at))->held[kind]<=(uint64)read.cap)continue;
-                Datum values[]={0,0,0,0,0,Int16GetDatum((int16)kind),BoolGetDatum(true)};
-                bool nulls[]={false,true,true,true,true,false,false};holder_emit(&read,at,values,nulls);
+            size_t nu=lp_idmap_count(col.by_entity);
+            if(nu>0){
+                const char *scols[]={"claim","rating","deviation","volatility","matches"},*scol;
+                Oid starget=lp_pg_relation("consensus");
+                Relation sparent=lp_pg_read_parent(starget,&scol,scols,lengthof(scols));
+                PresenceKey *keys=palloc_extended(nu*sizeof(*keys),MCXT_ALLOC_HUGE);
+                for(size_t i=0;i<nu;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(col.by_entity,i),.ordinal=(int64)i+1};
+                struct { HolderStandingCollect *c; AttrNumber st[4]; } sctx={.c=&col};
+                for(int j=0;j<4;j++)sctx.st[j]=get_attnum(starget,scols[j+1]);
+                lp_pg_indexed_keys(sparent,scol,keys,nu,collect_holder_standing,&sctx);
+                pfree(keys);table_close(sparent,NoLock);
+            }
+            pfree(col.links);
+            for(size_t i=0;i<col.rows.n;i++){
+                const HolderStandingRow *r=&col.rows.v[i];
+                Datum v[11]={
+                    Int64GetDatum(r->hit.ordinal),
+                    r->hit.hub?(Datum)0:id_datum(&r->hit.entity),
+                    r->hit.path,
+                    Int16GetDatum(r->hit.tier),
+                    PointerGetDatum(r->mask_copy),
+                    Int16GetDatum(r->hit.kind),
+                    BoolGetDatum(r->hit.hub),
+                    Float8GetDatum(r->rating),
+                    Float8GetDatum(r->deviation),
+                    Float8GetDatum(r->volatility),
+                    Int64GetDatum(r->matches)
+                };
+                bool nl[11]={
+                    false,r->hit.hub,r->hit.hub,r->hit.hub,r->hit.hub||!r->mask_copy,false,false,
+                    !r->known,!r->known,!r->known,!r->known
+                };
+                set_put(fcinfo,out,td,v,nl);
+                if(!r->hit.hub)pfree(DatumGetPointer(v[1]));
             }
         }
-    }PG_FINALLY();{lp_idmap_free(read.wanted);lp_idmap_free(read.required);lp_idmap_free(read.seen);}PG_END_TRY();
-    pfree(read.links);pfree(ids);pfree(required);table_close(parent,NoLock);PG_RETURN_NULL();
+    }
+    lp_vec_free(&col.rows);
+    lp_idmap_free(col.by_entity);
+    MemoryContextDelete(col.ctx);
+    pfree(ids);pfree(required);
+    return (Datum)0;
 }
 
 /* Claim selection is another projection of the same GIN/primary-key
@@ -510,6 +746,7 @@ typedef struct {
     PresenceOutput output;lp_idmap *wanted,*parents,*required,*opposite;lp_id *refuse,*include;int nrefuse,ninclude,*links;
     bool each,done;uint64 limit,sent,saturated,epoch,nom_epoch,nom_saturated;int floor,endpoint;int64 arity;lp_mask bits;
     AttrNumber id,path,tier,mask,standing[4];MemoryContext tuple_context;
+    lp_pg_claim_visit visit;void *visit_context;
 } ClaimRead;
 static void claim_key_tier(TupleTableSlot *slot,const PresenceKey *key,void *context)
 {
@@ -593,7 +830,13 @@ static void claim_emit_cached(ClaimRead *read,const PresenceKey *key)
     Datum values[]={0,PointerGetDatum(&key->id),path,Float8GetDatum(standing->rating),Float8GetDatum(standing->deviation),Float8GetDatum(standing->volatility),Int64GetDatum(standing->matches)};
     bool nulls[lengthof(values)]={false};
     if(!read->each){
-        set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values+1,nulls+1);
+        if(read->visit){
+            PgClaimHit hit={.i=0,.entity=key->id,.path=path,.rating=standing->rating,
+                .deviation=standing->deviation,.volatility=standing->volatility,.matches=standing->matches};
+            read->visit(&hit,read->visit_context);
+        }else{
+            set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values+1,nulls+1);
+        }
         read->done=++read->sent>=read->limit;
     }else{
         Geo geometry=geo_of(path);
@@ -607,13 +850,85 @@ static void claim_emit_cached(ClaimRead *read,const PresenceKey *key)
             part->epoch[dir]=read->epoch;
             if(part->epoch[1-dir]!=read->epoch){
                 for(int input=part->head;input>=0;input=read->links[input]){
-                    values[0]=Int64GetDatum((int64)input+1);set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);
+                    if(read->visit){
+                        PgClaimHit hit={.i=(int64)input+1,.entity=key->id,.path=path,.rating=standing->rating,
+                            .deviation=standing->deviation,.volatility=standing->volatility,.matches=standing->matches};
+                        read->visit(&hit,read->visit_context);
+                    }else{
+                        values[0]=Int64GetDatum((int64)input+1);set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);
+                    }
                 }
             }
             if(++part->sent[dir]==read->limit)read->saturated++;
         }
         read->done=read->saturated==target_dirs;
     }
+}
+static void run_claims_query(ClaimRead *read,const lp_id *ids,int count,const lp_id *opposite,int nopposite)
+{
+    read->wanted=lp_idmap_sized(sizeof(ClaimKey));read->parents=lp_idmap_sized(sizeof(ClaimStanding));read->required=lp_idmap_new();
+    read->opposite=nopposite>0?lp_idmap_new():NULL;
+    read->links=palloc_extended((Size)count*sizeof(int),MCXT_ALLOC_HUGE);
+    PG_TRY();{
+        for(int i=0;i<nopposite;i++)lp_idmap_put(read->opposite,opposite+i,NULL);
+        for(int i=0;i<read->ninclude;i++)lp_idmap_put(read->required,read->include+i,NULL);
+        for(int i=count-1;i>=0;i--){bool fresh;size_t at=lp_idmap_put(read->wanted,ids+i,&fresh);ClaimKey *part=lp_idmap_at(read->wanted,at);
+            if(fresh){memset(part,0,sizeof(*part));part->head=-1;}read->links[i]=part->head;part->head=i;}
+        const char *column,*entity_columns[]={"id","tier"};Oid target=lp_pg_relation("entity");
+        Relation entities=lp_pg_read_parent(target,&column,entity_columns,lengthof(entity_columns));
+        size_t n=lp_idmap_count(read->wanted);PresenceKey *keys=palloc_extended(n*sizeof(*keys),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read->wanted,i),.ordinal=(int64)i+1};
+        read->tier=get_attnum(target,"tier");lp_pg_indexed_keys(entities,column,keys,n,claim_key_tier,read);
+        table_close(entities,NoLock);pfree(keys);
+        int16 gin_min_floor=n>0?PG_INT16_MAX:-1;
+        for(size_t i=0;i<n;i++){
+            int kf=((ClaimKey *)lp_idmap_at(read->wanted,i))->floor;
+            read->floor=Max(read->floor,kf);
+            gin_min_floor=Min(gin_min_floor,(int16)kf);
+        }
+        if(!read->each)gin_min_floor=(int16)read->floor;
+        read->tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
+        const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
+        Relation paths=lp_pg_read_parent(target,&column,path_columns,lengthof(path_columns));
+        read->id=get_attnum(target,"entity");read->path=get_attnum(target,"path");read->tier=get_attnum(target,"tier");read->mask=get_attnum(target,"mask");
+        uint64 nom_cap=(read->each && read->limit<UINT64_MAX)?Max(read->limit,UINT64_C(64)):0;
+        scan_container_rows(paths,column,read->wanted,read->each?3:7,read->required,true,read->endpoint,read->opposite,read->bits,false,nom_cap,gin_min_floor,claim_nominate,read);
+        table_close(paths,NoLock);
+        n=lp_idmap_count(read->parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
+        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read->parents,i),.ordinal=(int64)i+1};
+        const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
+        Relation standings=lp_pg_read_parent(target,&column,standing_columns,lengthof(standing_columns));
+        for(int i=0;i<4;i++)read->standing[i]=get_attnum(target,standing_columns[i+1]);
+        lp_pg_indexed_keys(standings,column,keys,n,claim_standing,read);table_close(standings,NoLock);
+        for(size_t i=0;i<n && !read->done;i++){
+            if(((ClaimStanding *)lp_idmap_at(read->parents,(size_t)keys[i].ordinal-1))->known)
+                claim_emit_cached(read,keys+i);
+        }
+        MemoryContextDelete(read->tuple_context);read->tuple_context=NULL;pfree(keys);
+    }PG_FINALLY();{if(read->tuple_context)MemoryContextDelete(read->tuple_context);lp_idmap_free(read->wanted);lp_idmap_free(read->parents);lp_idmap_free(read->required);lp_idmap_free(read->opposite);}PG_END_TRY();
+    pfree(read->links);
+}
+void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
+                              const lp_id *refuse,int nrefuse,int16 endpoint,
+                              const lp_id *include,int ninclude,int64 arity,
+                              const lp_id *opposite,int nopposite,
+                              lp_pg_claim_visit visit,void *context)
+{
+    if(count<=0||!visit||fan==0)return;
+    if(endpoint<0||endpoint>3)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native claim endpoint must be 0 (any), 1 (first), 2 (last) or 3 (either)")));
+    if(arity<0)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native claim arity must be zero or positive")));
+    if(opposite && nopposite==0)return;
+    if(include && ninclude==0)return;
+    if(opposite && endpoint!=1 && endpoint!=2)
+        ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
+    ClaimRead read={
+        .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits,
+        .refuse=(lp_id *)refuse,.nrefuse=nrefuse,.include=(lp_id *)include,.ninclude=ninclude,
+        .visit=visit,.visit_context=context
+    };
+    run_claims_query(&read,ids,count,opposite,nopposite);
 }
 static Datum read_claims(FunctionCallInfo fcinfo,bool each)
 {
@@ -649,42 +964,9 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
         opposite=ids_of(PG_GETARG_ARRAYTYPE_P(7),&nopposite);
         if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);return (Datum)0;}
-        read.opposite=lp_idmap_new();
     }
-    read.wanted=lp_idmap_sized(sizeof(ClaimKey));read.parents=lp_idmap_sized(sizeof(ClaimStanding));read.required=lp_idmap_new();
-    read.links=palloc_extended((Size)count*sizeof(int),MCXT_ALLOC_HUGE);
-    PG_TRY();{
-        for(int i=0;i<nopposite;i++)lp_idmap_put(read.opposite,opposite+i,NULL);
-        for(int i=0;i<read.ninclude;i++)lp_idmap_put(read.required,read.include+i,NULL);
-        for(int i=count-1;i>=0;i--){bool fresh;size_t at=lp_idmap_put(read.wanted,ids+i,&fresh);ClaimKey *part=lp_idmap_at(read.wanted,at);
-            if(fresh){memset(part,0,sizeof(*part));part->head=-1;}read.links[i]=part->head;part->head=i;}
-        const char *column,*entity_columns[]={"id","tier"};Oid target=lp_pg_relation("entity");
-        Relation entities=lp_pg_read_parent(target,&column,entity_columns,lengthof(entity_columns));
-        size_t n=lp_idmap_count(read.wanted);PresenceKey *keys=palloc_extended(n*sizeof(*keys),MCXT_ALLOC_HUGE);
-        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.wanted,i),.ordinal=(int64)i+1};
-        read.tier=get_attnum(target,"tier");lp_pg_indexed_keys(entities,column,keys,n,claim_key_tier,&read);
-        table_close(entities,NoLock);pfree(keys);
-        for(size_t i=0;i<n;i++)read.floor=Max(read.floor,((ClaimKey *)lp_idmap_at(read.wanted,i))->floor);
-        read.tuple_context=AllocSetContextCreate(CurrentMemoryContext,"Native selected claim",ALLOCSET_DEFAULT_SIZES);
-        const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
-        Relation paths=lp_pg_read_parent(target,&column,path_columns,lengthof(path_columns));
-        read.id=get_attnum(target,"entity");read.path=get_attnum(target,"path");read.tier=get_attnum(target,"tier");read.mask=get_attnum(target,"mask");
-        uint64 nom_cap=(read.each && read.limit<UINT64_MAX)?Max(read.limit,UINT64_C(64)):0;
-        scan_container_rows(paths,column,read.wanted,each?3:7,read.required,true,read.endpoint,read.opposite,read.bits,false,nom_cap,claim_nominate,&read);
-        table_close(paths,NoLock);
-        n=lp_idmap_count(read.parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
-        for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read.parents,i),.ordinal=(int64)i+1};
-        const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
-        Relation standings=lp_pg_read_parent(target,&column,standing_columns,lengthof(standing_columns));
-        for(int i=0;i<4;i++)read.standing[i]=get_attnum(target,standing_columns[i+1]);
-        lp_pg_indexed_keys(standings,column,keys,n,claim_standing,&read);table_close(standings,NoLock);
-        for(size_t i=0;i<n && !read.done;i++){
-            if(((ClaimStanding *)lp_idmap_at(read.parents,(size_t)keys[i].ordinal-1))->known)
-                claim_emit_cached(&read,keys+i);
-        }
-        MemoryContextDelete(read.tuple_context);read.tuple_context=NULL;pfree(keys);
-    }PG_FINALLY();{if(read.tuple_context)MemoryContextDelete(read.tuple_context);lp_idmap_free(read.wanted);lp_idmap_free(read.parents);lp_idmap_free(read.required);lp_idmap_free(read.opposite);}PG_END_TRY();
-    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);pfree(read.links);return (Datum)0;
+    run_claims_query(&read,ids,count,opposite,nopposite);
+    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);return (Datum)0;
 }
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}
@@ -867,7 +1149,7 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
             Relation parent=lp_pg_read_parent(target,&column,selected,lengthof(selected));
             walk.id=get_attnum(target,"entity");walk.path=get_attnum(target,"path");walk.mask=get_attnum(target,"mask");
             uint64 h_cap=cap>=0?((UINT64_C(3)<<60)|((uint64)cap+1)):0;
-            scan_container_rows(parent,column,walk.keys,3,NULL,false,0,NULL,0,false,h_cap,held_first,&walk);
+            scan_container_rows(parent,column,walk.keys,3,NULL,false,0,NULL,0,false,h_cap,-1,held_first,&walk);
             table_close(parent,NoLock);
             for(int i=0;i<count && i<64;i++){
                 HeldKey *key=lp_idmap_lookup(walk.keys,ids+i);
@@ -955,4 +1237,252 @@ Datum laplace_held_files(PG_FUNCTION_ARGS)
         lp_vec_free(&walk.vertices);lp_vec_free(&walk.first);if(scope)lp_idmap_free(scope);
     }PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
+}
+
+/* ---------------------------------------------------------------- generic batched upward closure (held_up in DB) */
+typedef struct {
+    lp_id entity;
+    int16 tier;
+    uint64 keys_mask;
+    bool is_file, is_metadata, is_hub, expanded;
+    int32 level;
+    lp_vec(int32) child_idxs;
+    lp_vec(int16) child_saids;
+    lp_vec(int32) child_runs;
+    lp_vec(int32) child_ordinals;
+} HeldClosureNode;
+
+typedef struct {
+    int16 mode; /* 0 = content (skip metadata, stop at file), 1 = name (only file metadata, stop at file), 2 = all */
+    size_t max_nodes;
+    bool cut;
+    MemoryContext ctx;
+    lp_idmap *by_id; /* lp_id -> int32 node_idx */
+    lp_vec(HeldClosureNode) nodes;
+    lp_idmap *front_map; /* lp_id -> int32 node_idx (front in current level) */
+    lp_idmap *next_map;
+    lp_idmap *level_seen;
+    const lp_id *front_ids;
+    size_t front_n;
+    int32 level;
+    lp_vec(lp_vertex) vbuf;
+} HeldClosureWalk;
+
+static int32 held_closure_ensure(HeldClosureWalk *w, const lp_id *id, int32 level, bool *fresh_out){
+    bool fresh;
+    int32 *pidx = lp_idmap_get(w->by_id, id, &fresh);
+    if (fresh) {
+        *pidx = (int32)w->nodes.n;
+        HeldClosureNode n = { .entity = *id, .tier = -1, .level = level };
+        lp_push(&w->nodes, n);
+    }
+    if (fresh_out) *fresh_out = fresh;
+    return *pidx;
+}
+
+static void held_closure_seed_path(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask;
+    HeldClosureWalk *w = context;
+    int32 *pidx = lp_idmap_lookup(w->by_id, id);
+    if (!pidx) return;
+    Geo g = geo_of(path);
+    if (g.p.n == 0) return;
+    lp_vec_reserve(&w->vbuf, g.p.n);
+    if (lp_path_decode(g.p, w->vbuf.v, g.p.n) != g.p.n) return;
+    HeldClosureNode *n = &w->nodes.v[*pidx];
+    if (w->vbuf.v[0].said == LP_SAID_METADATA) {
+        n->is_metadata = true;
+        if (g.p.n >= 2) n->is_file = true;
+    }
+}
+
+static void held_closure_hit(const PgHolderHit *hit, void *context){
+    HeldClosureWalk *w = context;
+    if (w->cut) return;
+    if (hit->hub) {
+        int64 ord = hit->ordinal - 1;
+        if (ord >= 0 && (size_t)ord < w->front_n) {
+            int32 *pidx = lp_idmap_lookup(w->by_id, &w->front_ids[ord]);
+            if (pidx) w->nodes.v[*pidx].is_hub = true;
+        }
+        return;
+    }
+    if (!hit->path) return;
+    bool fresh_level;
+    lp_idmap_get(w->level_seen, &hit->entity, &fresh_level);
+    if (!fresh_level) return;
+
+    Geo g = geo_of(hit->path);
+    size_t nv = g.p.n;
+    if (nv == 0) return;
+    lp_vec_reserve(&w->vbuf, nv);
+    lp_vertex *v = w->vbuf.v;
+    if (lp_path_decode(g.p, v, nv) != nv)
+        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace_held_closure: invalid stored path")));
+
+    bool meta = (v[0].said == LP_SAID_METADATA);
+    bool file = (nv >= 2 && meta);
+    bool matched = false;
+    uint64 gained = 0;
+
+    for (size_t k = 0; k < nv; k++) {
+        if (w->mode == 0 && v[k].said == LP_SAID_METADATA) continue;
+        if (w->mode == 1 && file && k > 0) continue;
+        int32 *cidx = lp_idmap_lookup(w->front_map, &v[k].id);
+        if (!cidx) continue;
+        gained |= w->nodes.v[*cidx].keys_mask;
+        matched = true;
+    }
+    if (!matched) return;
+
+    if (lp_idmap_find(w->by_id, &hit->entity) < 0 && w->nodes.n >= w->max_nodes) {
+        w->cut = true;
+        return;
+    }
+    bool fresh;
+    int32 pidx = held_closure_ensure(w, &hit->entity, w->level, &fresh);
+    HeldClosureNode *p = &w->nodes.v[pidx];
+    uint64 before = p->keys_mask;
+    p->keys_mask |= gained;
+    p->is_metadata |= meta;
+    p->is_file |= file;
+    p->tier = hit->tier;
+
+    for (size_t k = 0; k < nv; k++) {
+        if (w->mode == 0 && v[k].said == LP_SAID_METADATA) continue;
+        if (w->mode == 1 && file && k > 0) continue;
+        int32 *cidx = lp_idmap_lookup(w->front_map, &v[k].id);
+        if (!cidx) continue;
+        lp_push(&p->child_idxs, *cidx);
+        lp_push(&p->child_saids, (int16)v[k].said);
+        lp_push(&p->child_runs, (int32)(v[k].run ? v[k].run : 1));
+        lp_push(&p->child_ordinals, (int32)k);
+    }
+
+    bool should_push = (w->mode == 2) ? fresh : (!file && (fresh || p->keys_mask != before));
+    if (should_push)
+        lp_idmap_put(w->next_map, &hit->entity, NULL);
+}
+
+PG_FUNCTION_INFO_V1(laplace_held_closure);
+Datum laplace_held_closure(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_held_closure", &td);
+    if (PG_ARGISNULL(0)) return (Datum)0;
+    int count = 0;
+    lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &count);
+    int16 mode = (!PG_ARGISNULL(1)) ? PG_GETARG_INT16(1) : 0;
+    int64 cap = (!PG_ARGISNULL(2)) ? PG_GETARG_INT64(2) : -1;
+    int32 max_levels = (!PG_ARGISNULL(3)) ? PG_GETARG_INT32(3) : 32;
+    int32 max_nodes = (!PG_ARGISNULL(4)) ? PG_GETARG_INT32(4) : 400000;
+    if (mode < 0 || mode > 2 || cap < -1 || max_levels < 0 || max_nodes < 1)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_held_closure: invalid parameters")));
+    if (count <= 0) { pfree(ids); return (Datum)0; }
+
+    HeldClosureWalk w = {
+        .mode = mode,
+        .max_nodes = (size_t)max_nodes,
+        .ctx = CurrentMemoryContext,
+        .by_id = lp_idmap_sized(sizeof(int32)),
+        .front_map = lp_idmap_sized(sizeof(int32)),
+        .next_map = lp_idmap_new(),
+        .level_seen = lp_idmap_new()
+    };
+
+    PG_TRY(); {
+        for (int i = 0; i < count; i++) {
+            int32 idx = held_closure_ensure(&w, ids + i, 0, NULL);
+            if (i < 64) w.nodes.v[idx].keys_mask |= (UINT64_C(1) << i);
+            *(int32 *)lp_idmap_get(w.front_map, ids + i, NULL) = idx;
+        }
+        lp_pg_lookup_paths(lp_idmap_keys(w.front_map), lp_idmap_count(w.front_map), false, held_closure_seed_path, &w);
+
+        int32 levels = 0;
+        while (lp_idmap_count(w.front_map) > 0 && levels < max_levels && !w.cut) {
+            CHECK_FOR_INTERRUPTS();
+            levels++;
+            w.level = levels;
+            lp_idmap_clear(w.next_map);
+            lp_idmap_clear(w.level_seen);
+            w.front_ids = lp_idmap_keys(w.front_map);
+            w.front_n = lp_idmap_count(w.front_map);
+            lp_pg_holders_direct(w.front_ids, (int)w.front_n, NULL, 0, (levels == 1 && cap >= 0), -1, (levels == 1 ? cap : -1), 3, 0, 0, held_closure_hit, &w);
+            for (size_t i = 0; i < w.front_n; i++) {
+                int32 *idx = lp_idmap_lookup(w.front_map, &w.front_ids[i]);
+                if (idx) w.nodes.v[*idx].expanded = true;
+            }
+            lp_idmap_clear(w.front_map);
+            const lp_id *nx = lp_idmap_keys(w.next_map);
+            size_t nxn = lp_idmap_count(w.next_map);
+            for (size_t i = 0; i < nxn; i++) {
+                int32 *idx = lp_idmap_lookup(w.by_id, &nx[i]);
+                if (idx) *(int32 *)lp_idmap_get(w.front_map, &nx[i], NULL) = *idx;
+            }
+        }
+
+        if (w.nodes.n > 0) {
+            lp_id *all_ids = palloc(sizeof(lp_id) * w.nodes.n);
+            int16 *tiers = palloc(sizeof(int16) * w.nodes.n);
+            for (size_t i = 0; i < w.nodes.n; i++) all_ids[i] = w.nodes.v[i].entity;
+            lp_pg_lookup_entity_tiers(all_ids, w.nodes.n, tiers);
+            for (size_t i = 0; i < w.nodes.n; i++)
+                if (w.nodes.v[i].tier < 0 && tiers[i] >= 0) w.nodes.v[i].tier = tiers[i];
+            pfree(all_ids); pfree(tiers);
+        }
+
+        for (size_t i = 0; i < w.nodes.n; i++) {
+            CHECK_FOR_INTERRUPTS();
+            const HeldClosureNode *n = &w.nodes.v[i];
+            int nec = (int)n->child_idxs.n;
+            Datum *d_c = nec ? palloc(sizeof(Datum) * (size_t)nec) : NULL;
+            Datum *d_s = nec ? palloc(sizeof(Datum) * (size_t)nec) : NULL;
+            Datum *d_r = nec ? palloc(sizeof(Datum) * (size_t)nec) : NULL;
+            Datum *d_o = nec ? palloc(sizeof(Datum) * (size_t)nec) : NULL;
+            for (int k = 0; k < nec; k++) {
+                d_c[k] = Int32GetDatum(n->child_idxs.v[k]);
+                d_s[k] = Int16GetDatum(n->child_saids.v[k]);
+                d_r[k] = Int32GetDatum(n->child_runs.v[k]);
+                d_o[k] = Int32GetDatum(n->child_ordinals.v[k]);
+            }
+            ArrayType *a_c = construct_array(d_c, nec, INT4OID, 4, true, TYPALIGN_INT);
+            ArrayType *a_s = construct_array(d_s, nec, INT2OID, 2, true, TYPALIGN_SHORT);
+            ArrayType *a_r = construct_array(d_r, nec, INT4OID, 4, true, TYPALIGN_INT);
+            ArrayType *a_o = construct_array(d_o, nec, INT4OID, 4, true, TYPALIGN_INT);
+            if (d_c) { pfree(d_c); pfree(d_s); pfree(d_r); pfree(d_o); }
+
+            Datum vals[15] = {
+                Int32GetDatum((int32)i),
+                id_datum(&n->entity),
+                Int16GetDatum(n->tier),
+                Int64GetDatum((int64)n->keys_mask),
+                BoolGetDatum(n->is_file),
+                BoolGetDatum(n->is_metadata),
+                BoolGetDatum(n->is_hub),
+                BoolGetDatum(n->expanded),
+                Int32GetDatum(n->level),
+                PointerGetDatum(a_c),
+                PointerGetDatum(a_s),
+                PointerGetDatum(a_r),
+                PointerGetDatum(a_o),
+                BoolGetDatum(w.cut),
+                Int32GetDatum(levels)
+            };
+            bool nl[15] = { false };
+            set_put(fcinfo, ts, td, vals, nl);
+            pfree(DatumGetPointer(vals[1]));
+            pfree(a_c); pfree(a_s); pfree(a_r); pfree(a_o);
+        }
+    } PG_FINALLY(); {
+        for (size_t i = 0; i < w.nodes.n; i++) {
+            lp_vec_free(&w.nodes.v[i].child_idxs);
+            lp_vec_free(&w.nodes.v[i].child_saids);
+            lp_vec_free(&w.nodes.v[i].child_runs);
+            lp_vec_free(&w.nodes.v[i].child_ordinals);
+        }
+        lp_vec_free(&w.nodes); lp_vec_free(&w.vbuf);
+        lp_idmap_free(w.by_id); lp_idmap_free(w.front_map);
+        lp_idmap_free(w.next_map); lp_idmap_free(w.level_seen);
+        pfree(ids);
+    } PG_END_TRY();
+    return (Datum)0;
 }

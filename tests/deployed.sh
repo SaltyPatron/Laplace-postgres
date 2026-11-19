@@ -97,15 +97,20 @@ fi
 # Ingestion writer privileges: a scratch role inside a rolled-back transaction.
 # The writer may clean Laplace GIN pending lists of partitions it can write and
 # nothing else, and has no canonical-table TRUNCATE.
-sql -v writer="laplace_check_writer_$$" <<'SQL'
+if [[ $(sql -c "SELECT to_regclass('public.physicality_t1') IS NOT NULL") == t ]]; then
+  p1=physicality_t1 p2=physicality_t2
+else
+  p1=physicality_00 p2=physicality_01
+fi
+sed -e "s/__P1__/$p1/g" -e "s/__P2__/$p2/g" <<'SQL' | sql -v writer="laplace_check_writer_$$"
 BEGIN;
 CREATE ROLE :"writer";
 GRANT USAGE ON SCHEMA public TO :"writer";
-GRANT INSERT,UPDATE ON public.physicality_00 TO :"writer";
-CREATE UNLOGGED TABLE stage.check_writer_maintenance_keys (entity blake3);
-CREATE UNLOGGED TABLE stage.check_writer_unwritable_keys (entity blake3);
-INSERT INTO stage.check_writer_maintenance_keys VALUES ('00000000000000000000000000000000');
-INSERT INTO stage.check_writer_unwritable_keys VALUES ('01000000000000000000000000000000');
+GRANT INSERT,UPDATE ON public.__P1__ TO :"writer";
+CREATE UNLOGGED TABLE stage.check_writer_maintenance_keys (entity blake3, tier smallint);
+CREATE UNLOGGED TABLE stage.check_writer_unwritable_keys (entity blake3, tier smallint);
+INSERT INTO stage.check_writer_maintenance_keys VALUES ('00000000000000000000000000000000', 1);
+INSERT INTO stage.check_writer_unwritable_keys VALUES ('01000000000000000000000000000000', 2);
 GRANT USAGE ON SCHEMA stage TO :"writer";
 GRANT SELECT ON stage.check_writer_maintenance_keys,stage.check_writer_unwritable_keys TO :"writer";
 CREATE TABLE public.check_writer_unrelated(values int[]);
@@ -113,12 +118,12 @@ CREATE INDEX check_writer_unrelated_gin ON public.check_writer_unrelated USING g
 GRANT INSERT,TRUNCATE ON public.check_writer_unrelated TO :"writer";
 SET LOCAL SESSION AUTHORIZATION :"writer";
 DO $$ DECLARE selected regclass; BEGIN
-  IF has_table_privilege('public.physicality_00','TRUNCATE') THEN
+  IF has_table_privilege('public.__P1__','TRUNCATE') THEN
     RAISE EXCEPTION 'ingestion unexpectedly has canonical-table TRUNCATE';
   END IF;
   FOR selected IN SELECT i.indexrelid FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
-    WHERE i.indrelid='public.physicality_00'::regclass AND a.amname='gin' LOOP
+    WHERE i.indrelid='public.__P1__'::regclass AND a.amname='gin' LOOP
   BEGIN
     PERFORM pg_catalog.gin_clean_pending_list(selected);
     RAISE EXCEPTION 'runtime unexpectedly owns the index';
@@ -133,7 +138,7 @@ DO $$ DECLARE selected regclass; BEGIN
   EXCEPTION WHEN insufficient_privilege THEN NULL; END;
   FOR selected IN SELECT i.indexrelid FROM pg_index i
     JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
-    WHERE i.indrelid='public.physicality_01'::regclass AND a.amname='gin' LOOP
+    WHERE i.indrelid='public.__P2__'::regclass AND a.amname='gin' LOOP
   BEGIN
     PERFORM public.laplace_clean_pending_list(selected);
     RAISE EXCEPTION 'unwritable Laplace index maintenance was permitted';
@@ -152,8 +157,8 @@ echo 'PASS ingestion writer privileges'
 python3 "$source_root/tests/stage-lifecycle.py" --psql "$psql" --connection "$LAPLACE_CONNINFO"
 
 # Concurrent publication of the same content; both publications roll back.
-"$isolationtester" "$LAPLACE_CONNINFO" < "$source_root/tests/specs/stage_overlap.spec" > "$work/stage-overlap.out"
-sed -i -e 's/[[:blank:]]*$//' -e '${/^$/d;}' "$work/stage-overlap.out"
+tr -d '\r' < "$source_root/tests/specs/stage_overlap.spec" | "$isolationtester" "$LAPLACE_CONNINFO" > "$work/stage-overlap.out"
+sed -i -e 's/\r$//' -e 's/[[:blank:]]*$//' -e '${/^$/d;}' "$work/stage-overlap.out"
 tr -d '\r' < "$source_root/tests/expected/stage_overlap.out" > "$work/stage-overlap.expected"
 diff -u "$work/stage-overlap.expected" "$work/stage-overlap.out"
 echo "PASS deployed extension regressions against database $dbname"

@@ -2,6 +2,7 @@
  * labels, claim previews, reference resolution, and constituent outputs. */
 #include "pg_core.h"
 #include "geo.h"
+#include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "utils/builtins.h"
 
@@ -135,6 +136,132 @@ PG_FUNCTION_INFO_V1(laplace_text_batch);
 Datum laplace_text_batch(PG_FUNCTION_ARGS){return realize_batch(fcinfo,false);}
 PG_FUNCTION_INFO_V1(laplace_labels);
 Datum laplace_labels(PG_FUNCTION_ARGS){return realize_batch(fcinfo,true);}
+
+/* Single-ID display label directly on the Native DAG (NULL when input is NULL,
+ * or when null_if_hex is requested and the ID has no realized label). */
+PG_FUNCTION_INFO_V1(laplace_label_text);
+Datum laplace_label_text(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) PG_RETURN_NULL();
+    bytea *b = PG_GETARG_BYTEA_PP(0);
+    if (VARSIZE_ANY_EXHDR(b) != sizeof(lp_id))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                        errmsg("a blake3 ID is 16 bytes (got %zu)", (size_t)VARSIZE_ANY_EXHDR(b))));
+    bool null_if_hex = (PG_NARGS() > 1 && !PG_ARGISNULL(1)) ? PG_GETARG_BOOL(1) : false;
+    lp_id id;
+    memcpy(id.b, VARDATA_ANY(b), sizeof(lp_id));
+
+    MemoryContext keep = CurrentMemoryContext;
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode));
+    lp_realizer *walk = lp_realizer_new();
+    StringInfoData out;
+    initStringInfo(&out);
+    text *res = NULL;
+    PG_TRY();
+    {
+        tnode(t, &id);
+        read_levels(t, keep, true, NULL);
+        render_label(walk, t, &id, &out);
+        bool suppress = false;
+        if (null_if_hex && out.len == 32) {
+            char hex[33];
+            lp_id_hex(&id, hex);
+            if (memcmp(out.data, hex, 32) == 0) suppress = true;
+        }
+        if (!suppress) res = cstring_to_text_with_len(out.data, out.len);
+    }
+    PG_FINALLY();
+    {
+        lp_idmap_free(t);
+        lp_realizer_free(walk);
+        pfree(out.data);
+    }
+    PG_END_TRY();
+    if (!res) PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(res);
+}
+
+/* Batch display realization preserving exact input ordinals and NULL slots. */
+PG_FUNCTION_INFO_V1(laplace_label_array);
+Datum laplace_label_array(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+    if (ARR_NDIM(arr) > 1)
+        ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR), errmsg("laplace_label_array: expected 1-D bytea[]")));
+    bool null_if_hex = (PG_NARGS() > 1 && !PG_ARGISNULL(1)) ? PG_GETARG_BOOL(1) : false;
+
+    Datum *elems = NULL;
+    bool *nulls = NULL;
+    int count = 0;
+    deconstruct_array(arr, BYTEAOID, -1, false, TYPALIGN_INT, &elems, &nulls, &count);
+    if (count <= 0) {
+        if (elems) pfree(elems);
+        if (nulls) pfree(nulls);
+        PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+    }
+
+    MemoryContext keep = CurrentMemoryContext;
+    lp_id *ids = palloc0(sizeof(lp_id) * (Size)count);
+    bool *valid = palloc0(sizeof(bool) * (Size)count);
+    Datum *out_elems = palloc0(sizeof(Datum) * (Size)count);
+    bool *out_nulls = palloc0(sizeof(bool) * (Size)count);
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode));
+    lp_idmap *cache = lp_idmap_sized(sizeof(Datum));
+    lp_realizer *walk = lp_realizer_new();
+
+    PG_TRY();
+    {
+        for (int i = 0; i < count; i++) {
+            if (nulls[i]) { out_nulls[i] = true; continue; }
+            bytea *b = DatumGetByteaPP(elems[i]);
+            if (VARSIZE_ANY_EXHDR(b) != sizeof(lp_id))
+                ereport(ERROR, (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                                errmsg("a blake3 ID is 16 bytes (got %zu)", (size_t)VARSIZE_ANY_EXHDR(b))));
+            memcpy(ids[i].b, VARDATA_ANY(b), sizeof(lp_id));
+            valid[i] = true;
+            tnode(t, &ids[i]);
+        }
+        read_levels(t, keep, true, NULL);
+        for (int i = 0; i < count; i++) {
+            if (!valid[i]) continue;
+            bool fresh = false;
+            Datum *cached = lp_idmap_get(cache, &ids[i], &fresh);
+            if (fresh) {
+                StringInfoData out;
+                initStringInfo(&out);
+                render_label(walk, t, &ids[i], &out);
+                bool suppress = false;
+                if (null_if_hex && out.len == 32) {
+                    char hex[33];
+                    lp_id_hex(&ids[i], hex);
+                    if (memcmp(out.data, hex, 32) == 0) suppress = true;
+                }
+                *cached = suppress ? (Datum)0 : PointerGetDatum(cstring_to_text_with_len(out.data, out.len));
+                pfree(out.data);
+            }
+            if (*cached == (Datum)0) {
+                out_nulls[i] = true;
+            } else {
+                out_elems[i] = *cached;
+                out_nulls[i] = false;
+            }
+        }
+    }
+    PG_FINALLY();
+    {
+        lp_idmap_free(cache);
+        lp_idmap_free(t);
+        lp_realizer_free(walk);
+    }
+    PG_END_TRY();
+
+    int dims[1] = { count }, lbs[1] = { 1 };
+    ArrayType *res = construct_md_array(out_elems, out_nulls, 1, dims, lbs, TEXTOID, -1, false, TYPALIGN_INT);
+    pfree(ids); pfree(valid); pfree(out_elems); pfree(out_nulls);
+    pfree(elems); pfree(nulls);
+    PG_RETURN_ARRAYTYPE_P(res);
+}
 
 /* Reference preparation is one Native operation: preserve client ID/surface
  * positions, probe the complete identity set, then materialize only missing
@@ -299,6 +426,419 @@ Datum laplace_below(PG_FUNCTION_ARGS){
             lp_pg_lookup_paths(frontier.v,frontier.n,true,below_output_row,&below);
             frontier.n=0;for(size_t i=0;i<below.next.n;i++)lp_push(&frontier,below.next.v[i]);
         }
-    }PG_FINALLY();{lp_idmap_free(below.expanded);lp_vec_free(&below.next);lp_vec_free(&frontier);}PG_END_TRY();
+    } PG_FINALLY();{lp_idmap_free(below.expanded);lp_vec_free(&below.next);lp_vec_free(&frontier);}PG_END_TRY();
     pfree(ids);PG_RETURN_NULL();
+}
+
+/* ---------------------------------------------------------------- batched witnesses with realized source names */
+typedef struct {
+    lp_id witness, lineage, record_id;
+    double trust;
+    int64 parts;
+    bool has_lin, has_path;
+} WitnessNamedRow;
+
+typedef struct {
+    lp_vec(WitnessNamedRow) rows;
+    lp_vec(lp_id) wids;
+    lp_idmap *by_w;
+    lp_idmap *rec_counts;
+} WitnessNamedCollect;
+
+static void witness_named_visit(const lp_id *id, const lp_id *lineage, double trust, void *context){
+    WitnessNamedCollect *c = context;
+    size_t idx = c->rows.n;
+    WitnessNamedRow r = { .witness = *id, .trust = trust, .has_lin = (lineage != NULL) };
+    if (lineage) r.lineage = *lineage;
+    lp_push(&c->rows, r);
+    lp_push(&c->wids, *id);
+    *(size_t *)lp_idmap_get(c->by_w, id, NULL) = idx;
+}
+
+static void witness_trunk_path(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask;
+    WitnessNamedCollect *c = context;
+    size_t *pidx = lp_idmap_lookup(c->by_w, id);
+    if (!pidx) return;
+    Geo g = geo_of(path);
+    if (g.p.n == 0) return;
+    WitnessNamedRow *r = &c->rows.v[*pidx];
+    r->record_id = lp_path_id(g.p, 0);
+    size_t plen = lp_path_len(g.p);
+    r->parts = plen > PG_INT64_MAX ? PG_INT64_MAX : (int64)plen;
+    r->has_path = true;
+    (*(int64 *)lp_idmap_get(c->rec_counts, &r->record_id, NULL))++;
+}
+
+PG_FUNCTION_INFO_V1(laplace_witnesses_named);
+Datum laplace_witnesses_named(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_witnesses_named", &td);
+    WitnessNamedCollect c = { .by_w = lp_idmap_sized(sizeof(size_t)), .rec_counts = lp_idmap_sized(sizeof(int64)) };
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode));
+    lp_realizer *walk = lp_realizer_new();
+    PG_TRY(); {
+        lp_pg_scan_all_witnesses(witness_named_visit, &c);
+        if (c.wids.n > 0) {
+            lp_pg_lookup_paths(c.wids.v, c.wids.n, false, witness_trunk_path, &c);
+            for (size_t i = 0; i < c.rows.n; i++)
+                if (c.rows.v[i].has_path) tnode(t, &c.rows.v[i].record_id);
+            read_levels(t, CurrentMemoryContext, true, NULL);
+        }
+        for (size_t i = 0; i < c.rows.n; i++) {
+            const WitnessNamedRow *r = &c.rows.v[i];
+            StringInfoData out; initStringInfo(&out);
+            if (r->has_path) render_label(walk, t, &r->record_id, &out);
+            text *name_t = cstring_to_text_with_len(out.data, out.len);
+            int64 readings = 0;
+            if (r->has_path) {
+                int64 *cnt = lp_idmap_lookup(c.rec_counts, &r->record_id);
+                if (cnt) readings = *cnt;
+            }
+            Datum v[7] = {
+                id_datum(&r->witness),
+                Float8GetDatum(r->trust),
+                r->has_lin ? id_datum(&r->lineage) : (Datum)0,
+                r->has_path ? id_datum(&r->record_id) : (Datum)0,
+                PointerGetDatum(name_t),
+                Int64GetDatum(r->parts),
+                Int64GetDatum(readings)
+            };
+            bool nl[7] = { false, false, !r->has_lin, !r->has_path, false, false, false };
+            set_put(fcinfo, ts, td, v, nl);
+            pfree(DatumGetPointer(v[0]));
+            if (r->has_lin) pfree(DatumGetPointer(v[2]));
+            if (r->has_path) pfree(DatumGetPointer(v[3]));
+            pfree(name_t); pfree(out.data);
+        }
+    } PG_FINALLY(); {
+        lp_idmap_free(t); lp_realizer_free(walk);
+        lp_idmap_free(c.by_w); lp_idmap_free(c.rec_counts);
+        lp_vec_free(&c.rows); lp_vec_free(&c.wids);
+    } PG_END_TRY();
+    return (Datum)0;
+}
+
+/* ---------------------------------------------------------------- single-pass code AST outline, paths & source text */
+typedef lp_vec(lp_id) RealizeIdVec;
+typedef struct { lp_vertex *v; size_t n; } CodeAstNode;
+typedef struct { lp_idmap *nodes; RealizeIdVec *meta_next; MemoryContext ctx; bool record_roles; } CodeAstCollect;
+
+static void code_ast_visit(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask;
+    CodeAstCollect *c = context;
+    bool fresh;
+    CodeAstNode *entry = lp_idmap_get(c->nodes, id, &fresh);
+    if (!fresh) return;
+    Geo g = geo_of(path);
+    entry->n = g.p.n;
+    entry->v = NULL;
+    if (!g.p.n) return;
+    entry->v = MemoryContextAlloc(c->ctx, sizeof(lp_vertex) * g.p.n);
+    if (lp_path_decode(g.p, entry->v, g.p.n) != g.p.n)
+        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace_code_symbols: invalid stored path")));
+    if (c->record_roles && c->meta_next) {
+        for (size_t k = 0; k < entry->n; k++) {
+            uint32 sd = entry->v[k].said;
+            if ((sd == LP_SAID_RECORD || sd == LP_SAID_HOLDS) && lp_idmap_find(c->nodes, &entry->v[k].id) < 0)
+                lp_push(c->meta_next, entry->v[k].id);
+        }
+    }
+}
+
+static void code_fetch_missing(CodeAstCollect *c, const lp_id *ids, size_t n){
+    if (!n) return;
+    lp_idmap *uniq = lp_idmap_new();
+    for (size_t i = 0; i < n; i++)
+        if (lp_idmap_find(c->nodes, &ids[i]) < 0) lp_idmap_put(uniq, &ids[i], NULL);
+    if (lp_idmap_count(uniq) > 0)
+        lp_pg_lookup_paths(lp_idmap_keys(uniq), lp_idmap_count(uniq), false, code_ast_visit, c);
+    lp_idmap_free(uniq);
+}
+
+static void render_exact(lp_realizer *walk, lp_idmap *t, const lp_id *id, StringInfo out){
+    if (lp_tier0_codepoint(lp_pg_tier0(), id) >= 0 || lp_idmap_find(t, id) >= 0) {
+        render(walk, t, id, out);
+        return;
+    }
+    char hex[33]; lp_id_hex(id, hex);
+    appendStringInfoString(out, hex);
+}
+
+PG_FUNCTION_INFO_V1(laplace_code_symbols);
+Datum laplace_code_symbols(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_code_symbols", &td);
+    if (PG_ARGISNULL(0)) return (Datum)0;
+    int nf = 0;
+    lp_id *files = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nf);
+    if (nf <= 0) { pfree(files); return (Datum)0; }
+    bool include_text = PG_NARGS() > 1 && !PG_ARGISNULL(1) ? PG_GETARG_BOOL(1) : true;
+
+    lp_text *tx = lp_pg_text_context();
+    lp_id id_pathname = {0}, id_filename = {0}, id_declared = {0};
+    if (!lp_text_id(tx, "pathname", 8, &id_pathname) ||
+        !lp_text_id(tx, "filename", 8, &id_filename) ||
+        !lp_text_id(tx, "declared identifier", 19, &id_declared))
+        ereport(ERROR, (errmsg("laplace_code_symbols: tier0 lacks ASCII lookup atoms")));
+
+    MemoryContext caller = CurrentMemoryContext;
+    MemoryContext symctx = AllocSetContextCreate(caller, "laplace_code_symbols", ALLOCSET_DEFAULT_SIZES);
+    lp_idmap *nodes = lp_idmap_sized(sizeof(CodeAstNode));
+    lp_idmap *text_tree = lp_idmap_sized(sizeof(TNode));
+    lp_realizer *walk = lp_realizer_new();
+
+    typedef struct { lp_id kind, name, source; } DeclIds;
+    typedef struct { lp_id file; lp_vec(lp_id) path_segs; lp_id filename; bool has_path, has_name, is_path_multi, present;
+                     lp_vec(lp_id) text_parts; lp_vec(uint32) text_runs; lp_vec(DeclIds) decls; } FileSym;
+
+    PG_TRY(); {
+        RealizeIdVec ast_front = {0}, ast_next = {0}, meta_heads = {0}, meta_kids = {0}, path_nodes = {0};
+        CodeAstCollect collect = { .nodes = nodes, .meta_next = &ast_next, .ctx = symctx, .record_roles = true };
+
+        for (int i = 0; i < nf; i++) lp_push(&ast_front, files[i]);
+        while (ast_front.n > 0) {
+            CHECK_FOR_INTERRUPTS();
+            ast_next.n = 0;
+            code_fetch_missing(&collect, ast_front.v, ast_front.n);
+            ast_front.n = 0;
+            for (size_t i = 0; i < ast_next.n; i++) lp_push(&ast_front, ast_next.v[i]);
+        }
+
+        /* Bounded metadata walk (max depth 8, matching api_cw_file_name) without widening content search. */
+        collect.record_roles = false; collect.meta_next = NULL;
+        for (int i = 0; i < nf; i++) lp_push(&meta_heads, files[i]);
+        for (int depth = 0; depth < 8 && meta_heads.n > 0; depth++) {
+            CHECK_FOR_INTERRUPTS();
+            code_fetch_missing(&collect, meta_heads.v, meta_heads.n);
+            meta_kids.n = 0;
+            lp_vec(lp_id) next_heads = {0};
+            for (size_t i = 0; i < meta_heads.n; i++) {
+                const CodeAstNode *n = lp_idmap_lookup(nodes, &meta_heads.v[i]);
+                if (!n || !n->n) continue;
+                for (size_t k = 0; k < n->n && k < 64; k++) lp_push(&meta_kids, n->v[k].id);
+                lp_push(&next_heads, n->v[0].id);
+            }
+            code_fetch_missing(&collect, meta_kids.v, meta_kids.n);
+            path_nodes.n = 0;
+            for (size_t i = 0; i < meta_kids.n; i++) {
+                const CodeAstNode *pair = lp_idmap_lookup(nodes, &meta_kids.v[i]);
+                if (pair && pair->n == 2 && lp_id_eq(&pair->v[0].id, &id_pathname))
+                    lp_push(&path_nodes, pair->v[1].id);
+            }
+            if (path_nodes.n > 0) code_fetch_missing(&collect, path_nodes.v, path_nodes.n);
+            meta_heads.n = 0;
+            for (size_t i = 0; i < next_heads.n; i++) lp_push(&meta_heads, next_heads.v[i]);
+            lp_vec_free(&next_heads);
+        }
+
+        FileSym *fsyms = MemoryContextAllocZero(symctx, sizeof(FileSym) * (size_t)nf);
+        RealizeIdVec all_claims = {0}, all_subjects = {0};
+        lp_vec(RealizeIdVec) raw_claims = {0};
+        typedef struct { lp_id id; uint32 role; } Pend;
+        lp_vec(Pend) pend = {0};
+
+        for (int i = 0; i < nf; i++) {
+            FileSym *fs = &fsyms[i];
+            fs->file = files[i];
+            const CodeAstNode *fn = lp_idmap_lookup(nodes, &files[i]);
+            if (!fn) continue;
+            fs->present = true;
+
+            /* Resolve file_path leaves from metadata chain */
+            lp_id at = files[i];
+            for (int depth = 0; depth < 8; depth++) {
+                const CodeAstNode *kn = lp_idmap_lookup(nodes, &at);
+                if (!kn || !kn->n) break;
+                lp_id pname = {0}, fname = {0}; bool hp = false, hn = false;
+                for (size_t k = 0; k < kn->n && k < 64; k++) {
+                    const CodeAstNode *pair = lp_idmap_lookup(nodes, &kn->v[k].id);
+                    if (!pair || pair->n != 2) continue;
+                    if (!hp && lp_id_eq(&pair->v[0].id, &id_pathname)) { pname = pair->v[1].id; hp = true; }
+                    else if (!hn && lp_id_eq(&pair->v[0].id, &id_filename)) { fname = pair->v[1].id; hn = true; }
+                }
+                if (hp) {
+                    const CodeAstNode *pn = (hn && lp_id_eq(&pname, &fname)) ? NULL : lp_idmap_lookup(nodes, &pname);
+                    if (pn && pn->n > 0) {
+                        for (size_t z = 0; z < pn->n && z < 128; z++) {
+                            lp_push(&fs->path_segs, pn->v[z].id);
+                            tnode(text_tree, &pn->v[z].id);
+                        }
+                    } else {
+                        lp_push(&fs->path_segs, pname);
+                        tnode(text_tree, &pname);
+                    }
+                    fs->has_path = true;
+                    break;
+                }
+                if (hn) {
+                    fs->filename = fname; fs->has_name = true;
+                    tnode(text_tree, &fname);
+                    break;
+                }
+                at = kn->v[0].id;
+            }
+
+            /* Collect claims in source order (matching fo_collect_claims) */
+            pend.n = 0;
+            for (size_t k = fn->n; k-- > 0;) {
+                uint32 sd = fn->v[k].said;
+                if (sd == LP_SAID_RECORD || sd == LP_SAID_HOLDS || sd == LP_SAID_CLAIM)
+                    lp_push(&pend, ((Pend){fn->v[k].id, sd}));
+            }
+            RealizeIdVec fclaims = {0};
+            while (pend.n > 0) {
+                Pend cur = pend.v[--pend.n];
+                if (cur.role == LP_SAID_CLAIM) {
+                    lp_push(&fclaims, cur.id);
+                    lp_push(&all_claims, cur.id);
+                    continue;
+                }
+                const CodeAstNode *cn = lp_idmap_lookup(nodes, &cur.id);
+                size_t marked = 0;
+                if (cn) {
+                    for (size_t k = cn->n; k-- > 0;) {
+                        uint32 sd = cn->v[k].said;
+                        if (sd != LP_SAID_RECORD && sd != LP_SAID_HOLDS && sd != LP_SAID_CLAIM) continue;
+                        marked++;
+                        uint32 run = cn->v[k].run ? cn->v[k].run : 1;
+                        while (run--) lp_push(&pend, ((Pend){cn->v[k].id, sd}));
+                    }
+                }
+                if (!marked && cur.role == LP_SAID_RECORD) {
+                    lp_push(&fclaims, cur.id);
+                    lp_push(&all_claims, cur.id);
+                }
+            }
+            /* Collect file content text leaves (matching fo_tree_text) */
+            if (include_text) {
+                for (size_t k = 0; k < fn->n; k++) {
+                    uint32 sd = fn->v[k].said;
+                    if (sd == LP_SAID_METADATA || sd == LP_SAID_CLAIM) continue;
+                    if (sd == LP_SAID_RECORD) {
+                        const CodeAstNode *rn = lp_idmap_lookup(nodes, &fn->v[k].id);
+                        bool has_claim = false;
+                        if (rn) for (size_t z = 0; z < rn->n; z++) if (rn->v[z].said == LP_SAID_CLAIM) { has_claim = true; break; }
+                        if (!has_claim) continue;
+                    }
+                    lp_push(&fs->text_parts, fn->v[k].id);
+                    lp_push(&fs->text_runs, fn->v[k].run ? fn->v[k].run : 1);
+                    tnode(text_tree, &fn->v[k].id);
+                }
+            }
+            lp_push(&raw_claims, fclaims);
+        }
+
+        /* Batch-fetch all claims and declared-identifier subjects */
+        code_fetch_missing(&collect, all_claims.v, all_claims.n);
+        for (size_t i = 0; i < all_claims.n; i++) {
+            const CodeAstNode *cn = lp_idmap_lookup(nodes, &all_claims.v[i]);
+            if (cn && cn->n == 3 && lp_id_eq(&cn->v[1].id, &id_declared))
+                lp_push(&all_subjects, cn->v[0].id);
+        }
+        code_fetch_missing(&collect, all_subjects.v, all_subjects.n);
+
+        for (int i = 0, ri = 0; i < nf; i++) {
+            FileSym *fs = &fsyms[i];
+            if (!fs->present) continue;
+            RealizeIdVec *fclaims = &raw_claims.v[ri++];
+            for (size_t k = 0; k < fclaims->n; k++) {
+                const CodeAstNode *cn = lp_idmap_lookup(nodes, &fclaims->v[k]);
+                if (!cn || cn->n != 3 || !lp_id_eq(&cn->v[1].id, &id_declared)) continue;
+                const CodeAstNode *sn = lp_idmap_lookup(nodes, &cn->v[0].id);
+                if (!sn || sn->n != 2) continue;
+                DeclIds d = { sn->v[0].id, cn->v[2].id, sn->v[1].id };
+                lp_push(&fs->decls, d);
+                tnode(text_tree, &d.kind);
+                tnode(text_tree, &d.name);
+                tnode(text_tree, &d.source);
+            }
+            lp_vec_free(fclaims);
+        }
+
+        /* Realize all needed leaves in one shared text frontier */
+        read_levels(text_tree, symctx, false, NULL);
+
+        for (int i = 0; i < nf; i++) {
+            FileSym *fs = &fsyms[i];
+            if (!fs->present) continue;
+            StringInfoData fp; initStringInfo(&fp);
+            if (fs->has_path) {
+                for (size_t z = 0; z < fs->path_segs.n; z++) {
+                    appendStringInfoChar(&fp, '/');
+                    render_exact(walk, text_tree, &fs->path_segs.v[z], &fp);
+                }
+            } else if (fs->has_name) {
+                render_exact(walk, text_tree, &fs->filename, &fp);
+            }
+            StringInfoData stxt; initStringInfo(&stxt);
+            if (include_text) {
+                for (size_t v = 0; v < fs->text_parts.n; v++) {
+                    StringInfoData part; initStringInfo(&part);
+                    render_exact(walk, text_tree, &fs->text_parts.v[v], &part);
+                    for (uint32 r = 0; r < fs->text_runs.v[v]; r++)
+                        appendBinaryStringInfo(&stxt, part.data, part.len);
+                    pfree(part.data);
+                }
+            }
+            text *fp_t = cstring_to_text_with_len(fp.data, fp.len);
+            text *st_t = include_text ? cstring_to_text_with_len(stxt.data, stxt.len) : NULL;
+
+            if (fs->decls.n == 0) {
+                Datum v[7] = {
+                    id_datum(&fs->file),
+                    PointerGetDatum(fp_t),
+                    include_text ? PointerGetDatum(st_t) : (Datum)0,
+                    Int32GetDatum(0),
+                    (Datum)0, (Datum)0, (Datum)0
+                };
+                bool nl[7] = { false, false, !include_text, false, true, true, true };
+                set_put(fcinfo, ts, td, v, nl);
+                pfree(DatumGetPointer(v[0]));
+            } else {
+                for (size_t d = 0; d < fs->decls.n; d++) {
+                    CHECK_FOR_INTERRUPTS();
+                    StringInfoData dk, dn, ds;
+                    initStringInfo(&dk); initStringInfo(&dn); initStringInfo(&ds);
+                    render_exact(walk, text_tree, &fs->decls.v[d].kind, &dk);
+                    render_exact(walk, text_tree, &fs->decls.v[d].name, &dn);
+                    render_exact(walk, text_tree, &fs->decls.v[d].source, &ds);
+                    text *dk_t = cstring_to_text_with_len(dk.data, dk.len);
+                    text *dn_t = cstring_to_text_with_len(dn.data, dn.len);
+                    text *ds_t = cstring_to_text_with_len(ds.data, ds.len);
+                    bool emit_src = (include_text && d == 0);
+                    Datum v[7] = {
+                        id_datum(&fs->file),
+                        PointerGetDatum(fp_t),
+                        emit_src ? PointerGetDatum(st_t) : (Datum)0,
+                        Int32GetDatum((int32)(d + 1)),
+                        PointerGetDatum(dk_t),
+                        PointerGetDatum(dn_t),
+                        PointerGetDatum(ds_t)
+                    };
+                    bool nl[7] = { false, false, !emit_src, false, false, false, false };
+                    set_put(fcinfo, ts, td, v, nl);
+                    pfree(DatumGetPointer(v[0]));
+                    pfree(dk_t); pfree(dn_t); pfree(ds_t);
+                    pfree(dk.data); pfree(dn.data); pfree(ds.data);
+                }
+            }
+            pfree(fp_t); if (st_t) pfree(st_t);
+            pfree(fp.data); pfree(stxt.data);
+            lp_vec_free(&fs->path_segs); lp_vec_free(&fs->text_parts);
+            lp_vec_free(&fs->text_runs); lp_vec_free(&fs->decls);
+        }
+
+        lp_vec_free(&ast_front); lp_vec_free(&ast_next); lp_vec_free(&meta_heads);
+        lp_vec_free(&meta_kids); lp_vec_free(&path_nodes);
+        lp_vec_free(&all_claims); lp_vec_free(&all_subjects);
+        lp_vec_free(&raw_claims); lp_vec_free(&pend);
+    } PG_FINALLY(); {
+        lp_realizer_free(walk);
+        lp_idmap_free(text_tree);
+        lp_idmap_free(nodes);
+        MemoryContextDelete(symctx);
+        pfree(files);
+    } PG_END_TRY();
+    return (Datum)0;
 }

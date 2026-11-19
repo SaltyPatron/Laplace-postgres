@@ -6,8 +6,12 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "catalog/pg_type.h"
+#include "nodes/pg_list.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 #include "utils/varbit.h"
+#include <math.h>
 
 #define LP_STRAT_HASBIT  1        /* mask ? int2 */
 #define LP_STRAT_HASALL  2        /* mask ?& int2[] */
@@ -33,12 +37,13 @@ static lp_mask mask_native(VarBit *mask){
     for (unsigned i = 0; i < 8; i++) value |= (uint64)reverse_byte(VARBITS(mask)[i]) << (8 * i);
     return value;
 }
-static VarBit *mask_sql(lp_mask value){
+VarBit *lp_pg_mask_sql(lp_mask value){
     VarBit *mask = palloc0(VARBITTOTALLEN(LP_MASK_BITS));
     SET_VARSIZE(mask, VARBITTOTALLEN(LP_MASK_BITS)); VARBITLEN(mask) = LP_MASK_BITS;
     for (unsigned i = 0; i < 8; i++) VARBITS(mask)[i] = reverse_byte((uint8)(value >> (8 * i)));
     return mask;
 }
+static inline VarBit *mask_sql(lp_mask value){ return lp_pg_mask_sql(value); }
 static const lp_bank *mask_bank(text *name){
     char *bank = text_to_cstring(name); const lp_bank *descriptor = lp_highway_bank(lp_pg_highway(), bank);
     if (!descriptor) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: no bank \"%s\" (manifest/banks.tsv)", bank)));
@@ -185,4 +190,74 @@ Datum laplace_bank_of(PG_FUNCTION_ARGS){
     if (!b) PG_RETURN_NULL();
     Datum v[4] = { CStringGetTextDatum(b->name), CStringGetTextDatum(b->group), CStringGetTextDatum(b->carrier), Int16GetDatum((int16)bit) }; bool nl[4] = { 0 };
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(td), v, nl)));
+}
+
+static int mask_sel_array_len(Node *other, bool *is_null_const)
+{
+    *is_null_const = false;
+    if (!other) return 2;
+    if (IsA(other, Const)) {
+        Const *c = (Const *)other;
+        if (c->constisnull) { *is_null_const = true; return 0; }
+        if (!c->constbyval && get_element_type(c->consttype) != InvalidOid) {
+            ArrayType *a = DatumGetArrayTypeP(c->constvalue);
+            int n = ArrayGetNItems(ARR_NDIM(a), ARR_DIMS(a));
+            return (n >= 0 && n <= 1000) ? n : 2;
+        }
+        return 1;
+    }
+    if (IsA(other, ArrayExpr)) {
+        int n = list_length(((ArrayExpr *)other)->elements);
+        return (n >= 0 && n <= 1000) ? n : 2;
+    }
+    return 2;
+}
+
+static inline float8 clamp_mask_sel(float8 v, float8 lo, float8 hi)
+{
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    CLAMP_PROBABILITY(v);
+    return v;
+}
+
+PG_FUNCTION_INFO_V1(laplace_mask_sel);
+Datum laplace_mask_sel(PG_FUNCTION_ARGS)
+{
+    PlannerInfo *root = (PlannerInfo *)PG_GETARG_POINTER(0);
+    Oid operatorid = PG_GETARG_OID(1);
+    List *args = (List *)PG_GETARG_POINTER(2);
+    int varRelid = PG_GETARG_INT32(3);
+
+    VariableStatData vardata;
+    Node *other = NULL;
+    bool varonleft = true;
+    bool has_var = get_restriction_variable(root, args, varRelid, &vardata, &other, &varonleft);
+    bool is_null = false;
+    int k = mask_sel_array_len(other, &is_null);
+    if (has_var) ReleaseVariableStats(vardata);
+    if (is_null) PG_RETURN_FLOAT8(0.0);
+
+    char *opname = get_opname(operatorid);
+    float8 sel = 0.02;
+    if (opname) {
+        if (strcmp(opname, "?") == 0) {
+            sel = 0.02;
+        } else if (strcmp(opname, "?&") == 0) {
+            int kk = Min(Max(k, 1), 6);
+            sel = clamp_mask_sel(pow(0.1, (double)kk) * 0.05, 5e-4, 0.02);
+        } else if (strcmp(opname, "?|") == 0) {
+            int kk = Max(k, 1);
+            sel = clamp_mask_sel(0.02 * (double)kk, 0.005, 0.30);
+        }
+        pfree(opname);
+    }
+    PG_RETURN_FLOAT8(sel);
+}
+
+PG_FUNCTION_INFO_V1(laplace_mask_joinsel);
+Datum laplace_mask_joinsel(PG_FUNCTION_ARGS)
+{
+    (void)fcinfo;
+    PG_RETURN_FLOAT8(0.01);
 }

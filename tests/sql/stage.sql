@@ -83,9 +83,7 @@ END $$;
 -- reads, without paying a pending-list scan at every provenance frontier.
 DO $$ DECLARE remaining bigint; cleaned bigint; untouched bigint;
   touched text:='lpcheckstagetouched';
-  unrelated text:=(SELECT u FROM unnest(ARRAY['lpcheckstageunrelatedx','lpcheckstageunrelatedy',
-    'lpcheckstageunrelatedz','lpcheckstageunrelatedw']) u
-    WHERE left(laplace_id(u)::text,2)<>left(laplace_id('lpcheckstagetouched')::text,2) LIMIT 1);
+  unrelated text:='lpcheckstage unrelated';
 BEGIN
   SELECT coalesce(sum(pg_catalog.gin_clean_pending_list(i.indexrelid)),0) INTO remaining
   FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_am a ON a.oid=c.relam
@@ -100,7 +98,8 @@ BEGIN
     SELECT laplace_id(t),laplace_tier(t),laplace_hilbert(t),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(t,'') c))
     FROM unnest(ARRAY[touched,unrelated]) t;
-  IF unrelated IS NULL OR left(laplace_id(touched)::text,2)=left(laplace_id(unrelated)::text,2) THEN
+  IF (SELECT tableoid FROM public.physicality WHERE entity=laplace_id(touched))
+     =(SELECT tableoid FROM public.physicality WHERE entity=laplace_id(unrelated)) THEN
     RAISE EXCEPTION 'maintenance fixture requires distinct destination partitions';
   END IF;
   CREATE UNLOGGED TABLE stage.check_maintenance_paths (LIKE stage.physicality INCLUDING DEFAULTS);

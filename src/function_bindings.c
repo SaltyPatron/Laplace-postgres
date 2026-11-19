@@ -15,6 +15,7 @@
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "utils/regproc.h"
+#include "executor/spi.h"
 
 typedef struct { const char *symbol; bool sql_scope; } FunctionBinding;
 #include "laplace_function_bindings.h"
@@ -53,7 +54,7 @@ static void restore_declared_api(const char *module,Oid extension)
         if(OidIsValid(procedure)){
             if(getExtensionOfObject(ProcedureRelationId,procedure)!=extension)
                 ereport(ERROR,(errcode(ERRCODE_DUPLICATE_OBJECT),errmsg("Native API conflicts with a foreign function: %s",format_procedure_qualified(procedure))));
-            continue;
+            if(!function->replace)continue;
         }
         const char *start=sql.data+raw->stmt_location;
         char *definition=raw->stmt_len?pnstrdup(start,raw->stmt_len):pstrdup(start);
@@ -61,7 +62,8 @@ static void restore_declared_api(const char *module,Oid extension)
         pfree(definition);
         procedure=LookupFuncName(function->funcname,count,arguments,false);
         if(getExtensionOfObject(ProcedureRelationId,procedure)!=extension){
-            char *membership=psprintf("ALTER EXTENSION laplace ADD FUNCTION %s",format_procedure_qualified(procedure));
+            char *membership=psprintf("ALTER EXTENSION laplace ADD %s %s",
+                function->is_procedure?"PROCEDURE":"FUNCTION",format_procedure_qualified(procedure));
             if(SPI_execute(membership,false,0)<0)elog(ERROR,"Native API membership restoration failed");
             pfree(membership);
         }

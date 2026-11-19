@@ -1,9 +1,8 @@
-/* One downward set traversal for consumers of registered canonical structure. */
+/* One downward set traversal for consumers of registered canonical structure,
+ * and zero-SPI graph walks (laplace_pull, laplace_chains, laplace_above). */
 #include "pg_core.h"
 #include "geo.h"
 #include "catalog/pg_type.h"
-#include "nodes/params.h"
-#include "access/table.h"
 
 typedef struct { lp_id *v; size_t n, cap; } WalkIds;
 typedef struct {
@@ -19,12 +18,11 @@ static void walk_remember(WitnessWalk *walk, WalkIds *frontier, const lp_id *id)
     lp_idmap_put(walk->seen, id, &fresh);
     if (fresh) lp_push(frontier, *id);
 }
-static void walk_root(TupleTableSlot *row, void *context)
+static void walk_root_visit(const lp_id *id, const lp_id *lineage, double trust, void *context)
 {
-    WitnessWalk *walk = context; bool missing;
-    Datum id = slot_getattr(row, 1, &missing);
-    if (missing) ereport(ERROR, (errmsg("registered witness has a null identity")));
-    walk_remember(walk, &walk->frontier, (const lp_id *)DatumGetPointer(id));
+    (void)lineage; (void)trust;
+    WitnessWalk *walk = context;
+    walk_remember(walk, &walk->frontier, id);
 }
 static void walk_path(const lp_id *id, Datum geometry, Datum mask, void *context)
 {
@@ -40,17 +38,13 @@ void lp_pg_walk_witnesses(ArrayType *roots, lp_pg_stored_path_visit visit, void 
     if (roots && ARR_NDIM(roots) > 1)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("witness roots must be a one-dimensional identity array")));
     WitnessWalk walk = {.seen = lp_idmap_new(), .visit = visit, .context = context};
-    Oid attestation = lp_pg_relation("attestation");
-    Oid types[] = {get_array_type(get_atttype(attestation, get_attnum(attestation, "witness")))};
-    ParamListInfo params = makeParamList(1);
-    params->params[0] = (ParamExternData){.ptype = types[0], .value = PointerGetDatum(roots), .isnull = roots == NULL};
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("witness traversal: SPI connect failed")));
-    SPIPlanPtr plan = lp_pg_prepare_cursor(
-        "SELECT DISTINCT witness FROM @extschema@.attestation WHERE ($1 IS NULL OR witness OPERATOR(@extschema@.=) ANY($1)) ORDER BY witness",
-        1, types, CURSOR_OPT_CUSTOM_PLAN);
-    if (!plan) ereport(ERROR, (errmsg("witness traversal: cannot prepare root selection")));
-    lp_pg_stream(plan, params, walk_root, &walk);
-    SPI_freeplan(plan); SPI_finish(); pfree(params);
+    if (!roots) {
+        lp_pg_scan_all_witnesses(walk_root_visit, &walk);
+    } else {
+        int nr; lp_id *rids = ids_of(roots, &nr);
+        if (nr > 0) lp_pg_lookup_witnesses(rids, (size_t)nr, false, walk_root_visit, &walk);
+        pfree(rids);
+    }
     while (walk.frontier.n) {
         CHECK_FOR_INTERRUPTS();
         lp_pg_lookup_paths(walk.frontier.v, walk.frontier.n, false, walk_path, &walk);
@@ -61,42 +55,28 @@ void lp_pg_walk_witnesses(ArrayType *roots, lp_pg_stored_path_visit visit, void 
 }
 
 /* ---------------------------------------------------------------- the claim reader the walks share
- * One kept statement: every scored claim of three constituents holding a frontier entity at either end, its middle
- * qualified (NULL unconstrained), at most fan an occurrence (NULL every one); one executor pass over the frontier. */
-typedef struct { SPIPlanPtr plan; uint64 generation; } WalkPlan;
-static WalkPlan claims_plan;
-static void walk_claims(Oid idarr, const lp_id *ids, int n, int64 fan, Datum middle, bool no_middle, Datum refuse){
-    uint64 generation = lp_pg_binding_generation();
-    if (claims_plan.plan && claims_plan.generation != generation) { SPI_freeplan(claims_plan.plan); claims_plan.plan = NULL; }
-    Oid types[4] = { idarr, INT8OID, idarr, idarr };
-    if (!claims_plan.plan) {
-        char *sql = lp_pg_sql("SELECT c.i, c.entity, c.path, c.rating, c.deviation, c.volatility, c.matches "
-            "FROM @extschema@.laplace_claims_each($1, $2, ARRAY[@extschema@.laplace_bank_bit('kind','claim')]::smallint[], $3, 3::smallint, $4, 3::bigint) c");
-        claims_plan.plan = SPI_prepare(sql, 4, types); pfree(sql);
-        if (!claims_plan.plan) ereport(ERROR, (errmsg("laplace walk: SPI_prepare: %s", SPI_result_code_string(SPI_result))));
-        SPI_keepplan(claims_plan.plan); claims_plan.generation = generation;
-    }
-    Datum a[4] = { PointerGetDatum(id_array_of(get_element_type(idarr), ids, n)), fan < 0 ? (Datum)0 : Int64GetDatum(fan), refuse, middle };
-    char nulls[4] = { ' ', fan < 0 ? 'n' : ' ', ' ', no_middle ? 'n' : ' ' };
-    if (SPI_execute_plan(claims_plan.plan, a, nulls, true, 0) != SPI_OK_SELECT)
-        ereport(ERROR, (errmsg("laplace walk: claims: %s", SPI_result_code_string(SPI_result))));
-}
+ * One Direct-AM claim reader: every scored claim of three constituents holding a frontier entity at either end, its
+ * middle qualified (NULL unconstrained), at most fan an occurrence (-1 every one). */
 typedef struct { int64 i; lp_id claim, part[3]; lp_rating r; int64 matches; } WalkClaim;
-/* The current SPI result as claims of exactly three constituents; anything else ties nothing to anything. */
-static WalkClaim *walk_rows(size_t *count){
-    WalkClaim *out = palloc(sizeof(WalkClaim) * (SPI_processed ? SPI_processed : 1)); size_t n = 0;
-    for (uint64 r = 0; r < SPI_processed; r++) {
-        HeapTuple t = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
-        WalkClaim *c = &out[n]; c->i = DatumGetInt64(SPI_getbinval(t, d, 1, &nl));
-        memcpy(c->claim.b, DatumGetPointer(SPI_getbinval(t, d, 2, &nl)), 16);
-        Geo g = geo_of(SPI_getbinval(t, d, 3, &nl)); lp_id part[4];
-        if (lp_path_len(g.p) != 3 || lp_path_expand(g.p, part, 4) != 3) continue;
-        memcpy(c->part, part, sizeof c->part);
-        c->r.rating = DatumGetFloat8(SPI_getbinval(t, d, 4, &nl)); c->r.deviation = DatumGetFloat8(SPI_getbinval(t, d, 5, &nl));
-        c->r.volatility = DatumGetFloat8(SPI_getbinval(t, d, 6, &nl)); c->matches = DatumGetInt64(SPI_getbinval(t, d, 7, &nl));
-        n++;
-    }
-    *count = n; return out;
+typedef struct {
+    lp_vec(WalkClaim) rows;
+    int64 seen;
+    int64 cap;
+    bool check_cap;
+} WalkClaimCollect;
+static void walk_claim_visit(const PgClaimHit *hit, void *context){
+    WalkClaimCollect *c = context;
+    if (!hit->path) return;
+    if (c->check_cap && ++c->seen > c->cap)
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("laplace_chains: paths exceed the admitted frontier; no partial path was returned")));
+    Geo g = geo_of(hit->path); lp_id part[4];
+    if (lp_path_len(g.p) != 3 || lp_path_expand(g.p, part, 4) != 3) return;
+    WalkClaim *wc = lp_vec_add(&c->rows);
+    wc->i = hit->i;
+    wc->claim = hit->entity;
+    memcpy(wc->part, part, sizeof wc->part);
+    wc->r = (lp_rating){ hit->rating, hit->deviation, hit->volatility };
+    wc->matches = hit->matches;
 }
 
 /* ---------------------------------------------------------------- PULL: best-first over rated claims
@@ -123,10 +103,11 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
     if (fan == PG_INT64_MAX) fan--;
     if (PG_ARGISNULL(0) || nodes == 0) PG_RETURN_NULL();
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0), el = get_element_type(idarr);
-    int ns; lp_id *seeds = ids_of(PG_GETARG_ARRAYTYPE_P(0), &ns); if (!ns) PG_RETURN_NULL();
+    int ns; lp_id *seeds = ids_of(PG_GETARG_ARRAYTYPE_P(0), &ns); if (!ns) { pfree(seeds); PG_RETURN_NULL(); }
     int ng = 0; lp_id *goals = PG_ARGISNULL(1) ? NULL : ids_of(PG_GETARG_ARRAYTYPE_P(1), &ng);
-    Datum middle = PG_ARGISNULL(5) ? (Datum)0 : PG_GETARG_DATUM(5);
-    Datum refuse = PG_ARGISNULL(6) ? PointerGetDatum(id_array_of(el, NULL, 0)) : PG_GETARG_DATUM(6);
+    bool no_middle = PG_ARGISNULL(5);
+    int nmid = 0; lp_id *mids = no_middle ? NULL : ids_of(PG_GETARG_ARRAYTYPE_P(5), &nmid);
+    int nref = 0; lp_id *refuse = PG_ARGISNULL(6) ? NULL : ids_of(PG_GETARG_ARRAYTYPE_P(6), &nref);
     lp_frontier *f = lp_frontier_new();
     lp_idmap *info = lp_idmap_sized(sizeof(PullInfo)), *goal = lp_idmap_new(), *seedset = lp_idmap_new();
     PG_TRY(); {
@@ -138,7 +119,6 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
             PullInfo *pi = lp_idmap_get(info, &seeds[i], NULL); pi->seed = seeds[i];
         }
         lp_id *closed = palloc(sizeof(lp_id) * 64); int64 nclosed = 0, capclosed = 64; bool done = false;
-        if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_pull: SPI_connect")));
         while (!done && nclosed < nodes) {
             CHECK_FOR_INTERRUPTS();
             lp_reached batch[PULL_BATCH]; int nb = 0; const lp_reached *x;
@@ -152,8 +132,12 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
             lp_id ids[PULL_BATCH]; int who[PULL_BATCH], m = 0;
             for (int i = 0; i < nb; i++) if ((int64)batch[i].hops < maxhops) { ids[m] = batch[i].id; who[m++] = i; }
             if (!m) continue;
-            walk_claims(idarr, ids, m, fan + 1, middle, PG_ARGISNULL(5), refuse);
-            size_t nc; WalkClaim *cl = walk_rows(&nc); SPI_freetuptable(SPI_tuptable);
+            WalkClaimCollect col = { .rows = { 0 }, .seen = 0, .cap = 0, .check_cap = false };
+            lp_pg_claims_each_direct(ids, m, fan + 1, UINT64_C(1),
+                                     refuse, nref, 3,
+                                     no_middle ? NULL : mids, nmid, 3, NULL, 0,
+                                     walk_claim_visit, &col);
+            size_t nc = col.rows.n; WalkClaim *cl = col.rows.v;
             lp_sort(cl, nc, sizeof(WalkClaim), by_claim);                         /* each entity's claims in ID order */
             int64 held[PULL_BATCH] = { 0 }, used[PULL_BATCH] = { 0 };
             for (size_t j = 0; j < nc; j++) if (cl[j].i >= 1 && cl[j].i <= m) held[cl[j].i - 1]++;
@@ -174,9 +158,8 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
                     oi->seed = seed; oi->relation = cl[j].part[1]; oi->rating = cl[j].r.rating; oi->deviation = cl[j].r.deviation;
                 }
             }
-            pfree(cl);
+            lp_vec_free(&col.rows);
         }
-        SPI_finish();
         for (int64 c = 0; c < nclosed; c++) {
             CHECK_FOR_INTERRUPTS();
             const lp_reached *r = lp_frontier_find(f, &closed[c]); const PullInfo *pi = lp_idmap_lookup(info, &closed[c]);
@@ -193,6 +176,10 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
             set_put(fcinfo, ts, td, o, nl); pfree(chain); pfree(claims);
         }
     } PG_FINALLY(); { lp_frontier_free(f); lp_idmap_free(info); lp_idmap_free(goal); lp_idmap_free(seedset); } PG_END_TRY();
+    if (refuse) pfree(refuse);
+    if (mids) pfree(mids);
+    if (goals) pfree(goals);
+    pfree(seeds);
     PG_RETURN_NULL();
 }
 
@@ -224,7 +211,6 @@ Datum laplace_chains(PG_FUNCTION_ARGS){
     for (int a = 0; a <= 5; a++) if (PG_ARGISNULL(a)) PG_RETURN_NULL();
     int64 cap = PG_GETARG_INT64(5);
     if (cap < 1) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_chains: cap must be positive")));
-    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     int nr, nsteps, np, nd, ni;
     lp_id *roots = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nr), *steps = ids_of(PG_GETARG_ARRAYTYPE_P(1), &nsteps);
     Datum *programs = chain_array(PG_GETARG_ARRAYTYPE_P(2), INT4OID, 4, true, TYPALIGN_INT, &np, "programs");
@@ -246,7 +232,6 @@ Datum laplace_chains(PG_FUNCTION_ARGS){
         int at = chain_add(&nodes, &node);
         frontier = frontier ? repalloc(frontier, sizeof(int) * (size_t)(nf + 1)) : palloc(sizeof(int)); frontier[nf++] = at;
     }
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_chains: SPI_connect")));
     for (int32 depth = 0; nf > 0; depth++) {
         CHECK_FOR_INTERRUPTS();
         lp_id *ids = palloc(sizeof(lp_id) * (size_t)nf), *mids = palloc(sizeof(lp_id) * (size_t)(nsteps ? nsteps : 1)); int nm = 0;
@@ -254,9 +239,12 @@ Datum laplace_chains(PG_FUNCTION_ARGS){
         for (int s = 0; s < nsteps; s++) if (DatumGetInt32(depths[s]) == depth) mids[nm++] = steps[s];
         int nn = 0; next = palloc(sizeof(int) * (size_t)Max(nf, 1)); int capnext = Max(nf, 1);
         if (nm > 0) {
-            walk_claims(idarr, ids, nf, -1, PointerGetDatum(id_array_of(get_element_type(idarr), mids, nm)), false, PointerGetDatum(id_array_of(get_element_type(idarr), NULL, 0)));
-            if ((int64)SPI_processed > cap) ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("laplace_chains: paths exceed the admitted frontier; no partial path was returned")));
-            size_t nc; WalkClaim *cl = walk_rows(&nc); SPI_freetuptable(SPI_tuptable);
+            WalkClaimCollect col = { .rows = { 0 }, .seen = 0, .cap = cap, .check_cap = true };
+            lp_pg_claims_each_direct(ids, nf, -1, UINT64_C(1),
+                                     NULL, 0, 3,
+                                     mids, nm, 3, NULL, 0,
+                                     walk_claim_visit, &col);
+            size_t nc = col.rows.n; const WalkClaim *cl = col.rows.v;
             for (size_t j = 0; j < nc; j++) {
                 int e = (int)cl[j].i - 1; if (e < 0 || e >= nf) continue;
                 int from = frontier[e]; ChainNode node = nodes.v[from];
@@ -289,11 +277,10 @@ Datum laplace_chains(PG_FUNCTION_ARGS){
                 }
                 path++; pfree(chain);
             }
-            pfree(cl);
+            lp_vec_free(&col.rows);
         }
         pfree(ids); pfree(mids); pfree(frontier); frontier = next; nf = nn;
     }
-    SPI_finish();
     PG_RETURN_NULL();
 }
 
@@ -313,10 +300,6 @@ static void above_row(const lp_id *id, Datum path, Datum mask, void *context){
         w->found = repalloc_huge(w->found, sizeof(lp_id) * (Size)w->room); w->hop = repalloc_huge(w->hop, sizeof(int32) * (Size)w->room);
     }
     w->found[w->n] = *id; w->hop[w->n] = w->at; w->n++;
-}
-typedef struct { AttrNumber tier; int16 *tiers; } AboveTiers;
-static void above_tier(TupleTableSlot *slot, const PresenceKey *key, void *context){
-    AboveTiers *t = context; bool nl; Datum d = slot_getattr(slot, t->tier, &nl); if (!nl) t->tiers[key->ordinal - 1] = DatumGetInt16(d);
 }
 PG_FUNCTION_INFO_V1(laplace_above);
 Datum laplace_above(PG_FUNCTION_ARGS){
@@ -340,16 +323,8 @@ Datum laplace_above(PG_FUNCTION_ARGS){
             nfront = (size_t)(w.n - before);
             frontier = palloc(sizeof(lp_id) * (nfront ? nfront : 1)); memcpy(frontier, w.found + before, sizeof(lp_id) * nfront);
         }
-        int16 *tiers = palloc(sizeof(int16) * (Size)(w.n ? w.n : 1)); for (int64 i = 0; i < w.n; i++) tiers[i] = -1;
-        if (w.n) {
-            const char *sel[] = { "id", "tier" }, *col; Oid target = lp_pg_relation("entity");
-            Relation ent = lp_pg_read_parent(target, &col, sel, lengthof(sel));
-            AboveTiers t = { get_attnum(target, "tier"), tiers };
-            PresenceKey *keys = palloc_extended((Size)w.n * sizeof(*keys), MCXT_ALLOC_HUGE);
-            for (int64 i = 0; i < w.n; i++) keys[i] = (PresenceKey){ .id = w.found[i], .ordinal = i + 1 };
-            lp_pg_indexed_keys(ent, col, keys, (size_t)w.n, above_tier, &t);
-            pfree(keys); table_close(ent, NoLock);
-        }
+        int16 *tiers = palloc(sizeof(int16) * (Size)(w.n ? w.n : 1));
+        if (w.n) lp_pg_lookup_entity_tiers(w.found, (size_t)w.n, tiers);
         for (int64 i = 0; i < w.n; i++) {
             Datum o[3] = { id_datum(&w.found[i]), Int16GetDatum(tiers[i]), Int32GetDatum(w.hop[i]) }; bool nl[3] = { false, tiers[i] < 0, false };
             set_put(fcinfo, ts, td, o, nl);

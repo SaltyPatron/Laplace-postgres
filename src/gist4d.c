@@ -12,11 +12,25 @@
  * Built sorted (sortsupport): keys in 4D Hilbert order of their centres, so CREATE INDEX writes pages in one pass
  * instead of inserting row by row. */
 #include "postgres.h"
+#include "pg_core.h"
 #include "fmgr.h"
+#include "miscadmin.h"
+#include "access/genam.h"
 #include "access/gist.h"
+#include "access/relscan.h"
+#include "access/skey.h"
 #include "access/stratnum.h"
+#include "access/table.h"
+#include "access/tableam.h"
 #include "utils/sortsupport.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
 #include "geo.h"
 #include "laplace/laplace.h"
@@ -88,7 +102,7 @@ static inline void box_join(Box4 *a, const Box4 *b){
 }
 static inline double box_edges(const Box4 *b){ return ((b->hi[0] - b->lo[0]) + (b->hi[1] - b->lo[1])) + (b->hi[2] - b->lo[2]) + (b->hi[3] - b->lo[3]); }
 /* The query's distance to the box, in lp_distance4's order of operations (header). */
-static inline double box_distance(const Box4 *b, const double q[4]){
+static inline double box4_distance(const Box4 *b, const double q[4]){
     double g[4];
     for (int d = 0; d < 4; d++) g[d] = q[d] < b->lo[d] ? b->lo[d] - q[d] : q[d] > b->hi[d] ? q[d] - b->hi[d] : 0.0;
     return sqrt(((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3]);
@@ -133,7 +147,7 @@ Datum laplace_angular4d_gist_distance(PG_FUNCTION_ARGS){
     if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_angular4d_ops: unknown strategy %u", strategy)));
     double u[4]; direction_of(point_of(PG_GETARG_DATUM(1)), u);
     *recheck = true;
-    PG_RETURN_FLOAT8(angle_of_chord(box_distance((const Box4 *)DatumGetPointer(e->key), u)));
+    PG_RETURN_FLOAT8(angle_of_chord(box4_distance((const Box4 *)DatumGetPointer(e->key), u)));
 }
 
 PG_FUNCTION_INFO_V1(laplace_point4d_gist_consistent);
@@ -228,7 +242,7 @@ Datum laplace_point4d_gist_distance(PG_FUNCTION_ARGS){
     StrategyNumber strategy = (StrategyNumber)PG_GETARG_UINT16(2); bool *recheck = (bool *)PG_GETARG_POINTER(4);
     if (strategy != LAPLACE_KNN) ereport(ERROR, (errmsg("laplace_point4d_ops: unknown strategy %u", strategy)));
     *recheck = true;    /* always evaluate the exact ordering operator on heap leaves */
-    PG_RETURN_FLOAT8(box_distance((const Box4 *)DatumGetPointer(e->key), point_of(PG_GETARG_DATUM(1))));
+    PG_RETURN_FLOAT8(box4_distance((const Box4 *)DatumGetPointer(e->key), point_of(PG_GETARG_DATUM(1))));
 }
 
 /* ---------------------------------------------------------------- laplace_path4d_ops: Fréchet KNN
@@ -369,4 +383,698 @@ Datum laplace_point4d_gist_sortsupport(PG_FUNCTION_ARGS){
     } else
         ssup->comparator = hilbert_cmp;
     PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(laplace_hilbert_ranges);
+Datum laplace_hilbert_ranges(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;
+    Tuplestorestate *output = set_begin(fcinfo, "laplace_hilbert_ranges", &descriptor);
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) PG_RETURN_NULL();
+    int32 cap = PG_ARGISNULL(2) ? 64 : PG_GETARG_INT32(2);
+    if (cap < 1 || cap > 65536)
+        ereport(ERROR, (errmsg("laplace_hilbert_ranges: the budget is 1 to 65536 ranges, not %d", cap)));
+    const double *a = point_of(PG_GETARG_DATUM(0)), *b = point_of(PG_GETARG_DATUM(1));
+    uint32_t lo[4], hi[4];
+    for (int d = 0; d < 4; d++) { lo[d] = lp_hilbert4_axis(a[d]); hi[d] = lp_hilbert4_axis(b[d]); }
+    lp_hrange *r = palloc(sizeof *r * (size_t)cap);
+    size_t n = lp_hilbert4_ranges(lo, hi, r, (size_t)cap);
+    for (size_t i = 0; i < n; i++) {
+        Datum v[2] = {
+            Int64GetDatum((int64)(r[i].lo ^ 0x8000000000000000ull)),
+            Int64GetDatum((int64)(r[i].hi ^ 0x8000000000000000ull))
+        };
+        bool nl[2] = {false, false};
+        set_put(fcinfo, output, descriptor, v, nl);
+    }
+    pfree(r);
+    return (Datum)0;
+}
+
+PG_FUNCTION_INFO_V1(laplace_hilbert_ball_ranges_flat);
+Datum laplace_hilbert_ball_ranges_flat(PG_FUNCTION_ARGS){
+    const double *pt = point_of(PG_GETARG_DATUM(0));
+    double radius = PG_GETARG_FLOAT8(1);
+    int32 cap = (PG_NARGS() > 2 && !PG_ARGISNULL(2)) ? PG_GETARG_INT32(2) : 64;
+    if (cap < 1 || cap > 65536)
+        ereport(ERROR, (errmsg("laplace_hilbert_ball_ranges: the budget is 1 to 65536 ranges, not %d", cap)));
+    if (isnan(radius) || radius < 0.0)
+        ereport(ERROR, (errmsg("laplace_hilbert_ball_ranges: radius must be non-negative")));
+    lp_coord c;
+    lp_coord_trunc(pt, &c);
+    lp_hrange *r = palloc(sizeof *r * (size_t)cap);
+    size_t n = lp_hilbert4_ball_ranges(&c, radius, r, (size_t)cap);
+    Datum *v = palloc(sizeof *v * (2 * n + 1));
+    for (size_t i = 0; i < n; i++) {
+        v[2 * i] = Int64GetDatum((int64)(r[i].lo ^ 0x8000000000000000ull));
+        v[2 * i + 1] = Int64GetDatum((int64)(r[i].hi ^ 0x8000000000000000ull));
+    }
+    ArrayType *arr = construct_array_builtin(v, (int)(2 * n), INT8OID);
+    pfree(v);
+    pfree(r);
+    PG_RETURN_ARRAYTYPE_P(arr);
+}
+
+PG_FUNCTION_INFO_V1(laplace_hilbert_ball_ranges);
+Datum laplace_hilbert_ball_ranges(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;
+    Tuplestorestate *output = set_begin(fcinfo, "laplace_hilbert_ball_ranges", &descriptor);
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) PG_RETURN_NULL();
+    const double *pt = point_of(PG_GETARG_DATUM(0));
+    double radius = PG_GETARG_FLOAT8(1);
+    int32 cap = (PG_NARGS() > 2 && !PG_ARGISNULL(2)) ? PG_GETARG_INT32(2) : 64;
+    if (cap < 1 || cap > 65536)
+        ereport(ERROR, (errmsg("laplace_hilbert_ball_ranges: the budget is 1 to 65536 ranges, not %d", cap)));
+    if (isnan(radius) || radius < 0.0)
+        ereport(ERROR, (errmsg("laplace_hilbert_ball_ranges: radius must be non-negative")));
+    lp_coord c;
+    lp_coord_trunc(pt, &c);
+    lp_hrange *r = palloc(sizeof *r * (size_t)cap);
+    size_t n = lp_hilbert4_ball_ranges(&c, radius, r, (size_t)cap);
+    for (size_t i = 0; i < n; i++) {
+        Datum v[2] = {
+            Int64GetDatum((int64)(r[i].lo ^ 0x8000000000000000ull)),
+            Int64GetDatum((int64)(r[i].hi ^ 0x8000000000000000ull))
+        };
+        bool nl[2] = {false, false};
+        set_put(fcinfo, output, descriptor, v, nl);
+    }
+    pfree(r);
+    return (Datum)0;
+}
+
+static bytea *make_point4d_geom(const double p[4]){
+    bytea *g = palloc0(48);
+    SET_VARSIZE(g, 48);
+    uint8 *b = (uint8 *)g;
+    b[7] = G2_VERSION | G2_Z | G2_M;
+    uint32 type = 1, n = 1;
+    memcpy(b + 8, &type, 4);
+    memcpy(b + 12, &n, 4);
+    memcpy(b + 16, p, 32);
+    return g;
+}
+
+typedef struct { lp_id id; int16 tier; double p[4]; double distance; } KnnCand;
+typedef struct {
+    Relation part, idx;
+    TupleTableSlot *slot;
+    IndexScanDesc scan;
+    AttrNumber a_id, a_tier, a_coord;
+    double bound;
+    bool active;
+} KnnPartScan;
+
+static int knn_cand_better(const KnnCand *a, const KnnCand *b){
+    if (isnan(a->distance) != isnan(b->distance)) return isnan(a->distance) ? 1 : -1;
+    if (a->distance < b->distance) return -1;
+    if (a->distance > b->distance) return 1;
+    return memcmp(a->id.b, b->id.b, sizeof(lp_id));
+}
+
+static void knn_insert_topk(KnnCand *top, int *count, int k, const KnnCand *cand){
+    if (*count < k) {
+        int i = (*count)++;
+        while (i > 0 && knn_cand_better(cand, &top[i - 1]) < 0) {
+            top[i] = top[i - 1];
+            i--;
+        }
+        top[i] = *cand;
+    } else if (knn_cand_better(cand, &top[k - 1]) < 0) {
+        int i = k - 1;
+        while (i > 0 && knn_cand_better(cand, &top[i - 1]) < 0) {
+            top[i] = top[i - 1];
+            i--;
+        }
+        top[i] = *cand;
+    }
+}
+
+static void knn_advance_partition(KnnPartScan *sc, const double query[4], const double uquery[4],
+                                  bool angular, int16 min_tier, bool has_max_tier, int16 max_tier,
+                                  const lp_id *exclude_id, KnnCand *top, int *count, int k){
+    while (index_getnext_slot(sc->scan, ForwardScanDirection, sc->slot)) {
+        CHECK_FOR_INTERRUPTS();
+        bool ni = false, nt = false, nc = false;
+        Datum di = slot_getattr(sc->slot, sc->a_id, &ni);
+        Datum dt = slot_getattr(sc->slot, sc->a_tier, &nt);
+        Datum dc = slot_getattr(sc->slot, sc->a_coord, &nc);
+        if (ni || nt || nc)
+            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace_knn4d: null entity geometry metadata")));
+        int16 tier = DatumGetInt16(dt);
+        double bound = (!sc->scan->xs_orderbynulls || !sc->scan->xs_orderbynulls[0])
+            ? DatumGetFloat8(sc->scan->xs_orderbyvals[0]) : INFINITY;
+        const double *cp = point_of(dc);
+        double dist;
+        if (angular) {
+            double uc[4];
+            direction_of(cp, uc);
+            dist = angle_of_chord(lp_distance4(uc, uquery));
+        } else {
+            dist = lp_distance4(query, cp);
+        }
+        const uint8 *id_bytes = (const uint8 *)DatumGetPointer(di);
+        bool tier_ok = tier >= min_tier && (!has_max_tier || tier <= max_tier);
+        bool id_ok = !exclude_id || memcmp(id_bytes, exclude_id->b, sizeof(lp_id)) != 0;
+        if (tier_ok && id_ok && !isnan(dist)) {
+            KnnCand cand = { .tier = tier, .distance = dist };
+            memcpy(cand.id.b, id_bytes, sizeof(lp_id));
+            memcpy(cand.p, cp, sizeof(cand.p));
+            knn_insert_topk(top, count, k, &cand);
+        }
+        ExecClearTuple(sc->slot);
+        sc->bound = isnan(bound) ? dist : bound;
+        if (isnan(sc->bound)) {
+            sc->active = false;
+            return;
+        }
+        /* Stop once the lower bound exceeds the current k-th best distance;
+         * otherwise keep pulling in best-first GiST order if filtered out. */
+        if (*count >= k && !isnan(sc->bound) && sc->bound > top[k - 1].distance) {
+            sc->active = false;
+            return;
+        }
+        sc->active = true;
+        return;
+    }
+    sc->active = false;
+}
+
+int lp_pg_knn4d(const double query[4], int k, bool angular, int16 min_tier, bool has_max_tier, int16 max_tier,
+                const lp_id *exclude_id, PgKnnHit *out, MemoryContext result_ctx){
+    if (k <= 0 || (has_max_tier && min_tier > max_tier)) return 0;
+    Oid target = lp_pg_relation("entity");
+    const char *selected[] = {"id", "tier", "coord"};
+    const char *column;
+    Relation parent = lp_pg_read_parent(target, &column, selected, 3);
+    Oid geom_oid = get_atttype(target, get_attnum(target, "coord"));
+    table_close(parent, NoLock);
+
+    const Oid *parts = NULL, *aux = NULL, *aux2 = NULL;
+    const int16 *min_tiers = NULL, *max_tiers = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, &aux, &aux2);
+    (void)lp_pg_canonical_tier_bounds("entity", &min_tiers, &max_tiers);
+    const Oid *gists = angular ? aux2 : aux;
+
+    bytea *qgeom = make_point4d_geom(query);
+    Datum qdatum = PointerGetDatum(qgeom);
+    double uquery[4];
+    if (angular) direction_of(query, uquery);
+    if (angular && isnan(uquery[0])) { pfree(qgeom); return 0; }
+
+    KnnPartScan *scans = palloc0((Size)nparts * sizeof(*scans));
+    KnnCand *top = palloc((Size)k * sizeof(*top));
+    int found = 0;
+    Snapshot snap = GetActiveSnapshot();
+    int active_count = 0;
+
+    PG_TRY(); {
+        for (int p = 0; p < nparts; p++) {
+            KnnPartScan *sc = &scans[p];
+            if (min_tiers && max_tiers &&
+                (max_tiers[p] < min_tier || (has_max_tier && min_tiers[p] > max_tier)))
+                continue;
+            if (!OidIsValid(gists[p]))
+                ereport(ERROR, (errmsg("laplace_knn4d: entity partition missing canonical %s GiST index",
+                    angular ? "laplace_angular4d_ops" : "laplace_point4d_ops")));
+            sc->part = table_open(parts[p], AccessShareLock);
+            sc->idx = index_open(gists[p], AccessShareLock);
+            sc->a_id = get_attnum(parts[p], "id");
+            sc->a_tier = get_attnum(parts[p], "tier");
+            sc->a_coord = get_attnum(parts[p], "coord");
+            Oid dist_op = get_opfamily_member(sc->idx->rd_opfamily[0], geom_oid, geom_oid, LAPLACE_KNN);
+            if (!OidIsValid(dist_op))
+                ereport(ERROR, (errmsg("laplace_knn4d: GiST opfamily missing distance operator")));
+            ScanKeyData okey;
+            ScanKeyEntryInitialize(&okey, SK_ORDER_BY, 1, LAPLACE_KNN, geom_oid, InvalidOid,
+                get_opcode(dist_op), qdatum);
+            sc->slot = table_slot_create(sc->part, NULL);
+            sc->scan = index_beginscan(sc->part, sc->idx, snap, NULL, 0, 1);
+            index_rescan(sc->scan, NULL, 0, &okey, 1);
+            knn_advance_partition(sc, query, uquery, angular, min_tier, has_max_tier, max_tier, exclude_id, top, &found, k);
+            if (sc->active) active_count++;
+        }
+
+        while (active_count > 0) {
+            CHECK_FOR_INTERRUPTS();
+            int best_p = -1;
+            for (int p = 0; p < nparts; p++) {
+                if (!scans[p].active) continue;
+                if (best_p < 0 || (!isnan(scans[p].bound) && (isnan(scans[best_p].bound) || scans[p].bound < scans[best_p].bound)))
+                    best_p = p;
+            }
+            if (best_p < 0) break;
+            if (found >= k && (isnan(scans[best_p].bound) || scans[best_p].bound > top[k - 1].distance))
+                break;
+            knn_advance_partition(&scans[best_p], query, uquery, angular, min_tier, has_max_tier, max_tier, exclude_id, top, &found, k);
+            if (!scans[best_p].active) active_count--;
+        }
+    } PG_FINALLY(); {
+        for (int p = 0; p < nparts; p++) {
+            if (scans[p].scan) index_endscan(scans[p].scan);
+            if (scans[p].slot) ExecDropSingleTupleTableSlot(scans[p].slot);
+            if (scans[p].idx) index_close(scans[p].idx, NoLock);
+            if (scans[p].part) table_close(scans[p].part, NoLock);
+        }
+        pfree(scans);
+        pfree(qgeom);
+    } PG_END_TRY();
+
+    MemoryContext old = MemoryContextSwitchTo(result_ctx ? result_ctx : CurrentMemoryContext);
+    for (int i = 0; i < found; i++) {
+        out[i].id = top[i].id;
+        out[i].tier = top[i].tier;
+        out[i].coord = PointerGetDatum(make_point4d_geom(top[i].p));
+        out[i].distance = top[i].distance;
+    }
+    MemoryContextSwitchTo(old);
+    pfree(top);
+    return found;
+}
+
+PG_FUNCTION_INFO_V1(laplace_knn4d);
+Datum laplace_knn4d(PG_FUNCTION_ARGS){
+    TupleDesc descriptor;
+    Tuplestorestate *output = set_begin(fcinfo, "laplace_knn4d", &descriptor);
+    if (PG_ARGISNULL(0)) return (Datum)0;
+    const double *q = point_of(PG_GETARG_DATUM(0));
+    int32 k = PG_ARGISNULL(1) ? 16 : PG_GETARG_INT32(1);
+    bool angular = PG_ARGISNULL(2) ? false : PG_GETARG_BOOL(2);
+    int16 min_tier = PG_ARGISNULL(3) ? 0 : PG_GETARG_INT16(3);
+    bool has_max_tier = (PG_NARGS() > 4 && !PG_ARGISNULL(4));
+    int16 max_tier = has_max_tier ? PG_GETARG_INT16(4) : 0;
+    lp_id excl;
+    const lp_id *exclude_id = NULL;
+    if (PG_NARGS() > 5 && !PG_ARGISNULL(5)) {
+        memcpy(excl.b, PG_GETARG_POINTER(5), sizeof(lp_id));
+        exclude_id = &excl;
+    }
+    if (k < 0) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_knn4d: k must be non-negative")));
+    if (k == 0 || (has_max_tier && min_tier > max_tier)) return (Datum)0;
+    PgKnnHit *hits = palloc((Size)k * sizeof(*hits));
+    int found = lp_pg_knn4d(q, k, angular, min_tier, has_max_tier, max_tier, exclude_id, hits, CurrentMemoryContext);
+    for (int i = 0; i < found; i++) {
+        Datum v[5] = {
+            Int64GetDatum((int64)i + 1),
+            id_datum(&hits[i].id),
+            Int16GetDatum(hits[i].tier),
+            hits[i].coord,
+            Float8GetDatum(hits[i].distance)
+        };
+        bool nl[5] = {false, false, false, false, false};
+        set_put(fcinfo, output, descriptor, v, nl);
+        pfree(DatumGetPointer(v[1]));
+        pfree(DatumGetPointer(v[3]));
+    }
+    pfree(hits);
+    return (Datum)0;
+}
+
+/* ---------------------------------------------------------------- Direct-AM Hilbert B-tree kernels */
+typedef struct {
+    lp_id id;
+    int64 hilbert;
+} HilbertNeighbor;
+
+static Oid find_btree_on(Relation part, AttrNumber col0, int min_keys, AttrNumber col1)
+{
+    List *idxs = RelationGetIndexList(part);
+    ListCell *lc;
+    Oid found = InvalidOid;
+    foreach(lc, idxs) {
+        Oid ioid = lfirst_oid(lc);
+        Relation idx = index_open(ioid, AccessShareLock);
+        if (idx->rd_rel->relam == BTREE_AM_OID && idx->rd_index &&
+            idx->rd_index->indisvalid && idx->rd_index->indisready && idx->rd_index->indislive &&
+            idx->rd_index->indnkeyatts >= min_keys &&
+            idx->rd_index->indkey.values[0] == col0 &&
+            (min_keys < 2 || idx->rd_index->indkey.values[1] == col1)) {
+            found = ioid;
+            index_close(idx, NoLock);
+            break;
+        }
+        index_close(idx, NoLock);
+    }
+    list_free(idxs);
+    return found;
+}
+
+static int cmp_hilb_asc(const void *pa, const void *pb)
+{
+    const HilbertNeighbor *a = pa, *b = pb;
+    if (a->hilbert != b->hilbert) return a->hilbert < b->hilbert ? -1 : 1;
+    return memcmp(a->id.b, b->id.b, sizeof(lp_id));
+}
+
+static int cmp_hilb_desc(const void *pa, const void *pb)
+{
+    const HilbertNeighbor *a = pa, *b = pb;
+    if (a->hilbert != b->hilbert) return a->hilbert > b->hilbert ? -1 : 1;
+    return -memcmp(a->id.b, b->id.b, sizeof(lp_id));
+}
+
+static void insert_hilb_topk(HilbertNeighbor *buf, int *cnt, int cap, const HilbertNeighbor *item, bool desc)
+{
+    if (cap <= 0) return;
+    if (*cnt < cap) {
+        int i = (*cnt)++;
+        while (i > 0 && (desc ? cmp_hilb_desc(item, &buf[i - 1]) : cmp_hilb_asc(item, &buf[i - 1])) < 0) {
+            buf[i] = buf[i - 1];
+            i--;
+        }
+        buf[i] = *item;
+    } else if ((desc ? cmp_hilb_desc(item, &buf[cap - 1]) : cmp_hilb_asc(item, &buf[cap - 1])) < 0) {
+        int i = cap - 1;
+        while (i > 0 && (desc ? cmp_hilb_desc(item, &buf[i - 1]) : cmp_hilb_asc(item, &buf[i - 1])) < 0) {
+            buf[i] = buf[i - 1];
+            i--;
+        }
+        buf[i] = *item;
+    }
+}
+
+/* Direct-AM 2-sided B-tree seek on (tier, hilbert, id) matching geometry.prompt.hilbert tie semantics. */
+PG_FUNCTION_INFO_V1(laplace_hilbert_neighbors);
+Datum laplace_hilbert_neighbors(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_hilbert_neighbors", &td);
+    if (PG_ARGISNULL(0)) return (Datum)0;
+    Geo g = geo_of(PG_GETARG_DATUM(0));
+    if (g.type != 1 || g.p.n != 1) ereport(ERROR, (errmsg("laplace_hilbert_neighbors: expected a POINT ZM")));
+    lp_coord anchor_c;
+    lp_coord_trunc(xyzm(&g), &anchor_c);
+    int64 anchor_key = (int64)lp_hilbert_key(lp_hilbert4(&anchor_c));
+
+    bool has_excl = (PG_NARGS() > 1 && !PG_ARGISNULL(1));
+    lp_id excl = {0};
+    if (has_excl) memcpy(excl.b, PG_GETARG_POINTER(1), sizeof(lp_id));
+    int32 k = (PG_NARGS() > 2 && !PG_ARGISNULL(2)) ? PG_GETARG_INT32(2) : 16;
+    int16 tier = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? PG_GETARG_INT16(3) : 0;
+    if (k <= 0) return (Datum)0;
+    if (k > 65536) k = 65536;
+
+    Oid target = lp_pg_relation("entity");
+    const char *cols[] = { "id", "tier", "hilbert" }, *col = NULL;
+    Relation parent = lp_pg_read_parent(target, &col, cols, 3);
+    table_close(parent, NoLock);
+
+    const Oid *parts = NULL;
+    const int16 *min_tiers = NULL, *max_tiers = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    (void)lp_pg_canonical_tier_bounds("entity", &min_tiers, &max_tiers);
+    Snapshot snap = GetActiveSnapshot();
+
+    HilbertNeighbor *upper = palloc((Size)k * sizeof(*upper));
+    HilbertNeighbor *lower = palloc((Size)(k + 1) * sizeof(*lower));
+    int n_upper = 0, n_lower = 0;
+
+    for (int p = 0; p < nparts; p++) {
+        CHECK_FOR_INTERRUPTS();
+        if (min_tiers && max_tiers && (tier < min_tiers[p] || tier > max_tiers[p]))
+            continue;
+        Relation part = table_open(parts[p], AccessShareLock);
+        AttrNumber a_id = get_attnum(parts[p], "id");
+        AttrNumber a_tier = get_attnum(parts[p], "tier");
+        AttrNumber a_hilb = get_attnum(parts[p], "hilbert");
+        Oid idx_oid = find_btree_on(part, a_tier, 2, a_hilb);
+        if (!OidIsValid(idx_oid))
+            ereport(ERROR, (errmsg("laplace_hilbert_neighbors: entity partition missing (tier, hilbert, id) index")));
+        Relation idx = index_open(idx_oid, AccessShareLock);
+        TupleTableSlot *slot = table_slot_create(part, NULL);
+
+        /* Upper seek: tier = tier AND hilbert >= anchor_key */
+        ScanKeyData sk[2];
+        ScanKeyEntryInitialize(&sk[0], 0, 1, BTEqualStrategyNumber, INT2OID,
+                               idx->rd_indcollation[0], F_INT2EQ, Int16GetDatum(tier));
+        ScanKeyEntryInitialize(&sk[1], 0, 2, BTGreaterEqualStrategyNumber, INT8OID,
+                               idx->rd_indcollation[1], F_INT8GE, Int64GetDatum(anchor_key));
+        IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 2, 0);
+        index_rescan(scan, sk, 2, NULL, 0);
+        while (index_getnext_slot(scan, ForwardScanDirection, slot)) {
+            CHECK_FOR_INTERRUPTS();
+            bool ni = true, nh = true;
+            Datum di = slot_getattr(slot, a_id, &ni);
+            Datum dh = slot_getattr(slot, a_hilb, &nh);
+            if (!ni && !nh) {
+                HilbertNeighbor cand = { .hilbert = DatumGetInt64(dh) };
+                memcpy(cand.id.b, DatumGetPointer(di), sizeof(lp_id));
+                if (has_excl && lp_id_eq(&cand.id, &excl)) { ExecClearTuple(slot); continue; }
+                if (n_upper >= k && cmp_hilb_asc(&cand, &upper[k - 1]) >= 0) { ExecClearTuple(slot); break; }
+                insert_hilb_topk(upper, &n_upper, k, &cand, false);
+            }
+            ExecClearTuple(slot);
+        }
+
+        /* Lower seek: tier = tier AND hilbert < anchor_key (keep k + 1 to detect tie boundary) */
+        ScanKeyEntryInitialize(&sk[1], 0, 2, BTLessStrategyNumber, INT8OID,
+                               idx->rd_indcollation[1], F_INT8LT, Int64GetDatum(anchor_key));
+        index_rescan(scan, sk, 2, NULL, 0);
+        while (index_getnext_slot(scan, BackwardScanDirection, slot)) {
+            CHECK_FOR_INTERRUPTS();
+            bool ni = true, nh = true;
+            Datum di = slot_getattr(slot, a_id, &ni);
+            Datum dh = slot_getattr(slot, a_hilb, &nh);
+            if (!ni && !nh) {
+                HilbertNeighbor cand = { .hilbert = DatumGetInt64(dh) };
+                memcpy(cand.id.b, DatumGetPointer(di), sizeof(lp_id));
+                if (has_excl && lp_id_eq(&cand.id, &excl)) { ExecClearTuple(slot); continue; }
+                if (n_lower >= k + 1 && cmp_hilb_desc(&cand, &lower[k]) >= 0) { ExecClearTuple(slot); break; }
+                insert_hilb_topk(lower, &n_lower, k + 1, &cand, true);
+            }
+            ExecClearTuple(slot);
+        }
+
+        index_endscan(scan);
+        ExecDropSingleTupleTableSlot(slot);
+        index_close(idx, NoLock);
+        table_close(part, NoLock);
+    }
+
+    bool has_tie = (n_lower == k + 1 && lower[k - 1].hilbert == lower[k].hilbert);
+    int64 tie_key = has_tie ? lower[k - 1].hilbert : 0;
+    HilbertNeighbor *tie_rows = has_tie ? palloc((Size)k * sizeof(*tie_rows)) : NULL;
+    int n_tie = 0;
+
+    if (has_tie) {
+        for (int p = 0; p < nparts; p++) {
+            CHECK_FOR_INTERRUPTS();
+            if (min_tiers && max_tiers && (tier < min_tiers[p] || tier > max_tiers[p]))
+                continue;
+            Relation part = table_open(parts[p], AccessShareLock);
+            AttrNumber a_id = get_attnum(parts[p], "id");
+            AttrNumber a_tier = get_attnum(parts[p], "tier");
+            AttrNumber a_hilb = get_attnum(parts[p], "hilbert");
+            Oid idx_oid = find_btree_on(part, a_tier, 2, a_hilb);
+            Relation idx = index_open(idx_oid, AccessShareLock);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+
+            ScanKeyData sk[2];
+            ScanKeyEntryInitialize(&sk[0], 0, 1, BTEqualStrategyNumber, INT2OID,
+                                   idx->rd_indcollation[0], F_INT2EQ, Int16GetDatum(tier));
+            ScanKeyEntryInitialize(&sk[1], 0, 2, BTEqualStrategyNumber, INT8OID,
+                                   idx->rd_indcollation[1], F_INT8EQ, Int64GetDatum(tie_key));
+            IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 2, 0);
+            index_rescan(scan, sk, 2, NULL, 0);
+            while (index_getnext_slot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool ni = true, nh = true;
+                Datum di = slot_getattr(slot, a_id, &ni);
+                Datum dh = slot_getattr(slot, a_hilb, &nh);
+                if (!ni && !nh) {
+                    HilbertNeighbor cand = { .hilbert = DatumGetInt64(dh) };
+                    memcpy(cand.id.b, DatumGetPointer(di), sizeof(lp_id));
+                    if (has_excl && lp_id_eq(&cand.id, &excl)) { ExecClearTuple(slot); continue; }
+                    if (n_tie >= k && cmp_hilb_asc(&cand, &tie_rows[k - 1]) >= 0) { ExecClearTuple(slot); break; }
+                    insert_hilb_topk(tie_rows, &n_tie, k, &cand, false);
+                }
+                ExecClearTuple(slot);
+            }
+            index_endscan(scan);
+            ExecDropSingleTupleTableSlot(slot);
+            index_close(idx, NoLock);
+            table_close(part, NoLock);
+        }
+    }
+
+    for (int i = 0; i < n_upper; i++) {
+        Datum v[3] = { id_datum(&upper[i].id), Int64GetDatum(upper[i].hilbert), Int64GetDatum(anchor_key) };
+        bool nl[3] = { false, false, false };
+        set_put(fcinfo, ts, td, v, nl);
+        pfree(DatumGetPointer(v[0]));
+    }
+    int lower_keep = Min(n_lower, k);
+    for (int i = 0; i < lower_keep; i++) {
+        if (has_tie && lower[i].hilbert == tie_key) continue;
+        Datum v[3] = { id_datum(&lower[i].id), Int64GetDatum(lower[i].hilbert), Int64GetDatum(anchor_key) };
+        bool nl[3] = { false, false, false };
+        set_put(fcinfo, ts, td, v, nl);
+        pfree(DatumGetPointer(v[0]));
+    }
+    for (int i = 0; i < n_tie; i++) {
+        Datum v[3] = { id_datum(&tie_rows[i].id), Int64GetDatum(tie_rows[i].hilbert), Int64GetDatum(anchor_key) };
+        bool nl[3] = { false, false, false };
+        set_put(fcinfo, ts, td, v, nl);
+        pfree(DatumGetPointer(v[0]));
+    }
+
+    if (tie_rows) pfree(tie_rows);
+    pfree(upper);
+    pfree(lower);
+    return (Datum)0;
+}
+
+typedef struct {
+    lp_id id;
+    double c[4];
+    int64 hilbert;
+    int32 path_len;
+    bool found;
+} ConstellationPick;
+
+static void constellation_path_len(const lp_id *id, Datum path, Datum mask, void *context)
+{
+    (void)mask;
+    lp_idmap *lens = context;
+    Geo g = geo_of(path);
+    int32 len = (int32)Min((size_t)PG_INT32_MAX, lp_path_len(g.p));
+    *(int32 *)lp_idmap_get(lens, id, NULL) = len;
+}
+
+/* Direct-AM equi-width Hilbert bucket constellation sampler replacing 1024-LATERAL SQL. */
+PG_FUNCTION_INFO_V1(laplace_constellation_sample);
+Datum laplace_constellation_sample(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_constellation_sample", &td);
+    int32 n = PG_ARGISNULL(0) ? 64 : PG_GETARG_INT32(0);
+    if (n < 0) n = 0;
+    if (n > 1024) n = 1024;
+    if (n == 0) return (Datum)0;
+
+    Oid target = lp_pg_relation("entity");
+    const char *cols[] = { "id", "coord", "hilbert" }, *col = NULL;
+    Relation parent = lp_pg_read_parent(target, &col, cols, 3);
+    table_close(parent, NoLock);
+
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    Snapshot snap = GetActiveSnapshot();
+
+    typedef struct {
+        Relation part, idx;
+        TupleTableSlot *slot;
+        IndexScanDesc scan;
+        AttrNumber a_id, a_coord, a_hilb;
+    } HilbPart;
+    HilbPart *hp = palloc0((Size)nparts * sizeof(*hp));
+    ConstellationPick *picks = palloc0((Size)n * sizeof(*picks));
+    lp_idmap *seen = lp_idmap_new();
+    lp_idmap *lens = lp_idmap_sized(sizeof(int32));
+    lp_vec(lp_id) distinct_ids = {0};
+
+    PG_TRY();
+    {
+        for (int p = 0; p < nparts; p++) {
+            hp[p].part = table_open(parts[p], AccessShareLock);
+            hp[p].a_id = get_attnum(parts[p], "id");
+            hp[p].a_coord = get_attnum(parts[p], "coord");
+            hp[p].a_hilb = get_attnum(parts[p], "hilbert");
+            Oid idx_oid = find_btree_on(hp[p].part, hp[p].a_hilb, 1, InvalidAttrNumber);
+            if (!OidIsValid(idx_oid))
+                ereport(ERROR, (errmsg("laplace_constellation_sample: entity partition missing (hilbert) index")));
+            hp[p].idx = index_open(idx_oid, AccessShareLock);
+            hp[p].slot = table_slot_create(hp[p].part, NULL);
+            hp[p].scan = index_beginscan(hp[p].part, hp[p].idx, snap, NULL, 1, 0);
+        }
+
+        for (int32 i = 0; i < n; i++) {
+            CHECK_FOR_INTERRUPTS();
+            int32 lo16 = (int32)(((int64)i * 65536) / n);
+            int32 hi16 = (int32)(((int64)(i + 1) * 65536) / n);
+            int64 lo_key = ((int64)(lo16 - 32768)) << 48;
+            bool has_hi = (hi16 < 65536);
+            int64 hi_key = has_hi ? (((int64)(hi16 - 32768)) << 48) : 0;
+
+            ConstellationPick best = { .found = false };
+            for (int p = 0; p < nparts; p++) {
+                ScanKeyData sk;
+                ScanKeyEntryInitialize(&sk, 0, 1, BTGreaterEqualStrategyNumber, INT8OID,
+                                       hp[p].idx->rd_indcollation[0], F_INT8GE, Int64GetDatum(lo_key));
+                index_rescan(hp[p].scan, &sk, 1, NULL, 0);
+                while (index_getnext_slot(hp[p].scan, ForwardScanDirection, hp[p].slot)) {
+                    bool ni = true, nc = true, nh = true;
+                    Datum di = slot_getattr(hp[p].slot, hp[p].a_id, &ni);
+                    Datum dc = slot_getattr(hp[p].slot, hp[p].a_coord, &nc);
+                    Datum dh = slot_getattr(hp[p].slot, hp[p].a_hilb, &nh);
+                    if (ni || nc || nh) { ExecClearTuple(hp[p].slot); continue; }
+                    int64 hval = DatumGetInt64(dh);
+                    if (has_hi && hval >= hi_key) { ExecClearTuple(hp[p].slot); break; }
+                    if (best.found && hval > best.hilbert) { ExecClearTuple(hp[p].slot); break; }
+                    lp_id cid;
+                    memcpy(cid.b, DatumGetPointer(di), sizeof(lp_id));
+                    if (!best.found || hval < best.hilbert || memcmp(cid.b, best.id.b, sizeof(lp_id)) < 0) {
+                        const double *pt = point_of(dc);
+                        best.id = cid;
+                        memcpy(best.c, pt, sizeof(best.c));
+                        best.hilbert = hval;
+                        best.found = true;
+                    }
+                    ExecClearTuple(hp[p].slot);
+                    break;
+                }
+            }
+
+            if (best.found) {
+                bool fresh = false;
+                lp_idmap_put(seen, &best.id, &fresh);
+                if (fresh) {
+                    picks[i] = best;
+                    lp_push(&distinct_ids, best.id);
+                }
+            }
+        }
+
+        if (distinct_ids.n > 0)
+            lp_pg_lookup_paths(distinct_ids.v, distinct_ids.n, false, constellation_path_len, lens);
+
+        int32 ord = 0;
+        for (int32 i = 0; i < n; i++) {
+            if (!picks[i].found) continue;
+            ord++;
+            const ConstellationPick *pk = &picks[i];
+            int32 *pl = lp_idmap_lookup(lens, &pk->id);
+            int32 plen = pl ? *pl : 0;
+            double r = sqrt(((pk->c[0] * pk->c[0] + pk->c[1] * pk->c[1]) + pk->c[2] * pk->c[2]) + pk->c[3] * pk->c[3]);
+            Datum v[9] = {
+                Int32GetDatum(ord),
+                id_datum(&pk->id),
+                Float8GetDatum(pk->c[0]),
+                Float8GetDatum(pk->c[1]),
+                Float8GetDatum(pk->c[2]),
+                Float8GetDatum(pk->c[3]),
+                Float8GetDatum(r),
+                Int32GetDatum(plen),
+                Int64GetDatum(pk->hilbert)
+            };
+            bool nl[9] = { false };
+            set_put(fcinfo, ts, td, v, nl);
+            pfree(DatumGetPointer(v[1]));
+        }
+    }
+    PG_FINALLY();
+    {
+        for (int p = 0; p < nparts; p++) {
+            if (hp[p].scan) index_endscan(hp[p].scan);
+            if (hp[p].slot) ExecDropSingleTupleTableSlot(hp[p].slot);
+            if (hp[p].idx) index_close(hp[p].idx, NoLock);
+            if (hp[p].part) table_close(hp[p].part, NoLock);
+        }
+        pfree(hp);
+        pfree(picks);
+        lp_vec_free(&distinct_ids);
+        lp_idmap_free(seen);
+        lp_idmap_free(lens);
+    }
+    PG_END_TRY();
+    return (Datum)0;
 }

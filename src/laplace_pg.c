@@ -36,6 +36,28 @@
 #include "laplace/consensus.h"
 #include "pg_core.h"
 #include "geo.h"
+#include "access/genam.h"
+#include "access/skey.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_extension.h"
+#include "catalog/pg_index.h"
+#include "commands/dbcommands.h"
+#include "miscadmin.h"
+#include "nodes/supportnodes.h"
+#include "storage/bufmgr.h"
+#include "storage/lockdefs.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/jsonb.h"
+#include "utils/numeric.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #define LP_STRING_(value) #value
 #define LP_STRING(value) LP_STRING_(value)
@@ -212,17 +234,72 @@ lp_id *lp_pg_path_keys(bytea *ewkb, int *n){
         ereport(ERROR, (errmsg("laplace: cannot read geometry vertices")));
     *n = (int)count; return keys;
 }
+Datum lp_pg_geom_from_ewkb(const uint8 *ewkb, size_t len, int32 srid){
+    static Oid importer, setsrid;
+    static uint64 generation;
+    uint64 current = lp_pg_binding_generation();
+    if (!OidIsValid(importer) || generation != current) {
+        Oid schema = get_extension_schema(get_extension_oid("postgis", false));
+        char *nsp = get_namespace_name(schema);
+        Oid bytea_type = BYTEAOID, int4_type = INT4OID;
+        Oid geom_type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("geometry"), ObjectIdGetDatum(schema));
+        importer = LookupFuncName(list_make2(makeString(nsp), makeString("st_geomfromewkb")), 1, &bytea_type, false);
+        Oid set_args[2] = {geom_type, int4_type};
+        setsrid = LookupFuncName(list_make2(makeString(nsp), makeString("st_setsrid")), 2, set_args, false);
+        generation = current;
+    }
+    bytea *b = bytes_datum(ewkb, len);
+    Datum g = OidFunctionCall1(importer, PointerGetDatum(b));
+    pfree(b);
+    if (srid != 0) g = OidFunctionCall2(setsrid, g, Int32GetDatum(srid));
+    return g;
+}
+static int32 geom_srid_of(Datum geometry){
+    static Oid getter;
+    static uint64 generation;
+    uint64 current = lp_pg_binding_generation();
+    if (!OidIsValid(getter) || generation != current) {
+        Oid schema = get_extension_schema(get_extension_oid("postgis", false));
+        Oid geom_type = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("geometry"), ObjectIdGetDatum(schema));
+        getter = LookupFuncName(list_make2(makeString(get_namespace_name(schema)), makeString("st_srid")), 1, &geom_type, false);
+        generation = current;
+    }
+    return DatumGetInt32(OidFunctionCall1(getter, geometry));
+}
+static bytea *enrich_path_ewkb(Datum rec_geom, Datum inc_geom){
+    bytea *a = lp_pg_path_ewkb(rec_geom), *b = lp_pg_path_ewkb(inc_geom);
+    lp_path recorded = lp_path_of((const uint8 *)VARDATA_ANY(a), VARSIZE_ANY_EXHDR(a));
+    lp_path incoming = lp_path_of((const uint8 *)VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+    size_t size = lp_ewkb_enrich_path(recorded, incoming, NULL, 0);
+    if (!size) { pfree(a); pfree(b); return NULL; }
+    if (size > MaxAllocSize - VARHDRSZ)
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("laplace: enriched path exceeds the geometry allocation limit")));
+    bytea *out = palloc(VARHDRSZ + size);
+    SET_VARSIZE(out, VARHDRSZ + size);
+    lp_ewkb_enrich_path(recorded, incoming, (uint8 *)VARDATA(out), size);
+    pfree(a); pfree(b);
+    return out;
+}
+Datum lp_pg_path_enrich_datum(Datum recorded, Datum incoming){
+    if (geom_srid_of(recorded) != geom_srid_of(incoming)) return (Datum)0;
+    bytea *ewkb = enrich_path_ewkb(recorded, incoming);
+    if (!ewkb) return (Datum)0;
+    Datum out = lp_pg_geom_from_ewkb((const uint8 *)VARDATA(ewkb), VARSIZE_ANY_EXHDR(ewkb), geom_srid_of(recorded));
+    pfree(ewkb);
+    return out;
+}
 PG_FUNCTION_INFO_V1(laplace_path_enrich_ewkb);
 Datum laplace_path_enrich_ewkb(PG_FUNCTION_ARGS){
-    bytea *a=lp_pg_path_ewkb(PG_GETARG_DATUM(0)), *b=lp_pg_path_ewkb(PG_GETARG_DATUM(1));
-    lp_path recorded=lp_path_of((const uint8 *)VARDATA_ANY(a),VARSIZE_ANY_EXHDR(a));
-    lp_path incoming=lp_path_of((const uint8 *)VARDATA_ANY(b),VARSIZE_ANY_EXHDR(b));
-    size_t size=lp_ewkb_enrich_path(recorded,incoming,NULL,0);
-    if (!size) PG_RETURN_NULL();
-    if (size>MaxAllocSize-VARHDRSZ) ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("laplace: enriched path exceeds the geometry allocation limit")));
-    bytea *out=palloc(VARHDRSZ+size); SET_VARSIZE(out,VARHDRSZ+size);
-    lp_ewkb_enrich_path(recorded,incoming,(uint8 *)VARDATA(out),size);
+    bytea *out = enrich_path_ewkb(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
+    if (!out) PG_RETURN_NULL();
     PG_RETURN_BYTEA_P(out);
+}
+PG_FUNCTION_INFO_V1(laplace_path_enrich);
+Datum laplace_path_enrich(PG_FUNCTION_ARGS){
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) PG_RETURN_NULL();
+    Datum out = lp_pg_path_enrich_datum(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
+    if (!out) PG_RETURN_NULL();
+    PG_RETURN_DATUM(out);
 }
 bool lp_pg_path_end_span(void *context, const lp_ewkb_span *span){
     lp_pg_path_ends *ends = context; double vertex[4];
@@ -253,6 +330,66 @@ Datum laplace_path_parts(PG_FUNCTION_ARGS){
     lp_id *ids=palloc(sizeof(*ids)*Max(n,(size_t)1));
     if(lp_path_expand(g.p,ids,n)!=n)ereport(ERROR,(errmsg("laplace_parts: incomplete path expansion")));
     ArrayType *result=id_array(fcinfo,ids,(int)n);pfree(ids);PG_RETURN_ARRAYTYPE_P(result);
+}
+
+typedef struct {
+    lp_id start_id, end_id;
+    int64 length;
+    bool found;
+} PathEndEntry;
+
+static void path_end_visit(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask;
+    PathEndEntry *e = lp_idmap_lookup((lp_idmap *)context, id);
+    if (!e) return;
+    Geo g = geo_of(path);
+    if (g.p.n == 0) return;
+    size_t len = lp_path_len(g.p);
+    if (len > PG_INT64_MAX)
+        ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("laplace_path_endpoints: run count exceeds bigint")));
+    e->start_id = lp_path_id(g.p, 0);
+    e->end_id = lp_path_id(g.p, g.p.n - 1);
+    e->length = (int64)len;
+    e->found = true;
+}
+
+PG_FUNCTION_INFO_V1(laplace_path_endpoints);
+Datum laplace_path_endpoints(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_path_endpoints", &td);
+    if (PG_ARGISNULL(0)) PG_RETURN_NULL();
+    int n = 0;
+    lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    if (n <= 0) { pfree(ids); PG_RETURN_NULL(); }
+    lp_idmap *by_id = lp_idmap_sized(sizeof(PathEndEntry));
+    PG_TRY(); {
+        for (int i = 0; i < n; i++) {
+            bool fresh;
+            PathEndEntry *e = lp_idmap_get(by_id, ids + i, &fresh);
+            if (fresh) *e = (PathEndEntry){0};
+        }
+        lp_pg_lookup_paths(lp_idmap_keys(by_id), lp_idmap_count(by_id), false, path_end_visit, by_id);
+        for (int i = 0; i < n; i++) {
+            const PathEndEntry *e = lp_idmap_lookup(by_id, ids + i);
+            if (!e || !e->found) continue;
+            Datum v[5] = {
+                Int64GetDatum((int64)i + 1),
+                id_datum(ids + i),
+                id_datum(&e->start_id),
+                id_datum(&e->end_id),
+                Int64GetDatum(e->length)
+            };
+            bool nl[5] = {false, false, false, false, false};
+            set_put(fcinfo, ts, td, v, nl);
+            pfree(DatumGetPointer(v[1]));
+            pfree(DatumGetPointer(v[2]));
+            pfree(DatumGetPointer(v[3]));
+        }
+    } PG_FINALLY(); {
+        lp_idmap_free(by_id);
+        pfree(ids);
+    } PG_END_TRY();
+    PG_RETURN_NULL();
 }
 
 /* One Native solve for a complete claim, not sequential updates of its previous
@@ -620,4 +757,488 @@ Datum laplace_isa(PG_FUNCTION_ARGS){
     char buf[256];
     snprintf(buf, sizeof buf, "cpu: %s; dispatch: %s", lp_cpu_describe(lp_cpu_features()), lp_cpu_describe(lp_cpu_active()));
     PG_RETURN_TEXT_P(cstring_to_text(buf));
+}
+
+static void jb_key(JsonbParseState **st, const char *k) {
+    JsonbValue v = { .type = jbvString };
+    v.val.string.len = (int)strlen(k);
+    v.val.string.val = pstrdup(k);
+    pushJsonbValue(st, WJB_KEY, &v);
+}
+
+static void jb_str(JsonbParseState **st, const char *k, const char *s) {
+    jb_key(st, k);
+    if (!s) {
+        JsonbValue n = { .type = jbvNull };
+        pushJsonbValue(st, WJB_VALUE, &n);
+        return;
+    }
+    JsonbValue v = { .type = jbvString };
+    v.val.string.len = (int)strlen(s);
+    v.val.string.val = pstrdup(s);
+    pushJsonbValue(st, WJB_VALUE, &v);
+}
+
+static void jb_i64(JsonbParseState **st, const char *k, int64 val) {
+    jb_key(st, k);
+    JsonbValue v = { .type = jbvNumeric };
+    v.val.numeric = int64_to_numeric(val);
+    pushJsonbValue(st, WJB_VALUE, &v);
+}
+
+static void jb_bool(JsonbParseState **st, const char *k, bool val) {
+    jb_key(st, k);
+    JsonbValue v = { .type = jbvBool };
+    v.val.boolean = val;
+    pushJsonbValue(st, WJB_VALUE, &v);
+}
+
+typedef struct {
+    int64 rows;
+    int64 bytes;
+    int64 parts;
+    int64 total_indexes;
+    int64 gin_indexes;
+    int64 gist_indexes;
+    int64 btree_indexes;
+    int64 unindexed_parts;
+} PartRelStats;
+
+static void collect_canonical_stats(const char *relname, bool exact, int64 *tier_counts, PartRelStats *out) {
+    memset(out, 0, sizeof(*out));
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions(relname, &parts, NULL, NULL, NULL);
+    out->parts = nparts;
+    Snapshot snap = exact ? GetActiveSnapshot() : NULL;
+    Relation pg_index = table_open(IndexRelationId, AccessShareLock);
+    for (int p = 0; p < nparts; p++) {
+        CHECK_FOR_INTERRUPTS();
+        int32 relpages = 0;
+        Oid toast_oid = InvalidOid;
+        HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(parts[p]));
+        if (HeapTupleIsValid(ctup)) {
+            Form_pg_class c = (Form_pg_class)GETSTRUCT(ctup);
+            relpages = c->relpages;
+            toast_oid = c->reltoastrelid;
+            if (!exact && c->reltuples > 0.0f)
+                out->rows += (int64)c->reltuples;
+            ReleaseSysCache(ctup);
+        }
+        int part_indexes = 0;
+        ScanKeyData ikey;
+        ScanKeyInit(&ikey, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(parts[p]));
+        SysScanDesc iscan = systable_beginscan(pg_index, IndexIndrelidIndexId, true, NULL, 1, &ikey);
+        HeapTuple idx_tup;
+        while (HeapTupleIsValid(idx_tup = systable_getnext(iscan))) {
+            Form_pg_index idx_form = (Form_pg_index)GETSTRUCT(idx_tup);
+            if (!idx_form->indislive) continue;
+            part_indexes++;
+            out->total_indexes++;
+            HeapTuple itup = SearchSysCache1(RELOID, ObjectIdGetDatum(idx_form->indexrelid));
+            if (HeapTupleIsValid(itup)) {
+                Form_pg_class ic = (Form_pg_class)GETSTRUCT(itup);
+                Oid relam = ic->relam;
+                if (relam == GIN_AM_OID) out->gin_indexes++;
+                else if (relam == GIST_AM_OID) out->gist_indexes++;
+                else if (relam == BTREE_AM_OID) out->btree_indexes++;
+                if (!exact && ic->relpages > 0)
+                    out->bytes += (int64)ic->relpages * BLCKSZ;
+                ReleaseSysCache(itup);
+            }
+        }
+        systable_endscan(iscan);
+        if (part_indexes == 0) out->unindexed_parts++;
+        if (!exact) {
+            if (relpages > 0) out->bytes += (int64)relpages * BLCKSZ;
+            if (OidIsValid(toast_oid)) {
+                HeapTuple ttup = SearchSysCache1(RELOID, ObjectIdGetDatum(toast_oid));
+                if (HeapTupleIsValid(ttup)) {
+                    Form_pg_class tc = (Form_pg_class)GETSTRUCT(ttup);
+                    if (tc->relpages > 0) out->bytes += (int64)tc->relpages * BLCKSZ;
+                    ReleaseSysCache(ttup);
+                }
+            }
+            continue;
+        }
+        out->bytes += DatumGetInt64(DirectFunctionCall1(pg_total_relation_size, ObjectIdGetDatum(parts[p])));
+        Relation part = table_open(parts[p], AccessShareLock);
+        if (RelationGetNumberOfBlocks(part) > 0) {
+            AttrNumber a_tier = tier_counts ? get_attnum(parts[p], "tier") : InvalidAttrNumber;
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                out->rows++;
+                if (tier_counts && a_tier > 0) {
+                    bool isnull = true;
+                    Datum td = slot_getattr(slot, a_tier, &isnull);
+                    if (!isnull) {
+                        int16 tier = DatumGetInt16(td);
+                        if (tier >= 0 && tier <= 255) tier_counts[tier]++;
+                    }
+                }
+                ExecClearTuple(slot);
+            }
+            table_endscan(scan);
+            ExecDropSingleTupleTableSlot(slot);
+        }
+        table_close(part, NoLock);
+    }
+    table_close(pg_index, AccessShareLock);
+}
+
+static void count_witness_cb(const lp_id *id, const lp_id *lineage, double trust, void *ctx) {
+    (void)id; (void)lineage; (void)trust;
+    (*(int64 *)ctx)++;
+}
+
+PG_FUNCTION_INFO_V1(laplace_estate_summary);
+Datum laplace_estate_summary(PG_FUNCTION_ARGS) {
+    bool exact = PG_NARGS() > 0 && !PG_ARGISNULL(0) ? PG_GETARG_BOOL(0) : false;
+
+    char *dbname = get_database_name(MyDatabaseId);
+    bool read_only = XactReadOnly || RecoveryInProgress();
+    int64 db_bytes = DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)));
+
+    char *extversion = NULL;
+    Oid ext_oid = get_extension_oid("laplace", true);
+    if (OidIsValid(ext_oid)) {
+        HeapTuple etup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(ext_oid));
+        if (HeapTupleIsValid(etup)) {
+            bool isnull = true;
+            Datum d = SysCacheGetAttr(EXTENSIONOID, etup, Anum_pg_extension_extversion, &isnull);
+            if (!isnull) extversion = TextDatumGetCString(d);
+            ReleaseSysCache(etup);
+        }
+    }
+
+    char isa[256];
+    snprintf(isa, sizeof isa, "cpu: %s; dispatch: %s", lp_cpu_describe(lp_cpu_features()), lp_cpu_describe(lp_cpu_active()));
+
+    char *t0_fp = NULL, *hw_fp = NULL, *chess_fp = NULL;
+    const char *t0_opt = GetConfigOption("laplace.tier0", true, false);
+    if (t0_opt && *t0_opt) {
+        uint8 fp[32];
+        lp_tier0_fingerprint(lp_pg_tier0(), fp);
+        t0_fp = text_to_cstring(fingerprint_text(fp));
+    }
+    const char *hw_opt = GetConfigOption("laplace.highway", true, false);
+    if (hw_opt && *hw_opt) {
+        uint8 fp[32];
+        lp_highway_fingerprint(lp_pg_highway(), fp);
+        hw_fp = text_to_cstring(fingerprint_text(fp));
+    }
+    const lp_perfcache *chess = lp_pg_chess(false);
+    if (chess) {
+        uint8 fp[32];
+        lp_perfcache_fingerprint(chess, fp);
+        chess_fp = text_to_cstring(fingerprint_text(fp));
+    }
+
+    int64 *tier_counts = exact ? palloc0(sizeof(int64) * 256) : NULL;
+    PartRelStats ent_s, path_s, att_s, con_s;
+    collect_canonical_stats("entity", exact, tier_counts, &ent_s);
+    collect_canonical_stats("physicality", exact, NULL, &path_s);
+    collect_canonical_stats("attestation", exact, NULL, &att_s);
+    collect_canonical_stats("consensus", exact, NULL, &con_s);
+
+    int64 witness_count = 0;
+    lp_pg_scan_all_witnesses(count_witness_cb, &witness_count);
+
+    int64 stage_tables = 0;
+    Oid stage_nsp = get_namespace_oid("stage", true);
+    if (OidIsValid(stage_nsp)) {
+        Relation rel_class = table_open(RelationRelationId, AccessShareLock);
+        ScanKeyData skey;
+        ScanKeyInit(&skey, Anum_pg_class_relnamespace, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(stage_nsp));
+        SysScanDesc sscan = systable_beginscan(rel_class, InvalidOid, false, NULL, 1, &skey);
+        HeapTuple ctup;
+        while (HeapTupleIsValid(ctup = systable_getnext(sscan))) {
+            Form_pg_class c = (Form_pg_class)GETSTRUCT(ctup);
+            if (c->relkind == RELKIND_RELATION || c->relkind == RELKIND_PARTITIONED_TABLE)
+                stage_tables++;
+        }
+        systable_endscan(sscan);
+        table_close(rel_class, AccessShareLock);
+    }
+
+    JsonbParseState *st = NULL;
+    pushJsonbValue(&st, WJB_BEGIN_OBJECT, NULL);
+    jb_str(&st, "database", dbname);
+    jb_bool(&st, "read_only", read_only);
+    jb_i64(&st, "database_bytes", db_bytes);
+    jb_str(&st, "count_kind", exact ? "exact" : "estimated");
+    jb_str(&st, "extversion", extversion);
+    jb_str(&st, "isa", isa);
+    jb_str(&st, "tier0", t0_fp);
+    jb_str(&st, "highway", hw_fp);
+    jb_str(&st, "chess", chess_fp);
+    jb_i64(&st, "entities", ent_s.rows);
+    jb_i64(&st, "physicalities", path_s.rows);
+    jb_i64(&st, "attestation_rows", att_s.rows);
+    jb_i64(&st, "standing_rows", con_s.rows);
+    jb_i64(&st, "registered_witness_rows", witness_count);
+    jb_i64(&st, "entity_bytes", ent_s.bytes);
+    jb_i64(&st, "physicality_bytes", path_s.bytes);
+    jb_i64(&st, "attestation_bytes", att_s.bytes);
+    jb_i64(&st, "consensus_bytes", con_s.bytes);
+    jb_i64(&st, "entity_parts", ent_s.parts);
+    jb_i64(&st, "physicality_parts", path_s.parts);
+    jb_i64(&st, "attestation_parts", att_s.parts);
+    jb_i64(&st, "consensus_parts", con_s.parts);
+    jb_i64(&st, "entity_indexes", ent_s.total_indexes);
+    jb_i64(&st, "entity_gist_indexes", ent_s.gist_indexes);
+    jb_i64(&st, "physicality_indexes", path_s.total_indexes);
+    jb_i64(&st, "physicality_gin_indexes", path_s.gin_indexes);
+    jb_i64(&st, "unindexed_parts", ent_s.unindexed_parts + path_s.unindexed_parts + att_s.unindexed_parts + con_s.unindexed_parts);
+    jb_i64(&st, "stage_tables", stage_tables);
+    if (tier_counts) {
+        jb_key(&st, "tiers");
+        pushJsonbValue(&st, WJB_BEGIN_OBJECT, NULL);
+        for (int t = 0; t <= 255; t++) {
+            if (!tier_counts[t]) continue;
+            char tkey[8];
+            snprintf(tkey, sizeof tkey, "%d", t);
+            jb_i64(&st, tkey, tier_counts[t]);
+        }
+        pushJsonbValue(&st, WJB_END_OBJECT, NULL);
+        pfree(tier_counts);
+    }
+    JsonbValue *root = pushJsonbValue(&st, WJB_END_OBJECT, NULL);
+    PG_RETURN_JSONB_P(JsonbValueToJsonb(root));
+}
+
+/* Planner SupportRequestRows hook so small ID arrays or page limits do not default to prorows=1000. */
+PG_FUNCTION_INFO_V1(laplace_srf_support);
+Datum laplace_srf_support(PG_FUNCTION_ARGS) {
+    Node *rawreq = (Node *)PG_GETARG_POINTER(0);
+    Node *ret = NULL;
+    if (IsA(rawreq, SupportRequestRows)) {
+        SupportRequestRows *req = (SupportRequestRows *)rawreq;
+        if (req->node && IsA(req->node, FuncExpr)) {
+            FuncExpr *fe = (FuncExpr *)req->node;
+            if (list_length(fe->args) >= 1) {
+                Node *arg0 = (Node *)linitial(fe->args);
+                double est = 16.0;
+                if (IsA(arg0, Const)) {
+                    Const *c = (Const *)arg0;
+                    if (c->constisnull) est = 1.0;
+                    else if (c->consttype == TEXTOID) est = 8.0;
+                    else if (get_element_type(c->consttype) != InvalidOid) {
+                        ArrayType *a = DatumGetArrayTypeP(c->constvalue);
+                        est = (double)ArrayGetNItems(ARR_NDIM(a), ARR_DIMS(a));
+                        if (est < 1.0) est = 1.0;
+                    }
+                } else if (IsA(arg0, ArrayExpr)) {
+                    est = (double)list_length(((ArrayExpr *)arg0)->elements);
+                    if (est < 1.0) est = 1.0;
+                }
+                const char *fn = get_func_name(req->funcid);
+                if (fn) {
+                    if (strcmp(fn, "laplace_library_page") == 0 && list_length(fe->args) >= 2) {
+                        Node *arg1 = (Node *)lsecond(fe->args);
+                        if (IsA(arg1, Const) && !((Const *)arg1)->constisnull)
+                            est = (double)DatumGetInt32(((Const *)arg1)->constvalue);
+                        else
+                            est = 64.0;
+                    } else if (strcmp(fn, "laplace_below") == 0 || strcmp(fn, "laplace_containers") == 0 ||
+                               strcmp(fn, "laplace_paths") == 0 || strcmp(fn, "laplace_contained") == 0) {
+                        est *= 16.0;
+                    } else if (strcmp(fn, "laplace_forward") == 0 || strcmp(fn, "laplace_forward_suffix") == 0 ||
+                               strcmp(fn, "laplace_claims_each") == 0 || strcmp(fn, "laplace_fills") == 0) {
+                        est *= 8.0;
+                    } else if (strcmp(fn, "laplace_replay_export") == 0) {
+                        est = 10000.0;
+                    } else if (strcmp(fn, "laplace_hilbert_neighbors") == 0 && list_length(fe->args) >= 3) {
+                        Node *arg2 = (Node *)lthird(fe->args);
+                        if (IsA(arg2, Const) && !((Const *)arg2)->constisnull)
+                            est = 2.0 * (double)DatumGetInt32(((Const *)arg2)->constvalue);
+                        else
+                            est = 32.0;
+                    } else if (strcmp(fn, "laplace_constellation_sample") == 0) {
+                        Node *a0 = (Node *)linitial(fe->args);
+                        if (IsA(a0, Const) && !((Const *)a0)->constisnull)
+                            est = (double)DatumGetInt32(((Const *)a0)->constvalue);
+                        else
+                            est = 64.0;
+                    }
+                }
+                if (est < 1.0) est = 1.0;
+                if (est > 1e7) est = 1e7;
+                req->rows = est;
+                ret = (Node *)req;
+            }
+        }
+    }
+    PG_RETURN_POINTER(ret);
+}
+
+static bool canonical_rel_nonempty(const char *relname, Snapshot snap)
+{
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions(relname, &parts, NULL, NULL, NULL);
+    bool found = false;
+    for (int p = 0; p < nparts && !found; p++) {
+        CHECK_FOR_INTERRUPTS();
+        Relation part = table_open(parts[p], AccessShareLock);
+        TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+        TupleTableSlot *slot = table_slot_create(part, NULL);
+        if (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+            found = true;
+        ExecDropSingleTupleTableSlot(slot);
+        table_endscan(scan);
+        table_close(part, NoLock);
+    }
+    return found;
+}
+
+/* Direct-AM early-exit emptiness probe across entity and consensus partitions. */
+PG_FUNCTION_INFO_V1(laplace_nonempty);
+Datum laplace_nonempty(PG_FUNCTION_ARGS)
+{
+    TupleDesc desc;
+    if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+        ereport(ERROR, (errmsg("laplace_nonempty requires composite result")));
+    const char *ecols[] = { "id" }, *ccols[] = { "claim" }, *col = NULL;
+    Relation ep = lp_pg_read_parent(lp_pg_relation("entity"), &col, ecols, 1);
+    table_close(ep, NoLock);
+    Relation cp = lp_pg_read_parent(lp_pg_relation("consensus"), &col, ccols, 1);
+    table_close(cp, NoLock);
+
+    Snapshot snap = GetActiveSnapshot();
+    bool has_ent = canonical_rel_nonempty("entity", snap);
+    bool has_con = canonical_rel_nonempty("consensus", snap);
+    Datum vals[2] = { BoolGetDatum(has_ent), BoolGetDatum(has_con) };
+    bool nulls[2] = { false, false };
+    PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), vals, nulls)));
+}
+
+/* Direct-AM uniform partition-stride tier distribution sample for status reporting. */
+PG_FUNCTION_INFO_V1(laplace_entity_tier_sample);
+Datum laplace_entity_tier_sample(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_entity_tier_sample", &td);
+    Oid target = lp_pg_relation("entity");
+    const char *cols[] = { "tier" }, *col = NULL;
+    Relation ep = lp_pg_read_parent(target, &col, cols, 1);
+    AttrNumber a_tier = get_attnum(target, "tier");
+    table_close(ep, NoLock);
+
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    double est_total = 0.0;
+    for (int p = 0; p < nparts; p++) {
+        HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(parts[p]));
+        if (HeapTupleIsValid(ctup)) {
+            Form_pg_class c = (Form_pg_class)GETSTRUCT(ctup);
+            if (c->reltuples > 0.0f) est_total += c->reltuples;
+            ReleaseSysCache(ctup);
+        }
+    }
+
+    int step = (nparts == 256 && est_total >= 100000.0) ? 64 : 1;
+    int64 counts[256] = {0};
+    Snapshot snap = GetActiveSnapshot();
+    for (int p = 0; p < nparts; p += step) {
+        CHECK_FOR_INTERRUPTS();
+        Relation part = table_open(parts[p], AccessShareLock);
+        TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+        TupleTableSlot *slot = table_slot_create(part, NULL);
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+            CHECK_FOR_INTERRUPTS();
+            bool isnull = true;
+            Datum dt = slot_getattr(slot, a_tier, &isnull);
+            if (!isnull) {
+                int16 tier = DatumGetInt16(dt);
+                if (tier >= 0 && tier <= 255) counts[tier]++;
+            }
+            ExecClearTuple(slot);
+        }
+        ExecDropSingleTupleTableSlot(slot);
+        table_endscan(scan);
+        table_close(part, NoLock);
+    }
+
+    for (int t = 0; t <= 255; t++) {
+        if (!counts[t]) continue;
+        Datum v[2] = { Int16GetDatum((int16)t), Int64GetDatum(counts[t] * (int64)step) };
+        bool nl[2] = { false, false };
+        set_put(fcinfo, ts, td, v, nl);
+    }
+    return (Datum)0;
+}
+
+static Oid find_tier_btree_index(Relation part, AttrNumber a_tier)
+{
+    List *idxs = RelationGetIndexList(part);
+    ListCell *lc;
+    Oid found = InvalidOid;
+    foreach(lc, idxs) {
+        Oid ioid = lfirst_oid(lc);
+        Relation idx = index_open(ioid, AccessShareLock);
+        if (idx->rd_rel->relam == BTREE_AM_OID && idx->rd_index &&
+            idx->rd_index->indisvalid && idx->rd_index->indisready && idx->rd_index->indislive &&
+            idx->rd_index->indnkeyatts >= 1 && idx->rd_index->indkey.values[0] == a_tier) {
+            found = ioid;
+            index_close(idx, NoLock);
+            break;
+        }
+        index_close(idx, NoLock);
+    }
+    list_free(idxs);
+    return found;
+}
+
+/* Direct-AM exact entity count at target_tier using per-partition (tier, hilbert, id) B-trees. */
+PG_FUNCTION_INFO_V1(laplace_entity_tier_count);
+Datum laplace_entity_tier_count(PG_FUNCTION_ARGS)
+{
+    int16 target_tier = PG_GETARG_INT16(0);
+    Oid target = lp_pg_relation("entity");
+    const char *cols[] = { "tier" }, *col = NULL;
+    Relation ep = lp_pg_read_parent(target, &col, cols, 1);
+    AttrNumber a_tier = get_attnum(target, "tier");
+    table_close(ep, NoLock);
+
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    Snapshot snap = GetActiveSnapshot();
+    int64 total = 0;
+
+    for (int p = 0; p < nparts; p++) {
+        CHECK_FOR_INTERRUPTS();
+        Relation part = table_open(parts[p], AccessShareLock);
+        AttrNumber p_tier = get_attnum(parts[p], "tier");
+        Oid idx_oid = find_tier_btree_index(part, p_tier);
+        TupleTableSlot *slot = table_slot_create(part, NULL);
+        if (OidIsValid(idx_oid)) {
+            Relation idx = index_open(idx_oid, AccessShareLock);
+            ScanKeyData sk;
+            ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, INT2OID,
+                                   idx->rd_indcollation[0], F_INT2EQ, Int16GetDatum(target_tier));
+            IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 1, 0);
+            index_rescan(scan, &sk, 1, NULL, 0);
+            while (index_getnext_slot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                total++;
+                ExecClearTuple(slot);
+            }
+            index_endscan(scan);
+            index_close(idx, NoLock);
+        } else {
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool isnull = true;
+                Datum dt = slot_getattr(slot, a_tier, &isnull);
+                if (!isnull && DatumGetInt16(dt) == target_tier) total++;
+                ExecClearTuple(slot);
+            }
+            table_endscan(scan);
+        }
+        ExecDropSingleTupleTableSlot(slot);
+        table_close(part, NoLock);
+    }
+    PG_RETURN_INT64(total);
 }

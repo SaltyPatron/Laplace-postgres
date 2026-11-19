@@ -71,24 +71,3 @@ char *lp_pg_sql(const char *sql)
     }
     return out.data;
 }
-
-int lp_pg_execute(const char *sql,bool read_only,long count)
-{
-    char *bound=lp_pg_sql(sql);
-    int result=SPI_execute(bound,read_only,count);pfree(bound);return result;
-}
-int lp_pg_execute_args(const char *sql,int nargs,Oid *types,Datum *values,const char *nulls,bool read_only,long count)
-{
-    char *bound=lp_pg_sql(sql);
-    int result=SPI_execute_with_args(bound,nargs,types,values,nulls,read_only,count);pfree(bound);return result;
-}
-SPIPlanPtr lp_pg_prepare_cursor(const char *sql,int nargs,Oid *types,int options)
-{
-    char *bound=lp_pg_sql(sql);
-    SPIPlanPtr result=SPI_prepare_cursor(bound,nargs,types,options);pfree(bound);return result;
-}
-
-void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit,void *context)
-{
-    lp_pg_execute_stream(plan,parameters,true,visit,context);
-}

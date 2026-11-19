@@ -7,9 +7,9 @@ SET client_min_messages = warning;
 BEGIN;
 -- The deployed assertion index is attached and valid on every canonical
 -- partition, so a reader can nominate assertion parents.
-DO $$ BEGIN
- IF (SELECT count(*) FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indexrelid
-     WHERE h.inhparent='public.physicality_assertions'::regclass AND i.indisvalid AND i.indisready)<>256 THEN
+DO $$ DECLARE expected bigint := (SELECT count(*) FROM pg_inherits WHERE inhparent='public.physicality'::regclass); BEGIN
+ IF expected = 0 OR (SELECT count(*) FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indexrelid
+     WHERE h.inhparent='public.physicality_assertions'::regclass AND i.indisvalid AND i.indisready) <> expected THEN
   RAISE EXCEPTION 'the deployed assertion index is not valid on every canonical partition';
  END IF;
  PERFORM count(*) FROM public.laplace_testimony(ARRAY[public.laplace_id('index repair probe')]);

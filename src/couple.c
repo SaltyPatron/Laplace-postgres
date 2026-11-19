@@ -1,105 +1,113 @@
 /* Forward sequence pass, gap fills, and 4D geometric/trajectory coupling
- * (laplace_fills, laplace_forward, laplace_couple). */
+ * (laplace_fills, laplace_forward, laplace_couple, laplace_curves). */
 #include "pg_core.h"
 #include "geo.h"
-#include "access/table.h"
 #include "catalog/pg_type.h"
-#include "executor/spi.h"
 #include "laplace/consensus.h"
 #include <math.h>
 
-/* Every read of the web is a statement planned once per backend and kept, run as one executor pass over a set, its
- * rows returned through a tuplestore. */
-typedef struct { const char *name; const char *sql; int nargs; SPIPlanPtr plan; uint64 generation; } Kept;
-#define KEPT_ARGS 8
-/* The statement's plan, made the first time it is run, with these argument types. Inside SPI. */
-static SPIPlanPtr kept_plan(Kept *k, const Oid *types){
-    uint64 generation=lp_pg_binding_generation();
-    if(k->plan && k->generation!=generation){SPI_freeplan(k->plan);k->plan=NULL;}
-    if (!k->plan) {
-        char *bound=lp_pg_sql(k->sql);
-        k->plan = SPI_prepare(bound, k->nargs, (Oid *)types);pfree(bound);
-        if (!k->plan) ereport(ERROR, (errmsg("%s: SPI_prepare: %s", k->name, SPI_result_code_string(SPI_result))));
-        SPI_keepplan(k->plan);
-        k->generation=generation;
+/* ---------------------------------------------------------------- fills
+ * laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is held by
+ * that path (including runs). */
+typedef struct {
+    FunctionCallInfo fcinfo;
+    Tuplestorestate *ts;
+    TupleDesc td;
+    lp_id *unique_ids;
+    int n_unique;
+    uint64_t *times;
+} FillsVisit;
+static void fills_hit(const PgHolderHit *hit, void *context){
+    FillsVisit *v = context;
+    if (hit->hub || !hit->path) return;
+    Geo g = geo_of(hit->path);
+    lp_path_times(g.p, v->unique_ids, (size_t)v->n_unique, v->times);
+    for (int i = 0; i < v->n_unique; i++) {
+        if (!v->times[i]) continue;
+        Datum o[4] = { id_datum(&hit->entity), id_datum(&v->unique_ids[i]),
+                       Int64GetDatum((int64)v->times[i]), Int16GetDatum(hit->tier) };
+        bool nl[4] = { false, false, false, false };
+        set_put(v->fcinfo, v->ts, v->td, o, nl);
     }
-    return k->plan;
 }
-static void kept_run(Kept *k, const Oid *types, Datum *args){
-    if (SPI_execute_plan(kept_plan(k, types), args, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("%s: %s", k->name, SPI_result_code_string(SPI_result))));
+PG_FUNCTION_INFO_V1(laplace_fills);
+Datum laplace_fills(PG_FUNCTION_ARGS){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_fills", &td);
+    if (PG_ARGISNULL(0)) PG_RETURN_NULL();
+    int n = 0; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    if (n <= 0) { pfree(ids); PG_RETURN_NULL(); }
+    int n_unique = (int)lp_ids_unique(ids, (size_t)n);
+    int16 *tiers = palloc(sizeof(int16) * (size_t)n_unique);
+    lp_pg_lookup_entity_tiers(ids, (size_t)n_unique, tiers);
+    int16 min_tier = INT16_MAX;
+    for (int i = 0; i < n_unique; i++) if (tiers[i] >= 0 && tiers[i] < min_tier) min_tier = tiers[i];
+    pfree(tiers);
+    if (min_tier == INT16_MAX) { pfree(ids); PG_RETURN_NULL(); }
+    FillsVisit ctx = { fcinfo, ts, td, ids, n_unique, palloc(sizeof(uint64_t) * (size_t)n_unique) };
+    lp_pg_holders_direct(ids, n_unique, NULL, 0, false, min_tier, -1, 3, 0, 0, fills_hit, &ctx);
+    pfree(ctx.times); pfree(ids);
+    PG_RETURN_NULL();
 }
-
-/* Run a kept statement over the call's own arguments, its argument types the call's, and hand every row through. */
-static void set_run(FunctionCallInfo fcinfo, Kept *k){
-    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, k->name, &td);
-    if (k->nargs > KEPT_ARGS || td->natts > KEPT_ARGS) ereport(ERROR, (errmsg("%s: more than %d arguments or columns", k->name, KEPT_ARGS)));
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("%s: SPI_connect", k->name)));
-    Oid t[KEPT_ARGS]; Datum a[KEPT_ARGS]; char nulls[KEPT_ARGS];
-    for (int i = 0; i < k->nargs; i++) {
-        t[i] = get_fn_expr_argtype(fcinfo->flinfo, i);
-        nulls[i] = PG_ARGISNULL(i) ? 'n' : ' ';
-        a[i] = PG_ARGISNULL(i) ? (Datum)0 : PG_GETARG_DATUM(i);
-    }
-    if (SPI_execute_plan(kept_plan(k,t),a,nulls,true,0) != SPI_OK_SELECT)
-        ereport(ERROR,(errmsg("%s: %s",k->name,SPI_result_code_string(SPI_result))));
-    int nc = SPI_tuptable->tupdesc->natts;
-    for (uint64 j = 0; j < SPI_processed; j++) {
-        Datum v[KEPT_ARGS]; bool nl[KEPT_ARGS];
-        for (int c = 0; c < nc; c++) v[c] = SPI_getbinval(SPI_tuptable->vals[j], SPI_tuptable->tupdesc, c + 1, &nl[c]);
-        tuplestore_putvalues(ts, td, v, nl);
-    }
-    SPI_finish();
-}
-#define SET_FN(fn, kept) PG_FUNCTION_INFO_V1(fn); Datum fn(PG_FUNCTION_ARGS){ set_run(fcinfo, &kept); PG_RETURN_NULL(); }
-
-/* laplace_fills(keys): every path above the lowest key that holds any of them, with the times each key is followed by
- * the next vertex of that path: what fills the gap after it. */
-static Kept fills_kept = { "laplace_fills",
-    "SELECT p.entity, t.id, t.times, p.tier FROM @extschema@.physicality p, @extschema@.laplace_path_times(p.path, $1) t "
-    "WHERE p.tier > (SELECT min(e.tier) FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)) AND p.path OPERATOR(@extschema@.&&) $1", 1, NULL, 0 };
-SET_FN(laplace_fills, fills_kept)
 
 /* laplace_forward(ids, fan): the forward pass over every contiguous segment of a prompt at once. For each segment
  * [i..j] of the prompt's constituents: the observations holding all of its parts (claims left out), how many hold it as
  * a run, and what follows the run in each, counted. A segment held by more than fan observations is a hub, reached and
  * not crossed: its row says paths fan + 1 (more than the fan), runs 0, and nothing follows it. Counting over the first
  * fan the index met would count a different set on another install of the same content. One row per continuation (next, times);
- * a segment held by nothing, or held where nothing follows the run, has a row with next null. SQL only fetches the
- * paths that hold a segment, through the container index (Architecture: SQL fetches and writes records); the runs are
- * matched and what follows them is counted here, by Laplace-Native: precedes, contains and co-occurrence from the
- * trajectories, no softmax, no window. */
-static Kept forward_kept = { "laplace_forward",
-    "SELECT h.ordinal, h.path, h.tier, h.hub FROM @extschema@.laplace_holders($1, $2, true, $3, $4, 2::smallint) h", 4, NULL, 0 };
-typedef struct { AttrNumber att; int16 *tier; } ForwardTiers;
-static void forward_tier_row(TupleTableSlot *slot, const PresenceKey *key, void *context){
-    ForwardTiers *ft = context; bool nl; Datum d = slot_getattr(slot, ft->att, &nl);
-    if (!nl) { int16 t = DatumGetInt16(d); if (t > ft->tier[key->ordinal - 1]) ft->tier[key->ordinal - 1] = t; }
-}
+ * a segment held by nothing, or held where nothing follows the run, has a row with next null. Direct index access
+ * fetches the paths that hold a segment through the GIN container index; the runs are matched and what follows them is
+ * counted here, by Laplace-Native: precedes, contains and co-occurrence from the trajectories, no softmax, no window. */
 /* A segment's observations: each path as it lies, and its tier. */
 typedef struct { Datum path; int16 tier; } Held;
 typedef lp_vec(Held) Helds;
-PG_FUNCTION_INFO_V1(laplace_forward);
-Datum laplace_forward(PG_FUNCTION_ARGS){
-    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_forward", &td);
-    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0); Oid el = ARR_ELEMTYPE(arr), at = get_fn_expr_argtype(fcinfo->flinfo, 0), ftypes[4] = { at, at, INT2OID, INT8OID };
-    int n; lp_id *ids = ids_of(arr, &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
-    int16 *tier = palloc(sizeof(int16) * (size_t)(n ? n : 1)); for (int i = 0; i < n; i++) tier[i] = -1;
-    if (n > 0) {
-        const char *sel[] = { "id", "tier" }, *col; Oid target = lp_pg_relation("entity");
-        Relation ent = lp_pg_read_parent(target, &col, sel, lengthof(sel));
-        ForwardTiers ft = { get_attnum(target, "tier"), tier };
-        PresenceKey *pkeys = palloc_extended((Size)n * sizeof(*pkeys), MCXT_ALLOC_HUGE);
-        for (int i = 0; i < n; i++) pkeys[i] = (PresenceKey){ .id = ids[i], .ordinal = (int64)i + 1 };
-        lp_pg_indexed_keys(ent, col, pkeys, (size_t)n, forward_tier_row, &ft);
-        pfree(pkeys); table_close(ent, NoLock);
-    }
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_forward: SPI_connect")));
+typedef struct { Helds *w_held; bool *w_hub; int nw; MemoryContext wordctx; } ForwardBatchCtx;
+static void forward_batch_hit(const PgHolderHit *hit, void *context){
+    ForwardBatchCtx *c = context;
+    int64 ord = hit->ordinal - 1;
+    if (ord < 0 || ord >= c->nw) return;
+    if (hit->hub) { c->w_hub[ord] = true; return; }
+    if (!hit->path) return;
+    MemoryContext old = MemoryContextSwitchTo(c->wordctx);
+    Datum copied = PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path));
+    lp_push(&c->w_held[ord], (Held){ copied, hit->tier });
+    MemoryContextSwitchTo(old);
+}
+typedef struct { Helds *dst; bool is_hub; MemoryContext keepctx; } ForwardSegCtx;
+static void forward_seg_hit(const PgHolderHit *hit, void *context){
+    ForwardSegCtx *c = context;
+    if (hit->hub) { c->is_hub = true; return; }
+    if (!hit->path) return;
+    MemoryContext old = MemoryContextSwitchTo(c->keepctx);
+    Datum copied = PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path));
+    lp_push(c->dst, (Held){ copied, hit->tier });
+    MemoryContextSwitchTo(old);
+}
+typedef struct {
+    int32 i, j;
+    int64 paths, runs, times;
+    lp_id next;
+} ForwardSuffixRow;
+
+static int cmp_forward_suffix(const void *a, const void *b){
+    const ForwardSuffixRow *x = a, *y = b;
+    int64 sx = (int64)(x->j - x->i), sy = (int64)(y->j - y->i);
+    if (sx != sy) return sx > sy ? -1 : 1;
+    if (x->times != y->times) return x->times > y->times ? -1 : 1;
+    return memcmp(x->next.b, y->next.b, sizeof(lp_id));
+}
+
+static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
+    TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, suffix_only ? "laplace_forward_suffix" : "laplace_forward", &td);
+    int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
+    if (n < 2) { pfree(ids); PG_RETURN_NULL(); }
+    int16 *tier = palloc(sizeof(int16) * (size_t)n);
+    for (int i = 0; i < n; i++) tier[i] = -1;
+    lp_pg_lookup_entity_tiers(ids, (size_t)n, tier);
     lp_idmap *followed = lp_idmap_sized(sizeof(int64)); lp_vec(lp_id) out = { 0 };
-    MemoryContext rowctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward rows", ALLOCSET_DEFAULT_SIZES),
-                  keepctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward held", ALLOCSET_DEFAULT_SIZES),
+    MemoryContext keepctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward held", ALLOCSET_DEFAULT_SIZES),
                   wordctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_forward words", ALLOCSET_DEFAULT_SIZES);
-    lp_id *w_ids = palloc(sizeof(lp_id) * (size_t)(n ? n : 1));
-    int *w_at = palloc(sizeof(int) * (size_t)(n ? n : 1)), nw = 0;
+    lp_id *w_ids = palloc(sizeof(lp_id) * (size_t)n);
+    int *w_at = palloc(sizeof(int) * (size_t)n), nw = 0;
     for (int i = 0; i < n; i++) {
         w_at[i] = -1; if (tier[i] <= 0) continue;
         for (int k = 0; k < nw; k++) if (lp_id_eq(&w_ids[k], &ids[i])) { w_at[i] = k; break; }
@@ -108,27 +116,15 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
     Helds *w_held = palloc0(sizeof(Helds) * (size_t)(nw ? nw : 1));
     bool *w_hub = palloc0(sizeof(bool) * (size_t)(nw ? nw : 1));
     if (nw > 0) {
-        MemoryContext old = MemoryContextSwitchTo(rowctx);
-        Datum a[4] = { PointerGetDatum(id_array_of(el, w_ids, nw)), PointerGetDatum(id_array_of(el, NULL, 0)), Int16GetDatum(0), Int64GetDatum(fan) };
-        kept_run(&forward_kept, ftypes, a);
-        MemoryContextSwitchTo(wordctx);
-        for (uint64 r = 0; r < SPI_processed; r++) {
-            bool nl; int64 ord = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1;
-            if (ord < 0 || ord >= nw) continue;
-            if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 4, &nl))) { w_hub[ord] = true; continue; }
-            Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl);
-            int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &nl));
-            lp_push(&w_held[ord], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t });
-        }
-        SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
+        ForwardBatchCtx bctx = { w_held, w_hub, nw, wordctx };
+        lp_pg_holders_direct(w_ids, nw, NULL, 0, true, 0, fan, 2, 0, 0, forward_batch_hit, &bctx);
     }
     Helds held[2] = { { 0 }, { 0 } };
-    for (int i = 0; i < n; i++) {
-        MemoryContextReset(keepctx);
-        int cur = 0, have = 0, floor = tier[i], words = tier[i] > 0;
-        for (int j = i + 1; j < n; j++) {
-            int prev_words = words, prev_floor = floor;
-            words += tier[j] > 0; if (tier[j] > floor) floor = tier[j];
+    if (suffix_only) {
+        lp_vec(ForwardSuffixRow) srows = { 0 };
+        int cur = 0, have = 0, j = n - 1, floor = tier[j], words = tier[j] > 0;
+        for (int i = n - 2; i >= 0; i--) {
+            words += tier[i] > 0; if (tier[i] > floor) floor = tier[i];
             int next = cur ^ 1, np = j - i + 1; held[next].n = 0;
             if (!words) { have = 0; continue; }
             if (!have) {
@@ -144,61 +140,120 @@ Datum laplace_forward(PG_FUNCTION_ARGS){
                     }
                     have = 1;
                 } else {
-                    bool dup_part = false;
-                    if (j > i + 1 && prev_words > 0 && floor == prev_floor) {
-                        for (int k = i; k < j; k++) if (lp_id_eq(&ids[k], &ids[j])) { dup_part = true; break; }
-                    }
-                    if (!dup_part) {
-                        int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
-                        MemoryContext old = MemoryContextSwitchTo(rowctx);
-                        Datum a[4] = { PointerGetDatum(id_array_of(el, ids + probe, 1)), PointerGetDatum(id_array_of(el, ids + i, np)), Int16GetDatum((int16)floor), Int64GetDatum(fan) };
-                        kept_run(&forward_kept, ftypes, a);
-                        MemoryContextSwitchTo(keepctx);
-                        bool is_hub = false;
-                        for (uint64 r = 0; r < SPI_processed; r++) {
-                            bool nl; if (DatumGetBool(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 4, &nl))) { is_hub = true; continue; }
-                            Datum d = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl);
-                            int16 t = DatumGetInt16(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 3, &nl));
-                            lp_push(&held[next], (Held){ PointerGetDatum(PG_DETOAST_DATUM_COPY(d)), t });
-                        }
-                        SPI_freetuptable(SPI_tuptable); MemoryContextSwitchTo(old); MemoryContextReset(rowctx);
-                        have = !is_hub;
-                    }
+                    int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
+                    ForwardSegCtx sctx = { &held[next], false, keepctx };
+                    lp_pg_holders_direct(ids + probe, 1, ids + i, np, true, (int16)floor, fan, 2, 0, 0, forward_seg_hit, &sctx);
+                    have = !sctx.is_hub;
                 }
-                if (!have) {
-                    Datum v[6]; bool nl[6] = { false, false, false, false, true, false };
-                    v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum(fan + 1); v[3] = Int64GetDatum(0); v[4] = (Datum)0; v[5] = Int64GetDatum(0);
-                    set_put(fcinfo, ts, td, v, nl); cur = next; continue;
+                if (!have) { cur = next; continue; }
+            } else {
+                for (size_t r = 0; r < held[cur].n; r++) {
+                    const Held *h = &held[cur].v[r]; Geo g = geo_of(h->path);
+                    if (h->tier > floor && lp_path_holds(g.p, ids + i, (size_t)np, true)) lp_push(&held[next], *h);
                 }
-            } else
-                for (size_t r = 0; r < held[cur].n; r++) { const Held *h = &held[cur].v[r]; Geo g = geo_of(h->path);
-                    if (h->tier > floor && lp_path_holds(g.p, &ids[j], 1, true)) lp_push(&held[next], *h); }
-            /* what follows the run in each path, counted by ID */
-            uint64 paths = held[next].n; int64 runs = 0; bool unfollowed = paths == 0;
+            }
+            if (held[next].n == 0) break;
+            uint64 paths = held[next].n; int64 runs = 0;
             lp_idmap_clear(followed);
             for (size_t r = 0; r < held[next].n; r++) {
                 Geo g = geo_of(held[next].v[r].path); size_t cap = g.p.n * 4 + 16; lp_vec_reserve(&out, cap);
                 size_t found = lp_path_follows(g.p, ids + i, (size_t)np, out.v, cap);
-                if (!found) { unfollowed = true; continue; }                     /* it holds the parts, and not as a run that anything follows */
+                if (!found) continue;
                 runs++; if (found > cap) found = cap;
                 for (size_t x = 0; x < found; x++) (*(int64 *)lp_idmap_get(followed, &out.v[x], NULL))++;
             }
-            Datum v[6]; bool nl[6] = { false, false, false, false, false, false };
-            v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum((int64)paths); v[3] = Int64GetDatum(runs);
-            for (size_t x = 0; x < lp_idmap_count(followed); x++) { v[4] = id_datum(lp_idmap_key(followed, x)); v[5] = Int64GetDatum(*(int64 *)lp_idmap_at(followed, x)); set_put(fcinfo, ts, td, v, nl); }
-            if (unfollowed) { v[4] = (Datum)0; nl[4] = true; v[5] = Int64GetDatum(0); set_put(fcinfo, ts, td, v, nl); }
+            for (size_t x = 0; x < lp_idmap_count(followed); x++) {
+                ForwardSuffixRow sr = { i + 1, j + 1, (int64)paths, runs, *(int64 *)lp_idmap_at(followed, x), *lp_idmap_key(followed, x) };
+                lp_push(&srows, sr);
+            }
             cur = next;
+        }
+        lp_sort(srows.v, srows.n, sizeof(ForwardSuffixRow), cmp_forward_suffix);
+        for (size_t k = 0; k < srows.n; k++) {
+            Datum v[6] = {
+                Int32GetDatum(srows.v[k].i), Int32GetDatum(srows.v[k].j),
+                Int64GetDatum(srows.v[k].paths), Int64GetDatum(srows.v[k].runs),
+                id_datum(&srows.v[k].next), Int64GetDatum(srows.v[k].times)
+            };
+            bool nl[6] = { false };
+            set_put(fcinfo, ts, td, v, nl);
+            pfree(DatumGetPointer(v[4]));
+        }
+        lp_vec_free(&srows);
+    } else {
+        for (int i = 0; i < n; i++) {
+            MemoryContextReset(keepctx);
+            int cur = 0, have = 0, floor = tier[i], words = tier[i] > 0;
+            for (int j = i + 1; j < n; j++) {
+                int prev_words = words, prev_floor = floor;
+                words += tier[j] > 0; if (tier[j] > floor) floor = tier[j];
+                int next = cur ^ 1, np = j - i + 1; held[next].n = 0;
+                if (!words) { have = 0; continue; }
+                if (!have) {
+                    int best_w = -1;
+                    for (int k = i; k <= j; k++) if (w_at[k] >= 0 && !w_hub[w_at[k]]) {
+                        if (best_w < 0 || w_held[w_at[k]].n < w_held[best_w].n) best_w = w_at[k];
+                    }
+                    if (best_w >= 0) {
+                        const Helds *src = &w_held[best_w];
+                        for (size_t r = 0; r < src->n; r++) {
+                            const Held *h = &src->v[r]; Geo g = geo_of(h->path);
+                            if (h->tier > floor && lp_path_holds(g.p, ids + i, (size_t)np, true)) lp_push(&held[next], *h);
+                        }
+                        have = 1;
+                    } else {
+                        bool dup_part = false;
+                        if (j > i + 1 && prev_words > 0 && floor == prev_floor) {
+                            for (int k = i; k < j; k++) if (lp_id_eq(&ids[k], &ids[j])) { dup_part = true; break; }
+                        }
+                        if (!dup_part) {
+                            int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
+                            ForwardSegCtx sctx = { &held[next], false, keepctx };
+                            lp_pg_holders_direct(ids + probe, 1, ids + i, np, true, (int16)floor, fan, 2, 0, 0, forward_seg_hit, &sctx);
+                            have = !sctx.is_hub;
+                        }
+                    }
+                    if (!have) {
+                        Datum v[6]; bool nl[6] = { false, false, false, false, true, false };
+                        v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum(fan + 1); v[3] = Int64GetDatum(0); v[4] = (Datum)0; v[5] = Int64GetDatum(0);
+                        set_put(fcinfo, ts, td, v, nl); cur = next; continue;
+                    }
+                } else
+                    for (size_t r = 0; r < held[cur].n; r++) { const Held *h = &held[cur].v[r]; Geo g = geo_of(h->path);
+                        if (h->tier > floor && lp_path_holds(g.p, &ids[j], 1, true)) lp_push(&held[next], *h); }
+                uint64 paths = held[next].n; int64 runs = 0; bool unfollowed = paths == 0;
+                lp_idmap_clear(followed);
+                for (size_t r = 0; r < held[next].n; r++) {
+                    Geo g = geo_of(held[next].v[r].path); size_t cap = g.p.n * 4 + 16; lp_vec_reserve(&out, cap);
+                    size_t found = lp_path_follows(g.p, ids + i, (size_t)np, out.v, cap);
+                    if (!found) { unfollowed = true; continue; }
+                    runs++; if (found > cap) found = cap;
+                    for (size_t x = 0; x < found; x++) (*(int64 *)lp_idmap_get(followed, &out.v[x], NULL))++;
+                }
+                Datum v[6]; bool nl[6] = { false, false, false, false, false, false };
+                v[0] = Int32GetDatum(i + 1); v[1] = Int32GetDatum(j + 1); v[2] = Int64GetDatum((int64)paths); v[3] = Int64GetDatum(runs);
+                for (size_t x = 0; x < lp_idmap_count(followed); x++) { v[4] = id_datum(lp_idmap_key(followed, x)); v[5] = Int64GetDatum(*(int64 *)lp_idmap_at(followed, x)); set_put(fcinfo, ts, td, v, nl); }
+                if (unfollowed) { v[4] = (Datum)0; nl[4] = true; v[5] = Int64GetDatum(0); set_put(fcinfo, ts, td, v, nl); }
+                cur = next;
+            }
         }
     }
     for (int k = 0; k < nw; k++) lp_vec_free(&w_held[k]);
-    MemoryContextDelete(rowctx); MemoryContextDelete(keepctx); MemoryContextDelete(wordctx);
+    pfree(w_held); pfree(w_hub); pfree(w_ids); pfree(w_at); pfree(tier); pfree(ids);
+    MemoryContextDelete(keepctx); MemoryContextDelete(wordctx);
     lp_idmap_free(followed); lp_vec_free(&out); lp_vec_free(&held[0]); lp_vec_free(&held[1]);
-    SPI_finish(); PG_RETURN_NULL();
+    PG_RETURN_NULL();
 }
+
+PG_FUNCTION_INFO_V1(laplace_forward);
+Datum laplace_forward(PG_FUNCTION_ARGS){ return run_laplace_forward(fcinfo, false); }
+
+PG_FUNCTION_INFO_V1(laplace_forward_suffix);
+Datum laplace_forward_suffix(PG_FUNCTION_ARGS){ return run_laplace_forward(fcinfo, true); }
 
 /* ---------------------------------------------------------------- COUPLE, one coarse native operator
  * laplace_couple(occ, fan, refuse, shape, shape_n, keep): the coupling field of an admitted observation
- * (Sequence 20.2), in one call: bounded indexed set access through SPI, everything else native.
+ * (Sequence 20.2), in one call: bounded direct-AM indexed set access, zero SQL/SPI.
  *   strand       every claim holding an occurrence, refusals out before the fan (15.5): the claim's other end
  *   containment  every observation holding an occurrence (19.3), at most the fan an occurrence
  *   shape        the observed curves nearest the observation's own (19.6, 19.7): nominated by the GIN (what holds the
@@ -218,24 +273,28 @@ static void emit(Field *f, const lp_id *id, int occ, int route, const lp_rating 
     if (vert) o[10] = PointerGetDatum(id_array_of(f->el, vert, nvert)); else { nl[10] = true; o[10] = 0; }
     set_put(f->fcinfo, f->ts, f->td, o, nl);
 }
-/* Every ID's real coordinate: an atom's from the Tier-0 floor, every other one from its entity row in one read; a map
- * from ID to its four doubles, those with neither left out. */
+/* Every ID's real coordinate: an atom's from the Tier-0 floor, every other one from its entity row in one direct read;
+ * a map from ID to its four doubles, those with neither left out. */
 typedef struct { double x[4]; bool has; } Coord4;
-static void coords_spi(Oid idarr, lp_idmap *at){
+static void coord_visit(int64 ordinal, const lp_id *id, int16 tier, Datum coord, int64 hilbert, void *context){
+    (void)ordinal; (void)tier; (void)hilbert;
+    if (!coord) return;
+    Coord4 *c = lp_idmap_lookup((lp_idmap *)context, id);
+    if (!c) return;
+    Geo gg = geo_of(coord);
+    if (gg.p.n >= 1) { memcpy(c->x, xyzm(&gg), 32); c->has = true; }
+}
+static void coords_load(lp_idmap *at){
     size_t n = lp_idmap_count(at); if (!n) return;
-    const lp_tier0_record *floor = lp_pg_tier0(); lp_id *rest = palloc(sizeof(lp_id) * n); int nr = 0;
-    for (size_t i = 0; i < n; i++) { Coord4 *c = lp_idmap_at(at, i); const lp_tier0_record *atom = lp_tier0_find(floor, lp_idmap_key(at, i));
-        if (atom) { lp_coord k; memcpy(k.m, atom->m, sizeof k.m); lp_coord_xyzm(&k, c->x); c->has = true; } else rest[nr++] = *lp_idmap_key(at, i); }
-    if (!nr) { pfree(rest); return; }
-    Datum a[1] = { PointerGetDatum(id_array_of(get_element_type(idarr), rest, nr)) }; Oid t[1] = { idarr };
-    pfree(rest);
-    if (lp_pg_execute_args("SELECT e.id, e.coord FROM @extschema@.entity e WHERE e.id OPERATOR(@extschema@.=) ANY($1)", 1, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace: coordinates")));
-    for (uint64 r = 0; r < SPI_processed; r++) {
-        bool nl; Datum g = SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl); if (nl) continue;
-        Coord4 *c = lp_idmap_lookup(at, (const lp_id *)DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)));
-        Geo gg = geo_of(g); if (!c || gg.p.n < 1) continue;
-        memcpy(c->x, xyzm(&gg), 32); c->has = true;
+    const lp_tier0_record *floor = lp_pg_tier0(); lp_id *rest = palloc(sizeof(lp_id) * n); size_t nr = 0;
+    for (size_t i = 0; i < n; i++) {
+        Coord4 *c = lp_idmap_at(at, i);
+        const lp_tier0_record *atom = lp_tier0_find(floor, lp_idmap_key(at, i));
+        if (atom) { lp_coord k; memcpy(k.m, atom->m, sizeof k.m); lp_coord_xyzm(&k, c->x); c->has = true; }
+        else rest[nr++] = *lp_idmap_key(at, i);
     }
+    if (nr) lp_pg_lookup_entity_coords(rest, nr, coord_visit, at);
+    pfree(rest);
 }
 /* An observed curve: the entity, its constituents, and its distance from the observation's own. */
 typedef struct { lp_id id; lp_id *v; int nv; double d; } Curve;
@@ -255,67 +314,140 @@ static double measure(int shape, double shape_n, const double *a, size_t na, con
         default: return lp_frechet4(a, na, b, nb);
     }
 }
+typedef struct { int idx; lp_rating rt; lp_id target; lp_id rel; } StrandHit;
+typedef struct {
+    const lp_id *occ;
+    int nocc;
+    int64 fan;
+    int *held;
+    lp_vec(StrandHit) hits;
+} StrandCollect;
+static void couple_strand_hit(const PgClaimHit *hit, void *context){
+    StrandCollect *c = context;
+    int idx = (int)hit->i - 1;
+    if (idx < 0 || idx >= c->nocc) return;
+    if (++c->held[idx] > c->fan || !hit->path) return;
+    Geo g = geo_of(hit->path);
+    lp_id part[64];
+    size_t np = lp_path_expand(g.p, part, 64);
+    if (np < 2 || np > 64) return;
+    int other = lp_tuple_other(part, np, &c->occ[idx]);
+    if (other < 0) return;
+    StrandHit *s = lp_vec_add(&c->hits);
+    s->idx = idx;
+    s->rt = (lp_rating){ hit->rating, hit->deviation, hit->volatility };
+    s->target = part[other];
+    s->rel = np >= 3 ? part[1] : c->occ[idx];
+}
+typedef struct {
+    Field *f;
+    const int *orig_idx;
+    int group_n;
+    int16 shape;
+    Curves *cv;
+    lp_idmap *seen;
+} ContainCollect;
+static void couple_contain_hit(const PgHolderHit *hit, void *context){
+    ContainCollect *c = context;
+    if (hit->hub || !hit->path) return;
+    int64 gidx = hit->ordinal - 1;
+    if (gidx < 0 || gidx >= c->group_n) return;
+    int orig = c->orig_idx[gidx];
+    emit(c->f, &hit->entity, orig + 1, ROUTE_CONTAIN, NULL, NULL, NULL, hit->tier, 0.0, NULL, 0);
+    if (c->shape >= 0) nominate(c->cv, c->seen, &hit->entity, hit->path);
+}
+typedef struct { Curves *cv; lp_idmap *seen; } KnnNominate;
+static void couple_knn_path(const lp_id *id, Datum path, Datum mask, void *context){
+    (void)mask;
+    KnnNominate *k = context;
+    if (path) nominate(k->cv, k->seen, id, path);
+}
 PG_FUNCTION_INFO_V1(laplace_couple);
 Datum laplace_couple(PG_FUNCTION_ARGS){
     Field f = { fcinfo, NULL, NULL, InvalidOid }; f.ts = set_begin(fcinfo, "laplace_couple", &f.td);
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0); f.el = get_element_type(idarr);
-    ArrayType *occa = PG_GETARG_ARRAYTYPE_P(0); int nocc; lp_id *occ = ids_of(occa, &nocc);
-    int64 fan = PG_GETARG_INT64(1); int16 shape = PG_GETARG_INT16(3); double shape_n = PG_GETARG_FLOAT8(4); int32 keep = PG_GETARG_INT32(5);
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_couple: SPI_connect")));
-    Datum fanp1 = Int64GetDatum(fan + 1), fand = Int64GetDatum(fan);
+    int nocc; lp_id *occ = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nocc);
+    int64 fan = PG_GETARG_INT64(1);
+    int nrefuse; lp_id *refuse = ids_of(PG_GETARG_ARRAYTYPE_P(2), &nrefuse);
+    int16 shape = PG_GETARG_INT16(3); double shape_n = PG_GETARG_FLOAT8(4); int32 keep = PG_GETARG_INT32(5);
     /* strands: every claim holding an occurrence, refusals out before the fan; the strand answers with its other end */
-    { Datum a[3] = { PointerGetDatum(occa), fanp1, PG_GETARG_DATUM(2) }; Oid t[3] = { idarr, INT8OID, idarr };
-      if (lp_pg_execute_args("SELECT u.i, c.path, c.rating, c.deviation, c.volatility FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
-            "CROSS JOIN LATERAL (SELECT p.path, s.rating, s.deviation, s.volatility FROM @extschema@.physicality p JOIN @extschema@.consensus s ON s.claim OPERATOR(@extschema@.=) p.entity WHERE p.tier > e.tier AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] "
-            "AND p.mask OPERATOR(@extschema@.?) 0::smallint AND NOT @extschema@.laplace_middle_any(p.path, $3) LIMIT $2) c", 3, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: strands")));
-      int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: what the scan met first is not its strands */
-      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
-      for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
-          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc || held[i] > fan) continue;
-          Geo g = geo_of(SPI_getbinval(tup, d, 2, &nl)); lp_id part[64]; size_t np = lp_path_expand(g.p, part, 64); if (np < 2 || np > 64) continue;
-          int other = lp_tuple_other(part, np, &occ[i]); if (other < 0) continue;
-          lp_rating rt = { DatumGetFloat8(SPI_getbinval(tup, d, 3, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 4, &nl)), DatumGetFloat8(SPI_getbinval(tup, d, 5, &nl)) };
-          emit(&f, &part[other], i + 1, ROUTE_STRAND, &rt, &occ[i], np >= 3 ? &part[1] : &occ[i], 0, 0.0, NULL, 0); } }
+    if (nocc > 0 && fan > 0) {
+        StrandCollect sc = { occ, nocc, fan, palloc0(sizeof(int) * (size_t)(nocc + 1)), { 0 } };
+        lp_pg_claims_each_direct(occ, nocc, fan + 1, UINT64_C(1),
+                                 refuse, nrefuse, 0,
+                                 NULL, 0, 0, NULL, 0,
+                                 couple_strand_hit, &sc);
+        for (size_t r = 0; r < sc.hits.n; r++) {
+            const StrandHit *s = &sc.hits.v[r];
+            if (sc.held[s->idx] > fan) continue;
+            emit(&f, &s->target, s->idx + 1, ROUTE_STRAND, &s->rt, &occ[s->idx], &s->rel, 0, 0.0, NULL, 0);
+        }
+        pfree(sc.held);
+        lp_vec_free(&sc.hits);
+    }
+    pfree(refuse);
     /* containment: what holds each occurrence, the paths kept as the shape's GIN nominations */
     lp_idmap *seen = lp_idmap_new(); Curves cv = { 0 };
-    { Datum a[2] = { PointerGetDatum(occa), fanp1 }; Oid t[2] = { idarr, INT8OID };
-      if (lp_pg_execute_args("SELECT u.i, c.entity, c.tier, c.path FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(id, i) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id "
-            "CROSS JOIN LATERAL (SELECT p.entity, p.tier, p.path FROM @extschema@.physicality p WHERE p.tier > e.tier AND p.path OPERATOR(@extschema@.@>) ARRAY[u.id] AND NOT (p.mask OPERATOR(@extschema@.?) 0::smallint) LIMIT $2) c", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: containment")));
-      int *held = palloc0(sizeof(int) * (size_t)(nocc + 1));                /* an occurrence more than the fan holds is a hub: reached, never crossed */
-      for (uint64 r = 0; r < SPI_processed; r++) { bool nl; int i = (int)DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)) - 1; if (i >= 0 && i < nocc) held[i]++; }
-      for (uint64 r = 0; r < SPI_processed; r++) { HeapTuple tup = SPI_tuptable->vals[r]; TupleDesc d = SPI_tuptable->tupdesc; bool nl;
-          int i = (int)DatumGetInt64(SPI_getbinval(tup, d, 1, &nl)) - 1; if (i < 0 || i >= nocc || held[i] > fan) continue;
-          lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(tup, d, 2, &nl)), 16);
-          emit(&f, &id, i + 1, ROUTE_CONTAIN, NULL, NULL, NULL, DatumGetInt16(SPI_getbinval(tup, d, 3, &nl)), 0.0, NULL, 0);
-          if (shape >= 0) nominate(&cv, seen, &id, SPI_getbinval(tup, d, 4, &nl)); } }
-    if (shape >= 0 && keep > 0) {
+    if (nocc > 0 && fan >= 0) {
+        int16 *occ_tier = palloc(sizeof(int16) * (size_t)nocc);
+        lp_pg_lookup_entity_tiers(occ, (size_t)nocc, occ_tier);
+        bool *done = palloc0(sizeof(bool) * (size_t)nocc);
+        lp_id *g_ids = palloc(sizeof(lp_id) * (size_t)nocc);
+        int *g_orig = palloc(sizeof(int) * (size_t)nocc);
+        for (int i = 0; i < nocc; i++) {
+            if (done[i] || occ_tier[i] < 0) continue;
+            int16 t = occ_tier[i];
+            int gn = 0;
+            for (int j = i; j < nocc; j++) {
+                if (!done[j] && occ_tier[j] == t) {
+                    done[j] = true;
+                    g_ids[gn] = occ[j];
+                    g_orig[gn] = j;
+                    gn++;
+                }
+            }
+            ContainCollect cc = { &f, g_orig, gn, shape, &cv, seen };
+            lp_pg_holders_direct(g_ids, gn, NULL, 0, true, t, fan, 2, 0, 0, couple_contain_hit, &cc);
+        }
+        pfree(g_orig); pfree(g_ids); pfree(done); pfree(occ_tier);
+    }
+    if (shape >= 0 && keep > 0 && nocc > 0) {
         /* the observation's own curve, and its centroid for the GiST */
-        lp_idmap *oc = lp_idmap_sized(sizeof(Coord4)); for (int i = 0; i < nocc; i++) lp_idmap_put(oc, &occ[i], NULL); coords_spi(idarr, oc);
+        lp_idmap *oc = lp_idmap_sized(sizeof(Coord4)); for (int i = 0; i < nocc; i++) lp_idmap_put(oc, &occ[i], NULL); coords_load(oc);
         double *pa = palloc(sizeof(double) * 4 * (size_t)nocc), cen[4] = { 0 }; int npa = 0;
         for (int i = 0; i < nocc; i++) { const Coord4 *c = lp_idmap_lookup(oc, &occ[i]); if (c && c->has) memcpy(pa + 4 * npa++, c->x, 32); }
         lp_idmap_free(oc);
         for (int i = 0; i < npa; i++) for (int k = 0; k < 4; k++) cen[k] += pa[4 * i + k] / npa;
         if (npa >= 2) {
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
-            uint8 pt[64]; size_t pl = lp_ewkb_point4(cen, pt, sizeof pt);
-            Datum a[2] = { PointerGetDatum(bytes_datum(pt, pl)), fand }; Oid t[2] = { BYTEAOID, INT8OID };
-            if (lp_pg_execute_args("SELECT e.id, p.path FROM (SELECT e.id FROM @extschema@.entity e WHERE e.tier >= 3 ORDER BY e.coord OPERATOR(@extschema@.<~>) @postgis@.ST_GeomFromEWKB($1) LIMIT $2) e JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) e.id", 2, t, a, NULL, true, 0) != SPI_OK_SELECT) ereport(ERROR, (errmsg("laplace_couple: nearest")));
-            for (uint64 r = 0; r < SPI_processed; r++) { bool nl; lp_id id; memcpy(id.b, DatumGetPointer(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 1, &nl)), 16);
-                nominate(&cv, seen, &id, SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc, 2, &nl)); }
+            if (fan > 0) {
+                int k = fan > PG_INT32_MAX ? PG_INT32_MAX : (int)fan;
+                PgKnnHit *hits = palloc(sizeof(PgKnnHit) * (size_t)k);
+                int nk = lp_pg_knn4d(cen, k, false, 3, false, 0, NULL, hits, CurrentMemoryContext);
+                if (nk > 0) {
+                    lp_id *knn_ids = palloc(sizeof(lp_id) * (size_t)nk);
+                    for (int i = 0; i < nk; i++) knn_ids[i] = hits[i].id;
+                    KnnNominate kc = { &cv, seen };
+                    lp_pg_lookup_paths(knn_ids, (size_t)nk, false, couple_knn_path, &kc);
+                    pfree(knn_ids);
+                }
+                pfree(hits);
+            }
             /* every child's real coordinate, once; each curve realized and measured */
             lp_idmap *kc = lp_idmap_sized(sizeof(Coord4)); for (size_t i = 0; i < cv.n; i++) for (int k = 0; k < cv.v[i].nv; k++) lp_idmap_put(kc, &cv.v[i].v[k], NULL);
-            coords_spi(idarr, kc);
+            coords_load(kc);
             double *b = palloc(sizeof(double) * 4 * 1024);
             for (size_t i = 0; i < cv.n; i++) { int nb = 0;
                 for (int k = 0; k < cv.v[i].nv; k++) { const Coord4 *c = lp_idmap_lookup(kc, &cv.v[i].v[k]); if (c && c->has) memcpy(b + 4 * nb++, c->x, 32); }
                 cv.v[i].d = nb < 2 ? INFINITY : measure(shape, shape_n, pa, (size_t)npa, b, (size_t)nb); }
+            pfree(b);
             lp_idmap_free(kc);
             lp_sort(cv.v, cv.n, sizeof(Curve), by_distance);
             for (size_t i = 0; i < cv.n && (int)i < keep; i++) if (isfinite(cv.v[i].d)) emit(&f, &cv.v[i].id, 0, ROUTE_SHAPE, NULL, NULL, NULL, 0, cv.v[i].d, cv.v[i].v, cv.v[i].nv);
         }
+        pfree(pa);
     }
-    lp_idmap_free(seen); lp_vec_free(&cv);
-    SPI_finish();
+    lp_idmap_free(seen); lp_vec_free(&cv); pfree(occ);
     PG_RETURN_NULL();
 }
 
@@ -338,17 +470,14 @@ static void curve_path(const lp_id *id, Datum path, Datum mask, void *context){
 PG_FUNCTION_INFO_V1(laplace_curves);
 Datum laplace_curves(PG_FUNCTION_ARGS){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, "laplace_curves", &td);
-    Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0);
     int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
     CurveRead r = { lp_idmap_sized(sizeof(CurveSlot)), CurrentMemoryContext };
     for (int i = 0; i < n; i++) lp_idmap_put(r.slots, &ids[i], NULL);
     lp_pg_lookup_paths(lp_idmap_keys(r.slots), lp_idmap_count(r.slots), false, curve_path, &r);
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_curves: SPI_connect")));
     lp_idmap *kc = lp_idmap_sized(sizeof(Coord4)); size_t most = 0;
     for (size_t s = 0; s < lp_idmap_count(r.slots); s++) { CurveSlot *c = lp_idmap_at(r.slots, s);
         for (int k = 0; k < c->nv; k++) lp_idmap_put(kc, &c->v[k], NULL); if ((size_t)c->nv > most) most = (size_t)c->nv; }
-    coords_spi(idarr, kc);
-    SPI_finish();
+    coords_load(kc);
     double *b = palloc(sizeof(double) * 4 * (most ? most : 1));
     for (int i = 0; i < n; i++) {
         const CurveSlot *c = lp_idmap_lookup(r.slots, &ids[i]); int nb = 0;
@@ -360,6 +489,226 @@ Datum laplace_curves(PG_FUNCTION_ARGS){
             o[2] = PointerGetDatum(e); }
         set_put(fcinfo, ts, td, o, nl);
     }
-    lp_idmap_free(kc); lp_idmap_free(r.slots);
+    pfree(b); lp_idmap_free(kc); lp_idmap_free(r.slots); pfree(ids);
+    PG_RETURN_NULL();
+}
+
+/* ---------------------------------------------------------------- batched pair roles (pull_degrees.c roles_of) */
+typedef struct { lp_id entity; Datum path; } RoleHit;
+typedef lp_vec(RoleHit) RoleHitVec;
+typedef struct { size_t start, count; } RoleSpan;
+typedef struct {
+    RoleHitVec *hits;
+    lp_idmap *seen;
+    MemoryContext ctx;
+} RolePairCollect;
+
+static void role_pair_hit(const PgHolderHit *hit, void *context){
+    RolePairCollect *c = context;
+    if (hit->hub || !hit->path) return;
+    bool fresh;
+    lp_idmap_get(c->seen, &hit->entity, &fresh);
+    if (!fresh) return;
+    MemoryContext old = MemoryContextSwitchTo(c->ctx);
+    RoleHit rh = { hit->entity, PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path)) };
+    lp_push(c->hits, rh);
+    MemoryContextSwitchTo(old);
+}
+
+PG_FUNCTION_INFO_V1(laplace_roles_of);
+Datum laplace_roles_of(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_roles_of", &td);
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) PG_RETURN_NULL();
+    int nl_count = 0, nr_count = 0;
+    lp_id *left = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nl_count);
+    lp_id *right = ids_of(PG_GETARG_ARRAYTYPE_P(1), &nr_count);
+    int64 fan = PG_ARGISNULL(2) ? -1 : PG_GETARG_INT64(2);
+    int16 kinds = (PG_NARGS() > 3 && !PG_ARGISNULL(3)) ? PG_GETARG_INT16(3) : 3;
+    if (kinds < 1 || kinds > 3) {
+        pfree(left); pfree(right);
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_roles_of: invalid kinds")));
+    }
+    if (nl_count != nr_count) {
+        pfree(left); pfree(right);
+        ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR), errmsg("laplace_roles_of: left and right arrays must match length")));
+    }
+    if (nl_count <= 0) { pfree(left); pfree(right); PG_RETURN_NULL(); }
+
+    MemoryContext pairctx = AllocSetContextCreate(CurrentMemoryContext, "laplace_roles_of", ALLOCSET_DEFAULT_SIZES);
+    lp_strmap *cache = lp_strmap_sized(sizeof(RoleSpan));
+    RoleHitVec hits = { 0 };
+    lp_idmap *seen = lp_idmap_new();
+
+    PG_TRY(); {
+        for (int k = 0; k < nl_count; k++) {
+            CHECK_FOR_INTERRUPTS();
+            lp_id pair[2] = { left[k], right[k] };
+            if (lp_id_cmp(&pair[0], &pair[1]) > 0) { lp_id tmp = pair[0]; pair[0] = pair[1]; pair[1] = tmp; }
+            bool fresh;
+            RoleSpan *span = lp_strmap_get(cache, pair, sizeof pair, &fresh);
+            if (fresh) {
+                span->start = hits.n;
+                lp_idmap_clear(seen);
+                RolePairCollect c = { &hits, seen, pairctx };
+                if (lp_id_eq(&pair[0], &pair[1]))
+                    lp_pg_holders_direct(&pair[0], 1, NULL, 0, true, -1, fan, kinds, 0, 0, role_pair_hit, &c);
+                else
+                    lp_pg_holders_direct(&pair[0], 1, &pair[1], 1, true, -1, fan, kinds, 0, 0, role_pair_hit, &c);
+                span->count = hits.n - span->start;
+            }
+            for (size_t i = 0; i < span->count; i++) {
+                const RoleHit *rh = &hits.v[span->start + i];
+                Datum o[3] = { Int64GetDatum((int64)k + 1), id_datum(&rh->entity), rh->path };
+                bool nl[3] = { false, false, false };
+                set_put(fcinfo, ts, td, o, nl);
+                pfree(DatumGetPointer(o[1]));
+            }
+        }
+    } PG_FINALLY(); {
+        lp_strmap_free(cache);
+        lp_idmap_free(seen);
+        lp_vec_free(&hits);
+        MemoryContextDelete(pairctx);
+        pfree(left); pfree(right);
+    } PG_END_TRY();
+    PG_RETURN_NULL();
+}
+
+/* ---------------------------------------------------------------- multi-tier upward multiplicity closure (fills.c) */
+typedef struct { int64 times; int16 tier; int32 level; } FillsAcc;
+typedef struct {
+    const lp_id *front_ids;
+    const int16 *front_tiers;
+    const int64 *front_delta;
+    size_t nf;
+    uint64_t *times_buf;
+    int32 level;
+    lp_idmap *level_seen;
+    lp_idmap *acc;        /* lp_id -> FillsAcc */
+    lp_idmap *next_delta; /* lp_id -> int64 */
+} FillsClosureCtx;
+
+static inline int64 sat_mul_i64(int64 a, uint64_t b){
+    if (a <= 0 || b == 0) return 0;
+    if (b > (uint64_t)(PG_INT64_MAX / a)) return PG_INT64_MAX;
+    return a * (int64)b;
+}
+static inline int64 sat_add_i64(int64 a, int64 b){
+    if (a > PG_INT64_MAX - b) return PG_INT64_MAX;
+    return a + b;
+}
+
+static void fills_closure_hit(const PgHolderHit *hit, void *context){
+    FillsClosureCtx *c = context;
+    if (hit->hub || !hit->path) return;
+    bool fresh_lvl;
+    lp_idmap_get(c->level_seen, &hit->entity, &fresh_lvl);
+    if (!fresh_lvl) return;
+
+    Geo g = geo_of(hit->path);
+    lp_path_times(g.p, c->front_ids, c->nf, c->times_buf);
+    int64 gain = 0;
+    for (size_t i = 0; i < c->nf; i++) {
+        if (!c->times_buf[i]) continue;
+        if (c->front_tiers[i] >= 0 && hit->tier <= c->front_tiers[i]) continue;
+        gain = sat_add_i64(gain, sat_mul_i64(c->front_delta[i], c->times_buf[i]));
+    }
+    if (gain <= 0) return;
+
+    bool fresh;
+    FillsAcc *acc = lp_idmap_get(c->acc, &hit->entity, &fresh);
+    if (fresh) *acc = (FillsAcc){ gain, hit->tier, c->level };
+    else {
+        acc->times = sat_add_i64(acc->times, gain);
+        if (hit->tier > acc->tier) acc->tier = hit->tier;
+    }
+    int64 *nd = lp_idmap_get(c->next_delta, &hit->entity, &fresh);
+    *nd = fresh ? gain : sat_add_i64(*nd, gain);
+}
+
+PG_FUNCTION_INFO_V1(laplace_fills_closure);
+Datum laplace_fills_closure(PG_FUNCTION_ARGS){
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_fills_closure", &td);
+    if (PG_ARGISNULL(0)) PG_RETURN_NULL();
+    int n = 0; lp_id *seeds = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n);
+    if (n <= 0) { pfree(seeds); PG_RETURN_NULL(); }
+
+    int64 *seed_times = NULL;
+    if (PG_NARGS() > 1 && !PG_ARGISNULL(1)) {
+        ArrayType *ta = PG_GETARG_ARRAYTYPE_P(1);
+        Datum *td_vals; bool *td_null; int ntimes = 0;
+        deconstruct_array(ta, INT8OID, 8, FLOAT8PASSBYVAL, TYPALIGN_DOUBLE, &td_vals, &td_null, &ntimes);
+        if (ntimes != n) {
+            pfree(td_vals); pfree(td_null); pfree(seeds);
+            ereport(ERROR, (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR), errmsg("laplace_fills_closure: seeds and seed_times must match length")));
+        }
+        seed_times = palloc(sizeof(int64) * (size_t)n);
+        for (int i = 0; i < n; i++) seed_times[i] = td_null[i] ? 0 : DatumGetInt64(td_vals[i]);
+        pfree(td_vals); pfree(td_null);
+    }
+    int32 max_levels = (PG_NARGS() > 2 && !PG_ARGISNULL(2)) ? PG_GETARG_INT32(2) : 64;
+    if (max_levels < 1) max_levels = 1;
+
+    lp_idmap *acc = lp_idmap_sized(sizeof(FillsAcc));
+    lp_idmap *front = lp_idmap_sized(sizeof(int64));
+    lp_idmap *next = lp_idmap_sized(sizeof(int64));
+    lp_idmap *level_seen = lp_idmap_new();
+
+    PG_TRY(); {
+        for (int i = 0; i < n; i++) {
+            int64 w = seed_times ? seed_times[i] : 1;
+            if (w <= 0) continue;
+            bool fresh;
+            int64 *cur = lp_idmap_get(front, seeds + i, &fresh);
+            *cur = fresh ? w : sat_add_i64(*cur, w);
+        }
+        for (int32 lvl = 1; lvl <= max_levels && lp_idmap_count(front) > 0; lvl++) {
+            CHECK_FOR_INTERRUPTS();
+            size_t nf = lp_idmap_count(front);
+            const lp_id *fids = lp_idmap_keys(front);
+            int16 *ftiers = palloc(sizeof(int16) * nf);
+            int64 *fdelta = palloc(sizeof(int64) * nf);
+            uint64_t *tbuf = palloc(sizeof(uint64_t) * nf);
+            lp_pg_lookup_entity_tiers(fids, nf, ftiers);
+            int16 min_tier = INT16_MAX;
+            for (size_t i = 0; i < nf; i++) {
+                fdelta[i] = *(int64 *)lp_idmap_at(front, i);
+                if (ftiers[i] >= 0 && ftiers[i] < min_tier) min_tier = ftiers[i];
+            }
+            if (min_tier != INT16_MAX) {
+                lp_idmap_clear(next);
+                lp_idmap_clear(level_seen);
+                FillsClosureCtx ctx = { fids, ftiers, fdelta, nf, tbuf, lvl, level_seen, acc, next };
+                lp_pg_holders_direct(fids, (int)nf, NULL, 0, false, min_tier, -1, 3, 0, 0, fills_closure_hit, &ctx);
+                lp_idmap_clear(front);
+                const lp_id *nx = lp_idmap_keys(next);
+                size_t nxn = lp_idmap_count(next);
+                for (size_t i = 0; i < nxn; i++)
+                    *(int64 *)lp_idmap_get(front, &nx[i], NULL) = *(int64 *)lp_idmap_at(next, i);
+            } else {
+                lp_idmap_clear(front);
+            }
+            pfree(ftiers); pfree(fdelta); pfree(tbuf);
+        }
+        for (size_t i = 0; i < lp_idmap_count(acc); i++) {
+            const FillsAcc *a = lp_idmap_at(acc, i);
+            Datum o[4] = {
+                id_datum(lp_idmap_key(acc, i)),
+                Int64GetDatum(a->times),
+                Int16GetDatum(a->tier),
+                Int32GetDatum(a->level)
+            };
+            bool nl[4] = { false, false, false, false };
+            set_put(fcinfo, ts, td, o, nl);
+            pfree(DatumGetPointer(o[0]));
+        }
+    } PG_FINALLY(); {
+        lp_idmap_free(acc); lp_idmap_free(front);
+        lp_idmap_free(next); lp_idmap_free(level_seen);
+        if (seed_times) pfree(seed_times);
+        pfree(seeds);
+    } PG_END_TRY();
     PG_RETURN_NULL();
 }

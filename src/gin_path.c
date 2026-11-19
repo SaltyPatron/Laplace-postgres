@@ -5,6 +5,10 @@
 #include "access/gin.h"
 #include "access/htup_details.h"
 #include "access/stratnum.h"
+#include "nodes/pg_list.h"
+#include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
+#include <math.h>
 
 #define LP_STRAT_CONTAINS 7        /* path @> blake3[] */
 #define LP_STRAT_OVERLAPS 3        /* path && blake3[] */
@@ -334,4 +338,84 @@ Datum laplace_path_times(PG_FUNCTION_ARGS){
     if (s->i >= s->n) SRF_RETURN_DONE(fx);
     Datum v[2]; bool nl[2] = { false, false }; v[0] = id_datum(&s->id[s->i]); v[1] = Int64GetDatum((int64)s->times[s->i]); s->i++;
     SRF_RETURN_NEXT(fx, HeapTupleGetDatum(heap_form_tuple(fx->tuple_desc, v, nl)));
+}
+
+static int path_sel_array_len(Node *other, bool *is_null_const)
+{
+    *is_null_const = false;
+    if (!other) return 2;
+    if (IsA(other, Const)) {
+        Const *c = (Const *)other;
+        if (c->constisnull) { *is_null_const = true; return 0; }
+        if (!c->constbyval && get_element_type(c->consttype) != InvalidOid) {
+            ArrayType *a = DatumGetArrayTypeP(c->constvalue);
+            int n = ArrayGetNItems(ARR_NDIM(a), ARR_DIMS(a));
+            return (n >= 0 && n <= 1000) ? n : 2;
+        }
+        return 1;
+    }
+    if (IsA(other, ArrayExpr)) {
+        int n = list_length(((ArrayExpr *)other)->elements);
+        return (n >= 0 && n <= 1000) ? n : 2;
+    }
+    return 2;
+}
+
+static inline float8 clamp_sel(float8 v, float8 lo, float8 hi)
+{
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    CLAMP_PROBABILITY(v);
+    return v;
+}
+
+PG_FUNCTION_INFO_V1(laplace_path_sel);
+Datum laplace_path_sel(PG_FUNCTION_ARGS)
+{
+    PlannerInfo *root = (PlannerInfo *)PG_GETARG_POINTER(0);
+    Oid operatorid = PG_GETARG_OID(1);
+    List *args = (List *)PG_GETARG_POINTER(2);
+    int varRelid = PG_GETARG_INT32(3);
+
+    VariableStatData vardata;
+    Node *other = NULL;
+    bool varonleft = true;
+    bool has_var = get_restriction_variable(root, args, varRelid, &vardata, &other, &varonleft);
+    bool is_null = false;
+    int k = path_sel_array_len(other, &is_null);
+    double tuples = (has_var && vardata.rel && vardata.rel->tuples > 100.0) ? vardata.rel->tuples : 1e6;
+    if (has_var) ReleaseVariableStats(vardata);
+    if (is_null) PG_RETURN_FLOAT8(0.0);
+
+    char *opname = get_opname(operatorid);
+    float8 sel = 0.005;
+    if (opname) {
+        if (strcmp(opname, "@^") == 0 || strcmp(opname, "^@") == 0) {
+            sel = clamp_sel(50.0 / Max(tuples, 100.0), 1e-6, 0.005);
+        } else if (strcmp(opname, "@>") == 0) {
+            int kk = Min(Max(k, 1), 8);
+            sel = clamp_sel(pow(0.05, (double)kk) * 0.01, 1e-6, 0.005);
+        } else if (strcmp(opname, "&&") == 0) {
+            int kk = Max(k, 1);
+            sel = clamp_sel(0.001 * (double)kk, 1e-4, 0.25);
+        }
+        pfree(opname);
+    }
+    PG_RETURN_FLOAT8(sel);
+}
+
+PG_FUNCTION_INFO_V1(laplace_path_joinsel);
+Datum laplace_path_joinsel(PG_FUNCTION_ARGS)
+{
+    Oid operatorid = PG_GETARG_OID(1);
+    char *opname = get_opname(operatorid);
+    float8 sel = 0.002;
+    if (opname) {
+        if (strcmp(opname, "@^") == 0 || strcmp(opname, "^@") == 0 || strcmp(opname, "@>") == 0)
+            sel = 0.0005;
+        else if (strcmp(opname, "&&") == 0)
+            sel = 0.002;
+        pfree(opname);
+    }
+    PG_RETURN_FLOAT8(sel);
 }

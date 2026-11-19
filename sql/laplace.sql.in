@@ -125,23 +125,43 @@ CREATE FUNCTION @extschema@.laplace_angular4d_gist_distance(internal, @extschema
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_angular4d_gist_distance';
 
+CREATE FUNCTION @extschema@.laplace_srf_support(internal) RETURNS internal
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_srf_support';
+
+CREATE FUNCTION @extschema@.laplace_path_sel(internal, oid, internal, integer) RETURNS double precision
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_sel';
+
+CREATE FUNCTION @extschema@.laplace_path_joinsel(internal, oid, internal, smallint, internal) RETURNS double precision
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_joinsel';
+
+CREATE FUNCTION @extschema@.laplace_mask_sel(internal, oid, internal, integer) RETURNS double precision
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_sel';
+
+CREATE FUNCTION @extschema@.laplace_mask_joinsel(internal, oid, internal, smallint, internal) RETURNS double precision
+    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_mask_joinsel';
+
 CREATE FUNCTION @extschema@.laplace_attested(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_attested';
 
 CREATE FUNCTION @extschema@.laplace_attested(claims @extschema@.blake3[], include_files boolean, OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_attested';
 
 CREATE FUNCTION @extschema@.laplace_attested_series(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT trust double precision, OUT witness boolean, OUT dependence_root @extschema@.blake3) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_attested_series';
 
 CREATE FUNCTION @extschema@.laplace_attribution(claims @extschema@.blake3[], OUT claim @extschema@.blake3, OUT trunk @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT trust double precision, OUT share_bp integer) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_attribution';
 
@@ -162,17 +182,17 @@ CREATE FUNCTION @extschema@.laplace_centroid4d_step(internal, @extschema:postgis
     AS 'MODULE_PATHNAME', 'laplace_centroid4d_step';
 
 CREATE FUNCTION @extschema@.laplace_claims(parts @extschema@.blake3[], fan bigint, bits smallint[], refuse @extschema@.blake3[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
-    LANGUAGE c STABLE ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_claims';
 
 CREATE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[], fan bigint, bits smallint[], refuse @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
-    LANGUAGE c STABLE ROWS 1024 PARALLEL SAFE
+    LANGUAGE c STABLE ROWS 1024 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_claims_each';
 
 CREATE FUNCTION @extschema@.laplace_chess_at(section text, slots integer[], OUT ordinal integer, OUT id @extschema@.blake3) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_chess_at';
 
 CREATE FUNCTION @extschema@.laplace_chess_fingerprint() RETURNS text
@@ -180,11 +200,11 @@ CREATE FUNCTION @extschema@.laplace_chess_fingerprint() RETURNS text
     AS 'MODULE_PATHNAME', 'laplace_chess_fingerprint';
 
 CREATE FUNCTION @extschema@.laplace_chess_next(positions @extschema@.blake3[], moves @extschema@.blake3[], OUT ordinal integer, OUT next @extschema@.blake3) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_chess_next';
 
 CREATE FUNCTION @extschema@.laplace_chess_records_ewkb(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord bytea, OUT hilbert bigint) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_chess_records_ewkb';
 
 CREATE FUNCTION @extschema@.laplace_chess_records(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord @extschema:postgis@.geometry, OUT hilbert bigint) RETURNS SETOF record
@@ -212,17 +232,17 @@ CREATE FUNCTION @extschema@.laplace_confidence(rating double precision, deviatio
     AS 'MODULE_PATHNAME', 'laplace_confidence';
 
 CREATE FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[], OUT trunk @extschema@.blake3, OUT claim @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT dependence_root @extschema@.blake3, OUT dependence_trust double precision) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_contained_series';
 
 CREATE FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[], claims @extschema@.blake3[], OUT trunk @extschema@.blake3, OUT claim @extschema@.blake3, OUT games double precision, OUT tokens double precision, OUT score double precision, OUT "position" integer, OUT dependence_root @extschema@.blake3, OUT dependence_trust double precision) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_contained_series';
 
 CREATE FUNCTION @extschema@.laplace_containers(parts @extschema@.blake3[], bits smallint[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bit) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_containers';
 
@@ -237,12 +257,12 @@ CREATE FUNCTION @extschema@.laplace_coord(text) RETURNS @extschema:postgis@.geom
 END;
 
 CREATE FUNCTION @extschema@.laplace_couple(occ @extschema@.blake3[], fan bigint, refuse @extschema@.blake3[], shape smallint, shape_n double precision, keep integer, OUT entity @extschema@.blake3, OUT occ integer, OUT route smallint, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT via @extschema@.blake3, OUT rel @extschema@.blake3, OUT tier smallint, OUT distance double precision, OUT vertices @extschema@.blake3[]) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 4096 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 4096 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_couple';
 
 CREATE FUNCTION @extschema@.laplace_curves(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT curve_ewkb bytea) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_curves';
 
 CREATE FUNCTION @extschema@.laplace_cp_coord_ewkb(integer) RETURNS bytea
@@ -286,7 +306,7 @@ CREATE FUNCTION @extschema@.laplace_enrich_stage(input regclass, target regclass
     AS 'MODULE_PATHNAME', 'laplace_enrich_stage';
 
 CREATE FUNCTION @extschema@.laplace_fills(keys @extschema@.blake3[], OUT entity @extschema@.blake3, OUT id @extschema@.blake3, OUT times bigint, OUT tier smallint) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 256 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_fills';
 
@@ -303,7 +323,7 @@ CREATE FUNCTION @extschema@.laplace_follows(@extschema:postgis@.geometry, @extsc
     AS 'MODULE_PATHNAME', 'laplace_follows';
 
 CREATE FUNCTION @extschema@.laplace_forward(ids @extschema@.blake3[], fan bigint, OUT i integer, OUT j integer, OUT paths bigint, OUT runs bigint, OUT next @extschema@.blake3, OUT times bigint) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    LANGUAGE c STABLE STRICT SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_forward';
 
@@ -316,7 +336,7 @@ CREATE FUNCTION @extschema@.laplace_frechet4d(@extschema:postgis@.geometry, @ext
     AS 'MODULE_PATHNAME', 'laplace_frechet4d_outliers';
 
 CREATE FUNCTION @extschema@.laplace_function_bindings(OUT symbol text, OUT sql_scope boolean) RETURNS SETOF record
-    LANGUAGE c IMMUTABLE PARALLEL SAFE
+    LANGUAGE c IMMUTABLE SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_function_bindings';
 
 CREATE FUNCTION @extschema@.laplace_gin_consistent(internal, smallint, @extschema@.blake3[], integer, internal, internal, internal, internal) RETURNS boolean
@@ -356,13 +376,16 @@ CREATE FUNCTION @extschema@.laplace_hilbert_ranges_flat(@extschema:postgis@.geom
     AS 'MODULE_PATHNAME', 'laplace_hilbert_ranges_flat';
 
 CREATE FUNCTION @extschema@.laplace_hilbert_ranges(lo @extschema:postgis@.geometry, hi @extschema:postgis@.geometry, budget integer DEFAULT 64) RETURNS TABLE(lo bigint, hi bigint)
-    LANGUAGE sql IMMUTABLE STRICT ROWS 64 PARALLEL SAFE
-    BEGIN ATOMIC
- SELECT s.f[((2 * i.i) - 1)] AS f,
-     s.f[(2 * i.i)] AS f
-    FROM ( SELECT @extschema@.laplace_hilbert_ranges_flat(laplace_hilbert_ranges.lo, laplace_hilbert_ranges.hi, laplace_hilbert_ranges.budget) AS f) s,
-     LATERAL generate_series(1, (COALESCE(array_length(s.f, 1), 0) / 2)) i(i);
-END;
+    LANGUAGE c IMMUTABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert_ranges';
+
+CREATE FUNCTION @extschema@.laplace_hilbert_ball_ranges_flat(@extschema:postgis@.geometry, double precision, integer) RETURNS bigint[]
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert_ball_ranges_flat';
+
+CREATE FUNCTION @extschema@.laplace_hilbert_ball_ranges(center @extschema:postgis@.geometry, radius double precision, budget integer DEFAULT 64) RETURNS TABLE(lo bigint, hi bigint)
+    LANGUAGE c IMMUTABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_hilbert_ball_ranges';
 
 CREATE FUNCTION @extschema@.laplace_id(text) RETURNS @extschema@.blake3
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
@@ -385,7 +408,7 @@ CREATE FUNCTION @extschema@.laplace_isa() RETURNS text
     AS 'MODULE_PATHNAME', 'laplace_isa';
 
 CREATE FUNCTION @extschema@.laplace_labels(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    LANGUAGE c STABLE STRICT SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_labels';
 
@@ -450,7 +473,7 @@ CREATE FUNCTION @extschema@.laplace_parts(text) RETURNS @extschema@.blake3[]
     AS 'MODULE_PATHNAME', 'laplace_parts';
 
 CREATE FUNCTION @extschema@.laplace_segments(text, OUT i bigint, OUT segment text, OUT id @extschema@.blake3) RETURNS SETOF record
-    LANGUAGE c IMMUTABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c IMMUTABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_segments';
 
 CREATE FUNCTION @extschema@.laplace_path_ewkb(@extschema@.blake3[]) RETURNS bytea
@@ -496,11 +519,8 @@ CREATE FUNCTION @extschema@.laplace_path_enrich_ewkb(recorded @extschema:postgis
     AS 'MODULE_PATHNAME', 'laplace_path_enrich_ewkb';
 
 CREATE FUNCTION @extschema@.laplace_path_enrich(recorded @extschema:postgis@.geometry, incoming @extschema:postgis@.geometry) RETURNS @extschema:postgis@.geometry
-    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
-    BEGIN ATOMIC
- SELECT @extschema:postgis@.st_setsrid(@extschema:postgis@.st_geomfromewkb(@extschema@.laplace_path_enrich_ewkb(recorded, incoming)), @extschema:postgis@.st_srid(recorded)) AS st_setsrid
-   WHERE (@extschema:postgis@.st_srid(recorded) = @extschema:postgis@.st_srid(incoming));
-END;
+    LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_path_enrich';
 
 CREATE FUNCTION @extschema@.laplace_path_length(@extschema:postgis@.geometry) RETURNS bigint
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
@@ -515,11 +535,11 @@ CREATE FUNCTION @extschema@.laplace_path_starts(@extschema:postgis@.geometry, @e
     AS 'MODULE_PATHNAME', 'laplace_path_starts';
 
 CREATE FUNCTION @extschema@.laplace_path_times(@extschema:postgis@.geometry, @extschema@.blake3[], OUT id @extschema@.blake3, OUT times bigint) RETURNS SETOF record
-    LANGUAGE c IMMUTABLE STRICT COST 1000 ROWS 4 PARALLEL SAFE
+    LANGUAGE c IMMUTABLE STRICT COST 1000 ROWS 4 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_path_times';
 
 CREATE FUNCTION @extschema@.laplace_paths(ids @extschema@.blake3[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT ROWS 64 PARALLEL SAFE
+    LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_paths';
 
@@ -560,12 +580,12 @@ CREATE FUNCTION @extschema@.laplace_point4d_gist_union(internal, internal) RETUR
     AS 'MODULE_PATHNAME', 'laplace_point4d_gist_union';
 
 CREATE FUNCTION @extschema@.laplace_present_ids(ids @extschema@.blake3[], OUT id @extschema@.blake3, OUT ordinal bigint) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    LANGUAGE c STABLE STRICT SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_present_ids';
 
 CREATE FUNCTION @extschema@.laplace_present_stage(input regclass, target regclass, id_column name, present_column name, OUT id @extschema@.blake3, OUT ordinal bigint) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT
+    LANGUAGE c STABLE STRICT SUPPORT @extschema@.laplace_srf_support
 
     AS 'MODULE_PATHNAME', 'laplace_present_stage';
 
@@ -586,7 +606,7 @@ CREATE FUNCTION @extschema@.laplace_series(roots @extschema@.blake3[], games big
     AS 'MODULE_PATHNAME', 'laplace_series';
 
 CREATE FUNCTION @extschema@.laplace_series_snapshot(pending regclass, changed @extschema@.blake3[] DEFAULT NULL::@extschema@.blake3[], OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
-    LANGUAGE c STABLE
+    LANGUAGE c STABLE SUPPORT @extschema@.laplace_srf_support
 
     AS 'MODULE_PATHNAME', 'laplace_series_snapshot';
 
@@ -595,7 +615,7 @@ CREATE FUNCTION @extschema@.laplace_stage_compatible(recorded_id @extschema@.bla
     AS 'MODULE_PATHNAME', 'laplace_stage_compatible';
 
 CREATE FUNCTION @extschema@.laplace_stage_snapshot(pending regclass, changed regclass, OUT claim @extschema@.blake3, OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
-    LANGUAGE c STABLE
+    LANGUAGE c STABLE SUPPORT @extschema@.laplace_srf_support
 
     AS 'MODULE_PATHNAME', 'laplace_series_snapshot';
 
@@ -605,7 +625,7 @@ CREATE FUNCTION @extschema@.laplace_text(@extschema@.blake3) RETURNS text
     AS 'MODULE_PATHNAME', 'laplace_text';
 
 CREATE FUNCTION @extschema@.laplace_text_batch(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) RETURNS SETOF record
-    LANGUAGE c STABLE STRICT PARALLEL SAFE
+    LANGUAGE c STABLE STRICT SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_text_batch';
 
@@ -680,8 +700,8 @@ CREATE OPERATOR @extschema@.&& (
     FUNCTION = @extschema@.laplace_path_overlaps,
     LEFTARG = @extschema:postgis@.geometry,
     RIGHTARG = @extschema@.blake3[],
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_path_sel,
+    JOIN = @extschema@.laplace_path_joinsel
 );
 
 CREATE OPERATOR @extschema@.< (
@@ -778,48 +798,48 @@ CREATE OPERATOR @extschema@.? (
     FUNCTION = @extschema@.laplace_mask_has,
     LEFTARG = bit,
     RIGHTARG = smallint,
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_mask_sel,
+    JOIN = @extschema@.laplace_mask_joinsel
 );
 
 CREATE OPERATOR @extschema@.?& (
     FUNCTION = @extschema@.laplace_mask_has_all,
     LEFTARG = bit,
     RIGHTARG = smallint[],
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_mask_sel,
+    JOIN = @extschema@.laplace_mask_joinsel
 );
 
 CREATE OPERATOR @extschema@.?| (
     FUNCTION = @extschema@.laplace_mask_has_any,
     LEFTARG = bit,
     RIGHTARG = smallint[],
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_mask_sel,
+    JOIN = @extschema@.laplace_mask_joinsel
 );
 
 CREATE OPERATOR @extschema@.@> (
     FUNCTION = @extschema@.laplace_path_contains,
     LEFTARG = @extschema:postgis@.geometry,
     RIGHTARG = @extschema@.blake3[],
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_path_sel,
+    JOIN = @extschema@.laplace_path_joinsel
 );
 
 CREATE OPERATOR @extschema@.@^ (
     FUNCTION = @extschema@.laplace_path_ends,
     LEFTARG = @extschema:postgis@.geometry,
     RIGHTARG = @extschema@.blake3,
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_path_sel,
+    JOIN = @extschema@.laplace_path_joinsel
 );
 
 CREATE OPERATOR @extschema@.^@ (
     FUNCTION = @extschema@.laplace_path_starts,
     LEFTARG = @extschema:postgis@.geometry,
     RIGHTARG = @extschema@.blake3,
-    RESTRICT = contsel,
-    JOIN = contjoinsel
+    RESTRICT = @extschema@.laplace_path_sel,
+    JOIN = @extschema@.laplace_path_joinsel
 );
 
 CREATE OPERATOR FAMILY @extschema@.blake3_hash_ops USING hash;
@@ -966,7 +986,7 @@ CREATE TABLE @extschema@.entity (
     mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
     CONSTRAINT entity_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
 )
-PARTITION BY RANGE (id);
+PARTITION BY RANGE (tier);
 
 CREATE TABLE @extschema@.physicality (
     entity @extschema@.blake3 NOT NULL,
@@ -976,7 +996,7 @@ CREATE TABLE @extschema@.physicality (
     mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
     CONSTRAINT physicality_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
 )
-PARTITION BY RANGE (entity);
+PARTITION BY RANGE (tier);
 
 CREATE TABLE @extschema@.attestation (
     claim @extschema@.blake3 NOT NULL,
@@ -1000,10 +1020,10 @@ CREATE TABLE @extschema@.consensus (
 PARTITION BY RANGE (claim);
 
 ALTER TABLE @extschema@.entity
-    ADD CONSTRAINT entity_pkey PRIMARY KEY (id);
+    ADD CONSTRAINT entity_pkey PRIMARY KEY (tier, id);
 
 ALTER TABLE @extschema@.physicality
-    ADD CONSTRAINT physicality_pkey PRIMARY KEY (entity);
+    ADD CONSTRAINT physicality_pkey PRIMARY KEY (tier, entity);
 
 ALTER TABLE @extschema@.attestation
     ADD CONSTRAINT attestation_pkey UNIQUE NULLS NOT DISTINCT (claim, witness, lineage);
@@ -1014,12 +1034,14 @@ ALTER TABLE @extschema@.consensus
 DO $partitions$
 DECLARE i integer; lo text; hi text; suffix text;
 BEGIN
- FOR i IN 0..255 LOOP
-  suffix:=pg_catalog.lpad(pg_catalog.to_hex(i),2,'0');
-  lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE pg_catalog.quote_literal(suffix||pg_catalog.repeat('0',30)) END;
-  hi:=CASE WHEN i=255 THEN 'MAXVALUE' ELSE pg_catalog.quote_literal(pg_catalog.lpad(pg_catalog.to_hex(i+1),2,'0')||pg_catalog.repeat('0',30)) END;
+ FOR i IN 0..8 LOOP
+  suffix:=CASE WHEN i=8 THEN 't8plus' ELSE 't'||i::text END;
+  lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE i::text END;
+  hi:=CASE WHEN i=8 THEN 'MAXVALUE' ELSE (i+1)::text END;
   EXECUTE pg_catalog.format('CREATE TABLE @extschema@.entity_%s PARTITION OF @extschema@.entity FOR VALUES FROM (%s) TO (%s)',suffix,lo,hi);
+  EXECUTE pg_catalog.format('CREATE UNIQUE INDEX entity_%s_id_key ON @extschema@.entity_%s (id)',suffix,suffix);
   EXECUTE pg_catalog.format('CREATE TABLE @extschema@.physicality_%s PARTITION OF @extschema@.physicality FOR VALUES FROM (%s) TO (%s) WITH (parallel_workers=0)',suffix,lo,hi);
+  EXECUTE pg_catalog.format('CREATE UNIQUE INDEX physicality_%s_entity_key ON @extschema@.physicality_%s (entity)',suffix,suffix);
  END LOOP;
  FOR i IN 0..15 LOOP
   suffix:=pg_catalog.to_hex(i);
@@ -1030,7 +1052,7 @@ BEGIN
  END LOOP;
 END $partitions$;
 ALTER TABLE @extschema@.physicality ALTER COLUMN path SET STATISTICS 0;
-ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(entity) REFERENCES @extschema@.entity(id);
+ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(tier, entity) REFERENCES @extschema@.entity(tier, id) ON UPDATE CASCADE;
 DO $dump_content$
 DECLARE item record;
 BEGIN
@@ -1094,5 +1116,7 @@ COMMENT ON FUNCTION @extschema@.laplace_text_id(text) IS 'Canonical Native UAX #
 COMMENT ON FUNCTION @extschema@.laplace_text_id(bytea) IS 'The same composition of UTF-8 content given as bytes, which carries U+0000 where text cannot. Empty, malformed or noncanonical UTF-8 returns NULL.';
 
 COMMENT ON FUNCTION @extschema@.laplace_text_is(text, text, text) IS 'Whether every codepoint of the text has the Unicode property value (laplace_is per codepoint), e.g. White_Space Yes for a text of white space only. Empty text returns NULL.';
+
+COMMENT ON FUNCTION @extschema@.laplace_hilbert_ball_ranges(center @extschema:postgis@.geometry, radius double precision, budget integer) IS '4D Hilbert B-tree ranges pruned simultaneously against the unit 4-ball B^4_1 and the Euclidean 4-ball around center with radius r, coalesced by gap weight inside B^4_1 up to budget ranges.';
 
 COMMENT ON OPERATOR laplace.<-> (@extschema:postgis@.geometry, @extschema:postgis@.geometry) IS 'Native 4D discrete Frechet distance, equal to chord distance for two points. Use OPERATOR(laplace.<->).';

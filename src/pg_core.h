@@ -6,12 +6,11 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/array.h"
+#include "utils/varbit.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "access/tupconvert.h"
-#include "laplace_pg/executor.h"
 #include "laplace/laplace.h"
 #include "laplace/tier0.h"
 #include "laplace/highway.h"
@@ -27,8 +26,11 @@ const lp_highway *lp_pg_highway(void);
 const lp_perfcache *lp_pg_chess(bool required);
 lp_mask lp_pg_mask_native(Datum mask);
 lp_mask lp_pg_kind_mask(const char *role);
+VarBit *lp_pg_mask_sql(lp_mask value);
 bytea *lp_pg_path_export(Datum geometry);
 bytea *lp_pg_path_ewkb(Datum geometry);
+Datum lp_pg_geom_from_ewkb(const uint8 *ewkb, size_t len, int32 srid);
+Datum lp_pg_path_enrich_datum(Datum recorded, Datum incoming);
 lp_id *lp_pg_path_keys(bytea *ewkb, int *n);
 
 typedef struct { lp_id first, last; bool found; } lp_pg_path_ends;
@@ -41,11 +43,6 @@ Oid lp_pg_schema(void);
 Oid lp_pg_relation(const char *name);
 uint64 lp_pg_binding_generation(void);
 char *lp_pg_sql(const char *sql);
-int lp_pg_execute(const char *sql,bool read_only,long count);
-int lp_pg_execute_args(const char *sql,int nargs,Oid *types,Datum *values,const char *nulls,bool read_only,long count);
-SPIPlanPtr lp_pg_prepare_cursor(const char *sql,int nargs,Oid *types,int options);
-typedef lp_pg_executor_visit lp_pg_row_visit;
-void lp_pg_stream(SPIPlanPtr plan,ParamListInfo parameters,lp_pg_row_visit visit,void *context);
 
 /* Complete ID-addressed path frontier. Native range routing and primary
  * indexes retain ascending ID order without sorting geometry in SQL. */
@@ -55,6 +52,7 @@ void lp_pg_lookup_paths(const lp_id *ids,size_t count,bool masks,lp_pg_path_visi
  * lineage is NULL; missing witness IDs produce no callback. */
 typedef void (*lp_pg_witness_visit)(const lp_id *id,const lp_id *lineage,double trust,void *context);
 void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_witness_visit visit,void *context);
+void lp_pg_scan_all_witnesses(lp_pg_witness_visit visit,void *context);
 /* Complete direct-container frontier through canonical GIN indexes, with
  * PostgreSQL bitmap visibility/lossy rechecks and ascending parent-ID visits. */
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool assertions,lp_pg_path_visit visit,void *context);
@@ -100,8 +98,16 @@ void lp_pg_compute_attested_registry(const lp_id *claims, int n, Oid idarr, int 
                                      void (*testimony)(const void *,const void *,const uint64_t *,size_t,double,void *), void *testimony_context);
 void lp_pg_compute_attested_rows(const lp_id *claims, int n, Oid idarr, int witnessed_only,
                                  int include_files, const lp_idmap *roots, const lp_idmap *known_witnesses, PgAttrRows *out);
+typedef struct {
+    lp_id trunk, claim, dependence_root;
+    double games, tokens, score, dependence_trust;
+    int32 position;
+    bool has_dependence;
+} PgContainedSeriesRow;
+typedef lp_vec(PgContainedSeriesRow) PgContainedSeriesRows;
+void lp_pg_contained_series(const lp_id *roots, int nroots, PgContainedSeriesRows *out);
 void lp_pg_read_attestation_rows(const lp_id *claims, int n, const lp_idmap *roots, PgAttrRows *out, lp_idmap *witnesses);
-void lp_pg_read_attestation_stage(const char *selection, PgAttrRows *out, lp_idmap *witnesses);
+void lp_pg_read_attestation_stage(Oid selection_relid, PgAttrRows *out, lp_idmap *witnesses);
 void lp_pg_attested_unstored(const lp_id *claims, int n, Oid idarr, int include_files, PgAttrRows *rows, lp_idmap *registry);
 
 /* The live parameter buffers and the actual PostgreSQL array boundary size
@@ -197,4 +203,33 @@ static inline TupleConversionMap *lp_pg_tuple_conversion(TupleDesc child, TupleD
     }
     return convert_tuples_by_name(child, parent);
 }
+
+/* Direct-AM canonical partition/index cache & batch access primitives (zero SPI). */
+int lp_pg_canonical_partitions(const char *relname, const Oid **parts, const Oid **pks, const Oid **aux, const Oid **aux2);
+int lp_pg_canonical_tier_bounds(const char *relname, const int16 **min_tiers, const int16 **max_tiers);
+typedef void (*lp_pg_entity_coord_visit)(int64 ordinal, const lp_id *id, int16 tier, Datum coord, int64 hilbert, void *context);
+void lp_pg_lookup_entity_coords(const lp_id *ids, size_t count, lp_pg_entity_coord_visit visit, void *context);
+void lp_pg_lookup_entity_tiers(const lp_id *ids, size_t count, int16 *tiers);
+void lp_pg_read_attestation_pk(const lp_id *claims, int n, const lp_idmap *roots, PgAttrRows *out, lp_idmap *witnesses);
+
+typedef struct { lp_id id; int16 tier; Datum coord; double distance; } PgKnnHit;
+int lp_pg_knn4d(const double query[4], int k, bool angular, int16 min_tier, bool has_max_tier, int16 max_tier, const lp_id *exclude_id, PgKnnHit *out, MemoryContext result_ctx);
+
+typedef struct { int64 ordinal; lp_id entity; Datum path; int16 tier; int16 kind; bool hub; } PgHolderHit;
+typedef void (*lp_pg_holder_visit)(const PgHolderHit *hit, void *context);
+void lp_pg_holders_direct(const lp_id *ids, int count, const lp_id *required, int nrequired,
+                          bool per_part, int16 floor, int64 cap, int16 kinds,
+                          lp_mask bits, int16 endpoint, lp_pg_holder_visit visit, void *context);
+
+typedef struct {
+    int64 i; lp_id entity; Datum path;
+    double rating, deviation, volatility; int64 matches;
+} PgClaimHit;
+typedef void (*lp_pg_claim_visit)(const PgClaimHit *hit, void *context);
+void lp_pg_claims_each_direct(const lp_id *ids, int count, int64 fan, lp_mask bits,
+                              const lp_id *refuse, int nrefuse, int16 endpoint,
+                              const lp_id *include, int ninclude, int64 arity,
+                              const lp_id *opposite, int nopposite,
+                              lp_pg_claim_visit visit, void *context);
+void lp_pg_truncate_rel(Oid rel1, Oid rel2);
 #endif

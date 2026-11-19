@@ -113,28 +113,95 @@ file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/laplace_current_api.h" CONTENT
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/operations.sql")
 file(READ "${_sql_root}/path_set_match.sql" _path_set_match)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_sql_root}/path_set_match.sql")
-# Greenfield until something is deployed: one install script and no update paths; a database holding
-# another version of the extension is recreated. The version is the content hash of that script, so any change to
-# what CREATE EXTENSION declares is another version: a fixed number would leave a database made from an earlier
-# script holding it, without the functions and tables the installed module and its callers now expect.
+# Storage layout versioning: hash only the storage type and persistent partitioned table DDL
+# (not function signatures or operators) so adding or fixing SQL/C functions never forces a
+# storage-incompatible database recreate.
 set(_input "${_sql_root}/laplace.sql.in")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_input}")
-file(READ "${_input}" _sql)
+file(READ "${_input}" _storage_template)
+string(FIND "${_storage_template}" "-- Canonical retained content;" _storage_tbl_begin)
+string(FIND "${_storage_template}" "-- @laplace_api@" _storage_tbl_end)
+if(_storage_tbl_begin LESS 0 OR _storage_tbl_end LESS _storage_tbl_begin)
+  message(FATAL_ERROR "Unable to locate canonical storage DDL section in ${_input}")
+endif()
+math(EXPR _storage_tbl_len "${_storage_tbl_end} - ${_storage_tbl_begin}")
+string(SUBSTRING "${_storage_template}" ${_storage_tbl_begin} ${_storage_tbl_len} _storage_ddl)
+string(REGEX MATCH "CREATE TYPE @extschema@\\.blake3 \\([^;]*\\);" _storage_b3_type "${_storage_template}")
+string(SHA256 _storage_version "${_storage_b3_type}\n${_storage_ddl}")
+string(SUBSTRING "${_storage_version}" 0 16 _storage_version)
+set(_sql "${_storage_template}")
 string(REPLACE "-- @laplace_path_set_match@" "${_path_set_match}" _sql "${_sql}")
 string(REPLACE "-- @laplace_operations@" "${_operations}" _sql "${_sql}")
 string(REPLACE "-- @laplace_api@" "${_api}" _sql "${_sql}")
+string(APPEND _sql "\nCOMMENT ON TABLE @extschema@.entity IS 'laplace-storage:${_storage_version}';\n")
 string(SHA256 _current_version "${_sql}")
 string(SUBSTRING "${_current_version}" 0 16 _current_version)
+set(_reconcile_sql
+  "-- Reconcile replaceable Laplace objects without touching storage tables.\n${_path_set_match}\n${_api}\n${_operations}\nDO $stamp$\nDECLARE ext_ns text;\nBEGIN\n  SELECT n.nspname INTO ext_ns FROM pg_catalog.pg_extension e JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'laplace';\n  IF ext_ns IS NOT NULL AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = ext_ns AND c.relname = 'entity') = 'r:9' THEN\n    EXECUTE pg_catalog.format('COMMENT ON TABLE %I.entity IS %L', ext_ns, 'laplace-storage:${_storage_version}');\n  END IF;\nEND $stamp$;\nSELECT @extschema@.laplace_restore_function_bindings();\n")
+string(CONCAT _verify_storage_sql
+  "SELECT CASE\n"
+  "  WHEN ext.ns IS NULL THEN 'missing'\n"
+  "  WHEN pg_catalog.obj_description(pg_catalog.to_regclass(ext.ns || '.entity'), 'pg_class') = 'laplace-storage:${_storage_version}' THEN 'ok'\n"
+  "  WHEN pg_catalog.to_regclass(ext.ns || '.entity') IS NOT NULL\n"
+  "    AND (pg_catalog.obj_description(pg_catalog.to_regclass(ext.ns || '.entity'), 'pg_class') IS NULL\n"
+  "         OR pg_catalog.obj_description(pg_catalog.to_regclass(ext.ns || '.entity'), 'pg_class') LIKE 'laplace-storage:%')\n"
+  "    AND EXISTS (SELECT 1 FROM pg_catalog.pg_type t WHERE t.typnamespace = ext.nsoid AND t.typname = 'blake3' AND t.typlen = 16)\n"
+  "    AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)\n"
+  "         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'entity') IN ('r:9', 'r:256')\n"
+  "    AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY a.attnum)\n"
+  "         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'entity' AND a.attnum > 0 AND NOT a.attisdropped) = 'id,tier,coord,hilbert,mask'\n"
+  "    AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)\n"
+  "         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'physicality') IN ('r:9', 'r:256')\n"
+  "    AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY a.attnum)\n"
+  "         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'physicality' AND a.attnum > 0 AND NOT a.attisdropped) = 'entity,tier,hilbert,path,mask'\n"
+  "    AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)\n"
+  "         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'attestation') = 'r:16'\n"
+  "    AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY a.attnum)\n"
+  "         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'attestation' AND a.attnum > 0 AND NOT a.attisdropped) = 'claim,witness,lineage,games,tokens,score,position,trust'\n"
+  "    AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)\n"
+  "         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'consensus') = 'r:16'\n"
+  "    AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY a.attnum)\n"
+  "         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'consensus' AND a.attnum > 0 AND NOT a.attisdropped) = 'claim,rating,deviation,volatility,matches'\n"
+  "  THEN 'ok'\n"
+  "  ELSE 'incompatible'\n"
+  "END\n"
+  "FROM (VALUES (1)) AS _v(dummy)\n"
+  "LEFT JOIN LATERAL (\n"
+  "  SELECT e.extnamespace AS nsoid, n.nspname AS ns\n"
+  "  FROM pg_catalog.pg_extension e\n"
+  "  JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace\n"
+  "  WHERE e.extname = 'laplace'\n"
+  ") ext ON true;\n")
 file(GENERATE OUTPUT "${_module_package}" CONTENT
   "set(MODULE [==[$<TARGET_FILE:laplace_pg>]==])\nset(CONTROL [==[${CMAKE_CURRENT_SOURCE_DIR}/laplace.control]==])\nset(VERSION [==[${_current_version}]==])\nset(OUTPUT [==[${_sql_output}]==])\nset(OVERRIDE [==[${LAPLACE_PG_MODULE_PATHNAME}]==])\ninclude([==[${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageModule.cmake]==])\n")
 add_custom_command(TARGET laplace_pg POST_BUILD COMMAND ${CMAKE_COMMAND} -P "${_module_package}" VERBATIM)
+function(_laplace_write_if_changed path content)
+  set(_existing "")
+  if(EXISTS "${path}")
+    file(READ "${path}" _existing)
+  endif()
+  if(NOT EXISTS "${path}" OR NOT "${_existing}" STREQUAL "${content}")
+    file(WRITE "${path}" "${content}")
+  endif()
+endfunction()
 set(LAPLACE_EXTENSION_SQL "${_sql_output}/laplace--${_current_version}.sql")
-set(_installed_sql "")
-if(EXISTS "${LAPLACE_EXTENSION_SQL}")
-  file(READ "${LAPLACE_EXTENSION_SQL}" _installed_sql)
-endif()
-if(NOT EXISTS "${LAPLACE_EXTENSION_SQL}" OR NOT "${_installed_sql}" STREQUAL "${_sql}")
-  file(WRITE "${LAPLACE_EXTENSION_SQL}" "${_sql}")
+set(LAPLACE_RECONCILE_SQL "${_sql_output}/laplace.reconcile.sql")
+set(LAPLACE_VERIFY_STORAGE_SQL "${_sql_output}/laplace.verify-storage.sql")
+_laplace_write_if_changed("${LAPLACE_EXTENSION_SQL}" "${_sql}")
+_laplace_write_if_changed("${LAPLACE_RECONCILE_SQL}" "${_reconcile_sql}")
+_laplace_write_if_changed("${LAPLACE_VERIFY_STORAGE_SQL}" "${_verify_storage_sql}")
+if(EXISTS "${_sql_output}/laplace.control")
+  file(READ "${_sql_output}/laplace.control" _existing_control)
+  string(REGEX REPLACE "default_version = '[^']*'" "default_version = '${_current_version}'" _updated_control "${_existing_control}")
+  _laplace_write_if_changed("${_sql_output}/laplace.control" "${_updated_control}")
 endif()
 file(GLOB _previous_sql "${_sql_output}/laplace--*.sql")
 foreach(_previous IN LISTS _previous_sql)
@@ -158,7 +225,7 @@ if(WIN32)
 else()
   install(TARGETS laplace_pg LIBRARY DESTINATION ${LAPLACE_PG_INSTALL_LIBDIR})
 endif()
-install(FILES "${_sql_output}/laplace.control" ${LAPLACE_EXTENSION_SQL} DESTINATION ${LAPLACE_PG_INSTALL_SHAREDIR})
+install(FILES "${_sql_output}/laplace.control" ${LAPLACE_EXTENSION_SQL} "${LAPLACE_RECONCILE_SQL}" "${LAPLACE_VERIFY_STORAGE_SQL}" DESTINATION ${LAPLACE_PG_INSTALL_SHAREDIR})
 
 if(PROJECT_IS_TOP_LEVEL)
   enable_testing()

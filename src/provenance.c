@@ -3,7 +3,13 @@
 #include "pg_core.h"
 #include "geo.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/relscan.h"
 #include "access/htup_details.h"
+#include "utils/acl.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/snapmgr.h"
 #include "laplace/highway.h"
 #include "laplace/geometry.h"
 #include "laplace/consensus.h"
@@ -214,6 +220,63 @@ static void pg_root_frontier_row(const lp_id *id,Datum path,Datum mask,void *con
 
 /* Restore testimony from persisted trunks without opening their source bytes.
  * Each Native index request is a bounded frontier, never a command per vertex. */
+void lp_pg_contained_series(const lp_id *roots_in, int nroots, PgContainedSeriesRows *out)
+{
+    if (!nroots) return;
+    PgDag d = { lp_idmap_new(), {0}, {0} };
+    lp_idmap *roots = lp_idmap_new(), *front = lp_idmap_new(), *seen = lp_idmap_new();
+    lp_idmap *classes = lp_idmap_sized(sizeof(const lp_trust_class *));
+    PgVertices vertices = {0};
+    for (int i = 0; i < nroots; i++) {
+        lp_idmap_put(roots, roots_in + i, NULL);
+        lp_idmap_put(front, roots_in + i, NULL);
+        pg_dag_node(&d, roots_in + i, NULL);
+    }
+    PgDownFrontier down = { .dag = &d, .seen = seen, .classes = classes, .vertices = &vertices, .floor = lp_pg_tier0() };
+    lp_pg_claim_bind(&down.binding);
+    bool initial = true;
+    while (lp_idmap_count(front)) {
+        lp_idmap *next = lp_idmap_new(); down.front = front; down.next = next;
+        lp_pg_lookup_paths(lp_idmap_keys(front), lp_idmap_count(front), true, pg_down_frontier_row, &down);
+        lp_idmap_free(front); front = next;
+        if (initial) {
+            for (size_t i = 0; i < lp_idmap_count(roots); i++)
+                if (lp_idmap_find(seen, lp_idmap_keys(roots) + i) < 0)
+                    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_contained_series: root has no stored path")));
+            initial = false;
+        }
+    }
+    MemoryContextDelete(down.binding.context);
+    lp_idmap_free(front); lp_vec_free(&vertices); lp_idmap_free(classes);
+    for (size_t i = 0; i < d.e.n; i++) if (!d.n.v[d.e.v[i].c].claim) d.e.v[i].claim = 0;
+    PgDown walk = pg_down_prepare(&d);
+    for (size_t i = 0; i < lp_idmap_count(roots); i++) {
+        const lp_id *root = lp_idmap_keys(roots) + i;
+        size_t top = (size_t)lp_idmap_find(d.m, root);
+        size_t found = pg_down_from(&d, &walk, top);
+        lp_strmap *per_claim = lp_strmap_sized(sizeof(PgTally));
+        pg_tally_under(&d, &walk, found, per_claim); pg_down_done(&walk, found);
+        for (size_t j = 0; j < lp_strmap_count(per_claim); j++) {
+            const PgTally *t = lp_strmap_at(per_claim, j); if (t->t.games <= 0) continue;
+            PgContainedSeriesRow row = {
+                .trunk = *root,
+                .claim = t->claim,
+                .dependence_root = t->dependence,
+                .games = t->t.games,
+                .tokens = t->t.tokens,
+                .score = t->t.wins,
+                .dependence_trust = t->dependence_trust,
+                .position = (int32)t->t.position,
+                .has_dependence = t->has_dependence != 0
+            };
+            lp_push(out, row);
+        }
+        lp_strmap_free(per_claim);
+    }
+    pg_down_free(&walk);
+    lp_idmap_free(roots); lp_idmap_free(seen); lp_idmap_free(d.m); lp_vec_free(&d.n); lp_vec_free(&d.e);
+}
+
 PG_FUNCTION_INFO_V1(laplace_contained_series);
 Datum laplace_contained_series(PG_FUNCTION_ARGS){
     TupleDesc td; Tuplestorestate *ts=set_begin(fcinfo,"laplace_contained_series",&td);
@@ -228,16 +291,13 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
     }
     if(!n){pfree(ids);lp_idmap_free(selected);PG_RETURN_NULL();}
     Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
-    PgDag d={lp_idmap_new(),{0},{0}};
-    lp_idmap *roots=lp_idmap_new(),*front=lp_idmap_new(),*seen=lp_idmap_new();
-    lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
-    PgVertices vertices={0};
-    for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
-    pfree(ids);
     if(selected){
-        /* An explicit claim set starts from those claims. Prove the supplied
-         * roots once, then use the shared upward kernel directly; there is no
-         * speculative downward graph or cardinality-based fallback. */
+        PgDag d={lp_idmap_new(),{0},{0}};
+        lp_idmap *roots=lp_idmap_new(),*front=lp_idmap_new(),*seen=lp_idmap_new();
+        lp_idmap *classes=lp_idmap_sized(sizeof(const lp_trust_class *));
+        PgVertices vertices={0};
+        for(int i=0;i<n;i++){lp_idmap_put(roots,ids+i,NULL);lp_idmap_put(front,ids+i,NULL);pg_dag_node(&d,ids+i,NULL);}
+        pfree(ids);
         PgRootFrontier probe={&vertices,0};
         lp_pg_lookup_paths(lp_idmap_keys(roots),lp_idmap_count(roots),true,pg_root_frontier_row,&probe);
         if(probe.found!=lp_idmap_count(roots))
@@ -258,47 +318,19 @@ Datum laplace_contained_series(PG_FUNCTION_ARGS){
         lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);
         PG_RETURN_NULL();
     }
-    /* The caller supplies exact IDs. Route and read their primary indexes
-     * directly; a cardinality-dependent SQL join may scan and externally sort
-     * the entire physicality relation for every large frontier. */
-    PgDownFrontier down={.dag=&d,.seen=seen,.classes=classes,.vertices=&vertices,.floor=lp_pg_tier0()};
-    lp_pg_claim_bind(&down.binding);
-    bool initial=true;
-    while(lp_idmap_count(front)){
-        lp_idmap *next=lp_idmap_new();down.front=front;down.next=next;
-        lp_pg_lookup_paths(lp_idmap_keys(front),lp_idmap_count(front),true,pg_down_frontier_row,&down);
-        lp_idmap_free(front);front=next;
-        if(initial){
-            for(size_t i=0;i<lp_idmap_count(roots);i++)
-                if(lp_idmap_find(seen,lp_idmap_keys(roots)+i)<0)
-                    ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("laplace_contained_series: root has no stored path")));
-            initial=false;
-        }
+    PgContainedSeriesRows out={0};
+    lp_pg_contained_series(ids,n,&out);
+    pfree(ids);
+    for(size_t i=0;i<out.n;i++){
+        const PgContainedSeriesRow *r=out.v+i;
+        Datum values[8]={id_datum(&r->trunk),id_datum(&r->claim),Float8GetDatum(r->games),Float8GetDatum(r->tokens),
+            Float8GetDatum(r->score),Int32GetDatum(r->position),
+            r->has_dependence?id_datum(&r->dependence_root):(Datum)0,
+            r->has_dependence?Float8GetDatum(r->dependence_trust):(Datum)0};
+        bool nulls[8]={false,false,false,false,false,false,!r->has_dependence,!r->has_dependence};
+        set_put(fcinfo,ts,td,values,nulls);
     }
-    MemoryContextDelete(down.binding.context);
-    lp_idmap_free(front);lp_vec_free(&vertices);lp_idmap_free(classes);
-    /* Assertion metadata names a claim only when the child's carrier does too.
-     * This is the same admission boundary used by laplace_series_snapshot. */
-    for(size_t i=0;i<d.e.n;i++)if(!d.n.v[d.e.v[i].c].claim)d.e.v[i].claim=0;
-    PgDown walk=pg_down_prepare(&d);
-    for(size_t i=0;i<lp_idmap_count(roots);i++){
-        const lp_id *root=lp_idmap_keys(roots)+i;
-        size_t top=(size_t)lp_idmap_find(d.m,root);
-        size_t found=pg_down_from(&d,&walk,top);lp_strmap *per_claim=lp_strmap_sized(sizeof(PgTally));
-        pg_tally_under(&d,&walk,found,per_claim);pg_down_done(&walk,found);
-        for(size_t j=0;j<lp_strmap_count(per_claim);j++){
-            const PgTally *t=lp_strmap_at(per_claim,j);if(t->t.games<=0)continue;
-            Datum values[8]={id_datum(root),id_datum(&t->claim),Float8GetDatum(t->t.games),Float8GetDatum(t->t.tokens),
-                Float8GetDatum(t->t.wins),Int32GetDatum((int32)t->t.position),
-                t->has_dependence?id_datum(&t->dependence):(Datum)0,
-                t->has_dependence?Float8GetDatum(t->dependence_trust):(Datum)0};
-            bool nulls[8]={false,false,false,false,false,false,!t->has_dependence,!t->has_dependence};
-            set_put(fcinfo,ts,td,values,nulls);
-        }
-        lp_strmap_free(per_claim);
-    }
-    pg_down_free(&walk);
-    lp_idmap_free(selected);lp_idmap_free(roots);lp_idmap_free(seen);lp_idmap_free(d.m);lp_vec_free(&d.n);lp_vec_free(&d.e);
+    lp_vec_free(&out);
     PG_RETURN_NULL();
 }
 
@@ -451,91 +483,44 @@ void lp_pg_compute_attested_rows(const lp_id *claims,int n,Oid idarr,int witness
     lp_pg_compute_attested_registry(claims,n,idarr,witnessed_only,include_files,roots,known_witnesses,out,NULL,NULL,NULL);
 }
 
-typedef struct { PgAttrRows *out; const lp_idmap *roots; lp_idmap *witnesses; } PgAttestedRead;
-static void pg_attested_read_row(TupleTableSlot *slot, void *context)
-{
-    PgAttestedRead *read = context;
-    bool missing; Datum val;
-    PgAttrRow row = { .witness = 1 };
-    val = slot_getattr(slot, 1, &missing);
-    if (missing) ereport(ERROR, (errmsg("laplace attestation: null claim")));
-    memcpy(row.claim.b, DatumGetPointer(val), 16);
-    val = slot_getattr(slot, 2, &missing);
-    if (missing) ereport(ERROR, (errmsg("laplace attestation: null witness")));
-    memcpy(row.trunk.b, DatumGetPointer(val), 16);
-    if (read->roots && lp_idmap_find(read->roots, &row.trunk) < 0) return;
-    val = slot_getattr(slot, 3, &missing);
-    row.has_dependence = !missing;
-    if (!missing) memcpy(row.dependence.b, DatumGetPointer(val), 16);
-    val = slot_getattr(slot, 4, &missing);
-    int64 games = missing ? 0 : DatumGetInt64(val);
-    val = slot_getattr(slot, 5, &missing);
-    int64 tokens = missing ? games : DatumGetInt64(val);
-    val = slot_getattr(slot, 6, &missing);
-    double mean_score = missing ? 0.0 : DatumGetFloat8(val);
-    val = slot_getattr(slot, 7, &missing);
-    row.position = missing ? 0 : (uint32_t)DatumGetInt32(val);
-    val = slot_getattr(slot, 8, &missing);
-    row.trust = missing ? 0.0 : DatumGetFloat8(val);
-    row.source_trust = row.trust;
-    row.games = (double)games;
-    row.tokens = (double)(tokens >= games ? tokens : games);
-    row.score = (double)games * mean_score;
-    if (read->witnesses) {
-        bool fresh;
-        PgSeriesWitness *w = lp_idmap_get(read->witnesses, &row.trunk, &fresh);
-        if (fresh || !row.has_dependence) {
-            w->trust = row.trust;
-            w->has_lineage = row.has_dependence;
-            if (row.has_dependence) w->lineage = row.dependence;
-        }
-    }
-    lp_push(read->out, row);
-}
-
 void lp_pg_read_attestation_rows(const lp_id *claims, int n, const lp_idmap *roots, PgAttrRows *out, lp_idmap *witnesses)
 {
     if (n <= 0) return;
-    Oid attestation = lp_pg_relation("attestation");
-    const char *selected[] = {"claim", "witness", "lineage", "games", "tokens", "score", "position", "trust"};
-    const char *column;
-    Relation parent = lp_pg_read_parent(attestation, &column, selected, 8);
-    Oid native_id = get_atttype(attestation, get_attnum(attestation, "claim"));
-    Oid idarray = get_array_type(native_id);
-    table_close(parent, NoLock);
-    PgAttestedRead read = { .out = out, .roots = roots, .witnesses = witnesses };
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_read_attestation_rows: SPI connect failed")));
-    SPIPlanPtr plan = lp_pg_prepare_cursor(
-        "SELECT claim,witness,lineage,games,tokens,score,\"position\",trust FROM @extschema@.attestation WHERE claim OPERATOR(@extschema@.=) ANY($1)",
-        1, &idarray, 0);
-    if (!plan) ereport(ERROR, (errmsg("laplace_read_attestation_rows: plan failed")));
-    size_t window = frontier_window_ids();
-    for (size_t at = 0; at < (size_t)n;) {
-        size_t amount = Min(window, (size_t)n - at);
-        ArrayType *wanted = id_array_of(native_id, claims + at, (int)amount);
-        ParamListInfo params = makeParamList(1);
-        params->params[0] = (ParamExternData){ .ptype = idarray, .value = PointerGetDatum(wanted), .pflags = 0 };
-        lp_pg_stream(plan, params, pg_attested_read_row, &read);
-        pfree(params); pfree(wanted); at += amount;
-    }
-    SPI_freeplan(plan); SPI_finish();
+    lp_pg_read_attestation_pk(claims, n, roots, out, witnesses);
     if (out->n) lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
 }
 
-/* A stage-resident claim set stays a set: one semi-join lets PostgreSQL hash or merge
- * the staged claims against every attestation partition, instead of binding the whole
- * set into an array parameter that each partition re-sorts and rechecks per tuple. */
-void lp_pg_read_attestation_stage(const char *selection, PgAttrRows *out, lp_idmap *witnesses)
+/* Scan the caller's stage or temp claim selection directly and resolve each
+ * unique claim against the canonical attestation primary-key partitions. */
+void lp_pg_read_attestation_stage(Oid selection_relid, PgAttrRows *out, lp_idmap *witnesses)
 {
-    PgAttestedRead read = { .out = out, .roots = NULL, .witnesses = witnesses };
-    if (SPI_connect() != SPI_OK_CONNECT) ereport(ERROR, (errmsg("laplace_read_attestation_stage: SPI connect failed")));
-    char *sql = psprintf("SELECT a.claim,a.witness,a.lineage,a.games,a.tokens,a.score,a.\"position\",a.trust"
-        " FROM @extschema@.attestation a WHERE EXISTS(SELECT FROM %s c WHERE c.claim OPERATOR(@extschema@.=) a.claim)", selection);
-    SPIPlanPtr plan = lp_pg_prepare_cursor(sql, 0, NULL, CURSOR_OPT_NO_SCROLL);
-    if (!plan) ereport(ERROR, (errmsg("laplace_read_attestation_stage: plan failed")));
-    lp_pg_stream(plan, NULL, pg_attested_read_row, &read);
-    SPI_freeplan(plan); pfree(sql); SPI_finish();
-    if (out->n) lp_sort(out->v, out->n, sizeof(PgAttrRow), by_attr_row);
+    if (!OidIsValid(selection_relid)) return;
+    Relation rel = table_open(selection_relid, AccessShareLock);
+    AttrNumber ac = get_attnum(selection_relid, "claim");
+    if (ac == InvalidAttrNumber)
+        ereport(ERROR, (errmsg("laplace_read_attestation_stage: relation \"%s\" has no claim column", RelationGetRelationName(rel))));
+    lp_idmap *claims = lp_idmap_new();
+    TableScanDesc scan = table_beginscan(rel, GetActiveSnapshot(), 0, NULL);
+    TupleTableSlot *slot = table_slot_create(rel, NULL);
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+        CHECK_FOR_INTERRUPTS();
+        bool missing;
+        Datum val = slot_getattr(slot, ac, &missing);
+        if (!missing) {
+            lp_id claim;
+            memcpy(claim.b, DatumGetPointer(val), sizeof(lp_id));
+            lp_idmap_put(claims, &claim, NULL);
+        }
+        ExecClearTuple(slot);
+    }
+    ExecDropSingleTupleTableSlot(slot);
+    table_endscan(scan);
+    table_close(rel, AccessShareLock);
+    size_t count = lp_idmap_count(claims);
+    if (count > (size_t)INT_MAX)
+        ereport(ERROR, (errmsg("laplace_read_attestation_stage: claim selection exceeds supported count")));
+    if (count > 0) lp_pg_read_attestation_rows(lp_idmap_keys(claims), (int)count, NULL, out, witnesses);
+    lp_idmap_free(claims);
 }
 
 /* Each claim's evidence is its stored attestations; a claim with none stored yet is
@@ -632,6 +617,149 @@ Datum laplace_attested(PG_FUNCTION_ARGS)
     PG_RETURN_NULL();
 }
 
+static int by_export_id(const void *a, const void *b)
+{
+    return memcmp(((const lp_id *)a)->b, ((const lp_id *)b)->b, sizeof(lp_id));
+}
+
+static int by_export_row(const void *a, const void *b)
+{
+    const PgAttrRow *x = a, *y = b;
+    int c = memcmp(x->claim.b, y->claim.b, sizeof(lp_id));
+    if (c) return c;
+    return memcmp(x->trunk.b, y->trunk.b, sizeof(lp_id));
+}
+
+/* Direct-AM full-estate attestation replay export streamed in sorted claim windows. */
+PG_FUNCTION_INFO_V1(laplace_replay_export);
+Datum laplace_replay_export(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_replay_export", &td);
+    int include_files = (PG_NARGS() > 0 && !PG_ARGISNULL(0) && PG_GETARG_BOOL(0)) ? 1 : 0;
+
+    const char *pcols[] = { "entity", "path", "mask" }, *ccols[] = { "claim" }, *acols[] = { "claim", "witness" };
+    const char *col = NULL;
+    Relation pp = lp_pg_read_parent(lp_pg_relation("physicality"), &col, pcols, 3);
+    table_close(pp, NoLock);
+    Relation cp = lp_pg_read_parent(lp_pg_relation("consensus"), &col, ccols, 1);
+    table_close(cp, NoLock);
+    Relation ap = lp_pg_read_parent(lp_pg_relation("attestation"), &col, acols, 2);
+    table_close(ap, NoLock);
+
+    lp_mask claim_bit = lp_pg_kind_mask("claim");
+    Snapshot snap = GetActiveSnapshot();
+    lp_idmap *claim_set = lp_idmap_new();
+    lp_id *sorted_claims = NULL;
+    MemoryContext old_ctx = CurrentMemoryContext;
+    MemoryContext row_ctx = AllocSetContextCreate(old_ctx, "laplace_replay_export_row", ALLOCSET_DEFAULT_SIZES);
+
+    PG_TRY();
+    {
+        const Oid *con_parts = NULL, *path_parts = NULL;
+        int n_con = lp_pg_canonical_partitions("consensus", &con_parts, NULL, NULL, NULL);
+        for (int p = 0; p < n_con; p++) {
+            CHECK_FOR_INTERRUPTS();
+            Relation part = table_open(con_parts[p], AccessShareLock);
+            AttrNumber ac = get_attnum(con_parts[p], "claim");
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool nc = false;
+                Datum dc = slot_getattr(slot, ac, &nc);
+                if (!nc) lp_idmap_put(claim_set, (const lp_id *)DatumGetPointer(dc), NULL);
+                ExecClearTuple(slot);
+            }
+            ExecDropSingleTupleTableSlot(slot);
+            table_endscan(scan);
+            table_close(part, NoLock);
+        }
+
+        int n_path = lp_pg_canonical_partitions("physicality", &path_parts, NULL, NULL, NULL);
+        for (int p = 0; p < n_path; p++) {
+            CHECK_FOR_INTERRUPTS();
+            Relation part = table_open(path_parts[p], AccessShareLock);
+            AttrNumber ae = get_attnum(path_parts[p], "entity");
+            AttrNumber apath = get_attnum(path_parts[p], "path");
+            AttrNumber am = get_attnum(path_parts[p], "mask");
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool ne = false, np = false, nm = false;
+                Datum de = slot_getattr(slot, ae, &ne);
+                Datum dm = slot_getattr(slot, am, &nm);
+                if (!ne && !nm && (lp_pg_mask_native(dm) & claim_bit) != 0) {
+                    Datum dp = slot_getattr(slot, apath, &np);
+                    if (!np) {
+                        MemoryContextSwitchTo(row_ctx);
+                        size_t len = lp_path_len(geo_of(dp).p);
+                        MemoryContextSwitchTo(old_ctx);
+                        MemoryContextReset(row_ctx);
+                        if (len >= 2) lp_idmap_put(claim_set, (const lp_id *)DatumGetPointer(de), NULL);
+                    }
+                }
+                ExecClearTuple(slot);
+            }
+            ExecDropSingleTupleTableSlot(slot);
+            table_endscan(scan);
+            table_close(part, NoLock);
+        }
+
+        size_t nclaims = lp_idmap_count(claim_set);
+        if (nclaims > 0) {
+            sorted_claims = palloc_extended(nclaims * sizeof(lp_id), MCXT_ALLOC_HUGE);
+            memcpy(sorted_claims, lp_idmap_keys(claim_set), nclaims * sizeof(lp_id));
+            lp_idmap_free(claim_set);
+            claim_set = NULL;
+            lp_sort(sorted_claims, nclaims, sizeof(lp_id), by_export_id);
+
+            const size_t window = 4096;
+            for (size_t begin = 0; begin < nclaims; begin += window) {
+                CHECK_FOR_INTERRUPTS();
+                size_t wn = Min(window, nclaims - begin);
+                PgAttrRows rows = {0};
+                if (!include_files)
+                    lp_pg_read_attestation_rows(sorted_claims + begin, (int)wn, NULL, &rows, NULL);
+                lp_pg_attested_unstored(sorted_claims + begin, (int)wn, InvalidOid, include_files, &rows, NULL);
+                lp_pg_rollup_sources(&rows);
+                size_t kept = 0;
+                for (size_t i = 0; i < rows.n; i++) {
+                    if (rows.v[i].witness || include_files)
+                        rows.v[kept++] = rows.v[i];
+                }
+                if (kept > 1) lp_sort(rows.v, kept, sizeof(PgAttrRow), by_export_row);
+                for (size_t i = 0; i < kept; i++) {
+                    const PgAttrRow *r = &rows.v[i];
+                    Datum v[6] = {
+                        id_datum(&r->claim),
+                        id_datum(&r->trunk),
+                        Float8GetDatum(r->games),
+                        Float8GetDatum(r->tokens),
+                        Float8GetDatum(r->score),
+                        Int32GetDatum((int32)r->position)
+                    };
+                    bool nl[6] = { false, false, false, false, false, false };
+                    set_put(fcinfo, ts, td, v, nl);
+                    pfree(DatumGetPointer(v[0]));
+                    pfree(DatumGetPointer(v[1]));
+                }
+                lp_vec_free(&rows);
+            }
+        }
+    }
+    PG_FINALLY();
+    {
+        MemoryContextSwitchTo(old_ctx);
+        MemoryContextDelete(row_ctx);
+        if (claim_set) lp_idmap_free(claim_set);
+        if (sorted_claims) pfree(sorted_claims);
+    }
+    PG_END_TRY();
+    return (Datum)0;
+}
+
 typedef struct {
     FunctionCallInfo call;Tuplestorestate *rows;TupleDesc descriptor;
     lp_idmap *sources;lp_id calculation;
@@ -700,4 +828,346 @@ Datum laplace_testimony(PG_FUNCTION_ARGS)
             pg_testimony_root,&out);
     }PG_FINALLY();{pfree(claims);lp_idmap_free(out.sources);}PG_END_TRY();
     PG_RETURN_NULL();
+}
+
+typedef struct {
+    lp_id witness;
+    lp_id lineage;
+    bool has_lineage;
+    lp_id terminal;
+    int8 state; /* 0 = unvisited, 1 = visiting, 2 = resolved, 3 = invalid cycle */
+} WitnessNode;
+
+typedef struct {
+    lp_vec(WitnessNode) nodes;
+    lp_idmap *by_id;
+} WitnessGraphCtx;
+
+static void collect_witness_node(const lp_id *id, const lp_id *lineage, double trust, void *ctx)
+{
+    (void)trust;
+    WitnessGraphCtx *g = ctx;
+    bool fresh = false;
+    lp_idmap_put(g->by_id, id, &fresh);
+    if (!fresh) return;
+    WitnessNode w = {0};
+    w.witness = *id;
+    w.has_lineage = (lineage != NULL);
+    if (lineage) w.lineage = *lineage;
+    lp_push(&g->nodes, w);
+}
+
+static void resolve_witness_roots(WitnessGraphCtx *g, int64 *invalid_out)
+{
+    *invalid_out = 0;
+    size_t n = g->nodes.n;
+    lp_vec(size_t) stack = {0};
+    for (size_t i = 0; i < n; i++) {
+        if (g->nodes.v[i].state >= 2) continue;
+        stack.n = 0;
+        size_t cur = i;
+        lp_id root = {0};
+        bool cyclic = false;
+        for (;;) {
+            WitnessNode *wn = &g->nodes.v[cur];
+            if (wn->state == 2) { root = wn->terminal; break; }
+            if (wn->state == 1 || wn->state == 3) { cyclic = true; break; }
+            wn->state = 1;
+            lp_push(&stack, cur);
+            if (!wn->has_lineage || lp_id_eq(&wn->lineage, &wn->witness)) {
+                root = wn->witness;
+                break;
+            }
+            int64 nxt = lp_idmap_find(g->by_id, &wn->lineage);
+            if (nxt < 0) {
+                root = wn->lineage;
+                break;
+            }
+            cur = (size_t)nxt;
+        }
+        if (cyclic) {
+            (*invalid_out)++;
+            for (size_t k = 0; k < stack.n; k++) g->nodes.v[stack.v[k]].state = 3;
+        } else {
+            for (size_t k = 0; k < stack.n; k++) {
+                g->nodes.v[stack.v[k]].terminal = root;
+                g->nodes.v[stack.v[k]].state = 2;
+            }
+        }
+    }
+    lp_vec_free(&stack);
+}
+
+typedef struct {
+    int32 list_idx;
+    uint32 slot;
+    size_t claim_ord;
+} SlotClaimHit;
+
+typedef struct {
+    const lp_highway *hw;
+    lp_idmap *matched_claim_map;
+    lp_vec(SlotClaimHit) hits;
+} AuditPathCtx;
+
+static void audit_visit_claim_path(const lp_id *claim, Datum path, Datum mask, void *ctx)
+{
+    (void)mask;
+    AuditPathCtx *ac = ctx;
+    Geo g = geo_of(path);
+    size_t n = lp_path_len(g.p);
+    int64 cord = -1;
+    for (size_t i = 0; i < n; i++) {
+        lp_id vid = lp_path_id(g.p, i);
+        if (!lp_highway_contains(ac->hw, &vid)) continue;
+        for (size_t li = 0; li < ac->hw->nlists; li++) {
+            int64 slot = lp_highway_slot(ac->hw, &ac->hw->list[li], &vid);
+            if (slot < 0) continue;
+            if (cord < 0) cord = (int64)lp_idmap_put(ac->matched_claim_map, claim, NULL);
+            lp_push(&ac->hits, ((SlotClaimHit){ (int32)li, (uint32)slot, (size_t)cord }));
+        }
+    }
+}
+
+typedef struct {
+    size_t list_slot_ord;
+    size_t root_id_ord;
+} SlotRootPair;
+
+static int cmp_size_t(const void *a, const void *b)
+{
+    size_t x = *(const size_t *)a, y = *(const size_t *)b;
+    return (x > y) - (x < y);
+}
+
+static size_t dedup_size_t(size_t *arr, size_t n)
+{
+    if (!n) return 0;
+    lp_sort(arr, n, sizeof(size_t), cmp_size_t);
+    size_t w = 1;
+    for (size_t i = 1; i < n; i++) if (arr[i] != arr[w - 1]) arr[w++] = arr[i];
+    return w;
+}
+
+static lp_id slot_key_id(int32 list_idx, uint32 slot)
+{
+    lp_id k = {0};
+    memcpy(k.b, &list_idx, sizeof(list_idx));
+    memcpy(k.b + 4, &slot, sizeof(slot));
+    return k;
+}
+
+/* Native Direct-AM highway provenance and 1-hop crosswalk audit (zero SPI). */
+PG_FUNCTION_INFO_V1(laplace_highway_audit);
+Datum laplace_highway_audit(PG_FUNCTION_ARGS)
+{
+    static const char *const audit_lists[8] = {
+        "ili", "Synset", "fnframe", "fnfe", "fnlu", "vnclass", "pbroleset", "vaframe"
+    };
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_highway_audit", &td);
+    const lp_highway *hw = lp_pg_highway();
+
+    WitnessGraphCtx wgraph = { {0}, lp_idmap_new() };
+    lp_vec(lp_id) chunk_claims = {0};
+    AuditPathCtx apctx = { hw, lp_idmap_new(), {0} };
+    PgAttrRows att_rows = {0};
+    lp_idmap *distinct_roots = lp_idmap_new();
+    lp_idmap *slot_map = lp_idmap_new();
+
+    PG_TRY();
+    {
+        lp_pg_scan_all_witnesses(collect_witness_node, &wgraph);
+        int64 invalid_lineage = 0;
+        resolve_witness_roots(&wgraph, &invalid_lineage);
+
+        Oid con_oid = lp_pg_relation("consensus");
+        AttrNumber a_claim = get_attnum(con_oid, "claim");
+        const Oid *parts = NULL;
+        int nparts = lp_pg_canonical_partitions("consensus", &parts, NULL, NULL, NULL);
+        Snapshot snap = GetActiveSnapshot();
+
+        for (int p = 0; p < nparts; p++) {
+            CHECK_FOR_INTERRUPTS();
+            Relation part = table_open(parts[p], AccessShareLock);
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool isnull = true;
+                Datum dc = slot_getattr(slot, a_claim, &isnull);
+                if (!isnull) lp_push(&chunk_claims, *(const lp_id *)DatumGetPointer(dc));
+                ExecClearTuple(slot);
+                if (chunk_claims.n >= 16384) {
+                    lp_pg_lookup_paths(chunk_claims.v, chunk_claims.n, false, audit_visit_claim_path, &apctx);
+                    chunk_claims.n = 0;
+                }
+            }
+            table_endscan(scan);
+            ExecDropSingleTupleTableSlot(slot);
+            table_close(part, NoLock);
+        }
+        if (chunk_claims.n > 0) {
+            lp_pg_lookup_paths(chunk_claims.v, chunk_claims.n, false, audit_visit_claim_path, &apctx);
+            chunk_claims.n = 0;
+        }
+
+        size_t n_mc = lp_idmap_count(apctx.matched_claim_map);
+        if (n_mc > 0)
+            lp_pg_read_attestation_pk(lp_idmap_keys(apctx.matched_claim_map), (int)n_mc, NULL, &att_rows, NULL);
+
+        typedef struct { size_t claim_ord; size_t root_ord; } ClaimRootPair;
+        lp_vec(ClaimRootPair) cr_pairs = {0};
+        for (size_t i = 0; i < att_rows.n; i++) {
+            int64 cord = lp_idmap_find(apctx.matched_claim_map, &att_rows.v[i].claim);
+            if (cord < 0) continue;
+            lp_id term = att_rows.v[i].trunk;
+            int64 widx = lp_idmap_find(wgraph.by_id, &att_rows.v[i].trunk);
+            if (widx >= 0) {
+                if (wgraph.nodes.v[widx].state == 3) continue;
+                if (wgraph.nodes.v[widx].state == 2) term = wgraph.nodes.v[widx].terminal;
+            }
+            size_t rord = lp_idmap_put(distinct_roots, &term, NULL);
+            lp_push(&cr_pairs, ((ClaimRootPair){ (size_t)cord, rord }));
+        }
+
+        size_t *claim_row_begin = n_mc ? palloc(sizeof(size_t) * n_mc) : NULL;
+        size_t *claim_row_end = n_mc ? palloc(sizeof(size_t) * n_mc) : NULL;
+        size_t *c_counts = n_mc ? palloc0(sizeof(size_t) * n_mc) : NULL;
+        for (size_t i = 0; i < cr_pairs.n; i++) c_counts[cr_pairs.v[i].claim_ord]++;
+        size_t total_cr = 0;
+        for (size_t i = 0; i < n_mc; i++) {
+            claim_row_begin[i] = total_cr;
+            claim_row_end[i] = total_cr;
+            total_cr += c_counts[i];
+        }
+        size_t *cr_flat = total_cr ? palloc(sizeof(size_t) * total_cr) : NULL;
+        for (size_t i = 0; i < cr_pairs.n; i++) {
+            size_t c = cr_pairs.v[i].claim_ord;
+            cr_flat[claim_row_end[c]++] = cr_pairs.v[i].root_ord;
+        }
+        lp_vec_free(&cr_pairs);
+        if (c_counts) pfree(c_counts);
+
+        lp_vec(SlotRootPair) sr_pairs = {0};
+        for (size_t i = 0; i < apctx.hits.n; i++) {
+            SlotClaimHit *h = &apctx.hits.v[i];
+            lp_id sk = slot_key_id(h->list_idx, h->slot);
+            size_t sord = lp_idmap_put(slot_map, &sk, NULL);
+            for (size_t k = claim_row_begin[h->claim_ord]; k < claim_row_end[h->claim_ord]; k++)
+                lp_push(&sr_pairs, ((SlotRootPair){ sord, cr_flat[k] }));
+        }
+        if (cr_flat) pfree(cr_flat);
+        if (claim_row_begin) pfree(claim_row_begin);
+        if (claim_row_end) pfree(claim_row_end);
+
+        size_t n_slots = lp_idmap_count(slot_map);
+        size_t *s_counts = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
+        size_t *s_begin = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
+        size_t *s_end = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
+        for (size_t i = 0; i < sr_pairs.n; i++) s_counts[sr_pairs.v[i].list_slot_ord]++;
+        size_t total_sr = 0;
+        for (size_t i = 0; i < n_slots; i++) {
+            s_begin[i] = total_sr;
+            s_end[i] = total_sr;
+            total_sr += s_counts[i];
+        }
+        size_t *s_flat = total_sr ? palloc(sizeof(size_t) * total_sr) : NULL;
+        for (size_t i = 0; i < sr_pairs.n; i++) {
+            size_t s = sr_pairs.v[i].list_slot_ord;
+            s_flat[s_end[s]++] = sr_pairs.v[i].root_id_ord;
+        }
+        lp_vec_free(&sr_pairs);
+        if (s_counts) pfree(s_counts);
+        for (size_t i = 0; i < n_slots; i++)
+            s_end[i] = s_begin[i] + dedup_size_t(&s_flat[s_begin[i]], s_end[i] - s_begin[i]);
+
+        lp_vec(size_t) scratch = {0};
+
+        for (int li = 0; li < 8; li++) {
+            const char *lname = audit_lists[li];
+            const lp_list *lst = lp_highway_list(hw, lname);
+            int src_list_idx = lst ? (int)(lst - hw->list) : -1;
+            int64 cached = 0, attested = 0, ind2 = 0, ind3 = 0, ind4 = 0, xw2 = 0, xw3 = 0, xw4 = 0;
+            if (lst && src_list_idx >= 0) {
+                for (uint32 s = 0; s < lst->count; s++) {
+                    CHECK_FOR_INTERRUPTS();
+                    if (!lp_highway_at(hw, lst, s)) continue;
+                    cached++;
+
+                    lp_id sk = slot_key_id(src_list_idx, s);
+                    int64 sord = lp_idmap_find(slot_map, &sk);
+                    size_t direct_n = 0;
+                    const size_t *direct_ptr = NULL;
+                    if (sord >= 0) {
+                        attested++;
+                        direct_n = s_end[sord] - s_begin[sord];
+                        direct_ptr = &s_flat[s_begin[sord]];
+                        if (direct_n >= 2) ind2++;
+                        if (direct_n >= 3) ind3++;
+                        if (direct_n >= 4) ind4++;
+                    }
+
+                    scratch.n = 0;
+                    for (size_t k = 0; k < direct_n; k++) lp_push(&scratch, direct_ptr[k]);
+
+                    for (size_t el = 0; el < hw->nedgelists; el++) {
+                        if (strcmp(hw->edges[el].a, lname) != 0) continue;
+                        const lp_list *dst_lst = lp_highway_list(hw, hw->edges[el].b);
+                        if (!dst_lst) continue;
+                        int dst_list_idx = (int)(dst_lst - hw->list);
+                        const lp_edge *edges = NULL;
+                        size_t ne = lp_highway_edges(hw, lname, s, hw->edges[el].b, &edges);
+                        for (size_t k = 0; k < ne; k++) {
+                            if (!lp_highway_at(hw, dst_lst, edges[k].to)) continue;
+                            lp_id tsk = slot_key_id(dst_list_idx, edges[k].to);
+                            int64 tord = lp_idmap_find(slot_map, &tsk);
+                            if (tord < 0) continue;
+                            size_t tn = s_end[tord] - s_begin[tord];
+                            for (size_t j = 0; j < tn; j++) lp_push(&scratch, s_flat[s_begin[tord] + j]);
+                        }
+                    }
+
+                    size_t xw_n = dedup_size_t(scratch.v, scratch.n);
+                    if (xw_n >= 2) xw2++;
+                    if (xw_n >= 3) xw3++;
+                    if (xw_n >= 4) xw4++;
+                }
+            }
+
+            Datum v[10] = {
+                CStringGetTextDatum(lname),
+                Int64GetDatum(cached),
+                Int64GetDatum(attested),
+                Int64GetDatum(ind2),
+                Int64GetDatum(ind3),
+                Int64GetDatum(ind4),
+                Int64GetDatum(xw2),
+                Int64GetDatum(xw3),
+                Int64GetDatum(xw4),
+                Int64GetDatum(invalid_lineage)
+            };
+            bool nl[10] = { false };
+            set_put(fcinfo, ts, td, v, nl);
+            pfree(DatumGetPointer(v[0]));
+        }
+
+        lp_vec_free(&scratch);
+        if (s_flat) pfree(s_flat);
+        if (s_begin) pfree(s_begin);
+        if (s_end) pfree(s_end);
+    }
+    PG_FINALLY();
+    {
+        lp_idmap_free(slot_map);
+        lp_idmap_free(distinct_roots);
+        lp_vec_free(&att_rows);
+        lp_idmap_free(apctx.matched_claim_map);
+        lp_vec_free(&apctx.hits);
+        lp_vec_free(&chunk_claims);
+        lp_idmap_free(wgraph.by_id);
+        lp_vec_free(&wgraph.nodes);
+    }
+    PG_END_TRY();
+    return (Datum)0;
 }
