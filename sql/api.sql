@@ -295,3 +295,46 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_constellation_sample(buckets inte
     OUT radius double precision, OUT path_len integer, OUT hilbert bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_constellation_sample';
+
+-- Witness-allowlist scoped standings and observation/claim read overloads (zero SPI, preserve storage DDL).
+CREATE OR REPLACE FUNCTION @extschema@.laplace_standings_scoped(ids @extschema@.blake3[],
+    witnesses @extschema@.blake3[] DEFAULT NULL,
+    OUT ordinal bigint, OUT claim @extschema@.blake3,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_standings_scoped';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_holders_with_standings(parts @extschema@.blake3[],
+    required @extschema@.blake3[], per_part boolean, floor smallint, cap bigint, kinds smallint,
+    bits smallint[], endpoint smallint, witnesses @extschema@.blake3[],
+    OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
+    OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_holders_with_standings';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_couple(occ @extschema@.blake3[], fan bigint,
+    refuse @extschema@.blake3[], shape smallint, shape_n double precision, keep integer,
+    witnesses @extschema@.blake3[],
+    OUT entity @extschema@.blake3, OUT occ integer, OUT route smallint,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT via @extschema@.blake3, OUT rel @extschema@.blake3, OUT tier smallint,
+    OUT distance double precision, OUT vertices @extschema@.blake3[]) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 4096 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_couple';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_forward(ids @extschema@.blake3[], fan bigint,
+    witnesses @extschema@.blake3[],
+    OUT i integer, OUT j integer, OUT paths bigint, OUT runs bigint,
+    OUT next @extschema@.blake3, OUT times bigint) RETURNS SETOF record
+    LANGUAGE c STABLE SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_forward';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_forward_suffix(ids @extschema@.blake3[], fan bigint,
+    witnesses @extschema@.blake3[],
+    OUT i integer, OUT j integer, OUT paths bigint, OUT runs bigint,
+    OUT next @extschema@.blake3, OUT times bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_forward_suffix';

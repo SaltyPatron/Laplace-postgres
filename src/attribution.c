@@ -154,35 +154,21 @@ static lp_id pg_series_root(PgSeriesBatch *batch, lp_id root)
     return root;
 }
 
-typedef struct { size_t row;double remainder;lp_id id; } PgRemainder;
-static int pg_remainder_order(const void *a,const void *b)
-{
-    const PgRemainder *x=a,*y=b;
-    if(x->remainder!=y->remainder)return x->remainder>y->remainder?-1:1;
-    return lp_id_cmp(&x->id,&y->id);
-}
-/* Allocate only after the selected claim/source set has been reduced. Stable
- * ID ties and one sort replace repeated winner scans and early rounding. */
+/* Allocate only after the selected claim/source set has been reduced, delegating
+ * exact 10000bp conservation and deterministic ID tie-breaking to Laplace-Native. */
 static void pg_attribution_shares(PgAttrRow *rows,size_t n)
 {
-    double total=0;size_t positive=0;
-    for(size_t i=0;i<n;i++){
-        rows[i].share_bp=0;
-        if(!isfinite(rows[i].fisher)||rows[i].fisher<0)pg_series_invalid();
-        total+=rows[i].fisher;if(rows[i].fisher>0)positive++;
+    if(!n)return;
+    double *weights=palloc(n*sizeof *weights);
+    lp_id *ids=palloc(n*sizeof *ids);
+    int32_t *bp=palloc(n*sizeof *bp);
+    for(size_t i=0;i<n;i++){weights[i]=rows[i].fisher;ids[i]=rows[i].trunk;}
+    if(!lp_fisher_shares_bp(weights,ids,n,bp)){
+        pfree(bp);pfree(ids);pfree(weights);
+        pg_series_invalid();
     }
-    if(!positive)return;
-    if(!isfinite(total)||total<=0)pg_series_invalid();
-    PgRemainder *remainder=palloc(positive*sizeof *remainder);size_t at=0;int allocated=0;
-    for(size_t i=0;i<n;i++)if(rows[i].fisher>0){
-        double exact=10000*(rows[i].fisher/total);int points=(int)floor(exact);
-        rows[i].share_bp=points;allocated+=points;
-        remainder[at++]=(PgRemainder){i,exact-points,rows[i].trunk};
-    }
-    if(allocated>10000||(size_t)(10000-allocated)>positive)pg_series_invalid();
-    lp_sort(remainder,positive,sizeof *remainder,pg_remainder_order);
-    for(int i=0;i<10000-allocated;i++)rows[remainder[i].row].share_bp++;
-    pfree(remainder);
+    for(size_t i=0;i<n;i++)rows[i].share_bp=bp[i];
+    pfree(bp);pfree(ids);pfree(weights);
 }
 
 /* Hydrate only the selected witnesses' missing ancestors. Symbolic roots need
@@ -333,6 +319,26 @@ Datum laplace_source_standings(PG_FUNCTION_ARGS)
         bool missing[5]={0};set_put(fcinfo,result,td,values,missing);
     }
     MemoryContextSwitchTo(caller);MemoryContextDelete(context);PG_RETURN_NULL();
+}
+
+void lp_pg_solve_scoped_standings(const lp_id *claims,int n,Oid idarr,
+                                  const lp_id *witnesses,int nwitnesses,lp_idmap *out)
+{
+    if(!out||n<=0||!claims||!witnesses||nwitnesses<=0)return;
+    MemoryContext caller=CurrentMemoryContext;
+    MemoryContext context=AllocSetContextCreate(caller,"Native scoped standings helper",ALLOCSET_DEFAULT_SIZES);
+    MemoryContextSwitchTo(context);
+    lp_idmap *scope=lp_idmap_new();
+    for(int i=0;i<nwitnesses;i++)lp_idmap_put(scope,witnesses+i,NULL);
+    PgSolvedStandings solved={0};
+    compute_attribution_rows(claims,n,idarr,scope,NULL,&solved);
+    lp_idmap_free(scope);
+    MemoryContextSwitchTo(caller);
+    for(size_t i=0;i<solved.n;i++){
+        lp_standing *st=lp_idmap_get(out,&solved.v[i].claim,NULL);
+        *st=solved.v[i].standing;
+    }
+    MemoryContextDelete(context);
 }
 
 static int pg_series_by_claim(const void *a, const void *b)

@@ -16,6 +16,7 @@
 #include "laplace/highway.h"
 #include "laplace/perfcache.h"
 #include "laplace/geometry.h"
+#include "laplace/consensus.h"
 #include "varatt.h"
 
 const lp_tier0_record *lp_pg_tier0(void);
@@ -231,5 +232,15 @@ void lp_pg_claims_each_direct(const lp_id *ids, int count, int64 fan, lp_mask bi
                               const lp_id *include, int ninclude, int64 arity,
                               const lp_id *opposite, int nopposite,
                               lp_pg_claim_visit visit, void *context);
+void lp_pg_claims_each_scoped_direct(const lp_id *ids, int count, int64 fan, lp_mask bits,
+                                     const lp_id *refuse, int nrefuse, int16 endpoint,
+                                     const lp_id *include, int ninclude, int64 arity,
+                                     const lp_id *opposite, int nopposite,
+                                     bool has_scope, const lp_id *witnesses, int nwitnesses, Oid idarr,
+                                     lp_pg_claim_visit visit, void *context);
+void lp_pg_solve_scoped_standings(const lp_id *claims, int n, Oid idarr,
+                                  const lp_id *witnesses, int nwitnesses, lp_idmap *out);
+void lp_pg_filter_witness_entities(const lp_id *entities, size_t count,
+                                   const lp_id *witnesses, int nwitnesses, bool *allowed);
 void lp_pg_truncate_rel(Oid rel1, Oid rel2);
 #endif

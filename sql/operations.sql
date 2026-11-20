@@ -32,6 +32,14 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake
     OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
     OUT matches bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 1024 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE AS 'MODULE_PATHNAME','laplace_claims_each';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
+    fan bigint, bits smallint[], refuse @extschema@.blake3[], endpoint smallint,
+    middle_any @extschema@.blake3[], arity bigint, opposite @extschema@.blake3[],
+    witnesses @extschema@.blake3[],
+    OUT i bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
+    OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 1024 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE AS 'MODULE_PATHNAME','laplace_claims_each';
 COMMENT ON FUNCTION @extschema@.laplace_claims_each(@extschema@.blake3[],bigint,smallint[],@extschema@.blake3[],smallint,@extschema@.blake3[],bigint,@extschema@.blake3[])
     IS 'The same directed Native claim selector with an opposite endpoint set. For endpoint 1 it restricts the last constituent; for endpoint 2 it restricts the first. NULL is unconstrained; an empty set selects nothing. The opposite set joins the GIN scan when its distinct ID count is no larger than the primary set; broader sets qualify acquired carriers in Native C. Complete transfer windows are unioned and both complete endpoint sets qualify every carrier before standing lookup and fan.';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_claims_each(ids @extschema@.blake3[],
@@ -129,6 +137,16 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_pull(seeds @extschema@.blake3[], 
     hops integer DEFAULT 4, fan bigint DEFAULT 64, nodes bigint DEFAULT 4096,
     middle @extschema@.blake3[] DEFAULT NULL, refuse @extschema@.blake3[] DEFAULT '{}',
     k double precision DEFAULT 2, per_hop double precision DEFAULT 0.05,
+    OUT ordinal bigint, OUT id @extschema@.blake3, OUT seed @extschema@.blake3, OUT via @extschema@.blake3,
+    OUT claim @extschema@.blake3, OUT relation @extschema@.blake3, OUT rating double precision,
+    OUT deviation double precision, OUT cost double precision, OUT hops integer, OUT hub boolean,
+    OUT goal boolean, OUT chain @extschema@.blake3[], OUT claims @extschema@.blake3[]) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256 SUPPORT @extschema@.laplace_srf_support
+    AS 'MODULE_PATHNAME', 'laplace_pull';
+CREATE OR REPLACE FUNCTION @extschema@.laplace_pull(seeds @extschema@.blake3[], goals @extschema@.blake3[],
+    hops integer, fan bigint, nodes bigint,
+    middle @extschema@.blake3[], refuse @extschema@.blake3[],
+    k double precision, per_hop double precision, witnesses @extschema@.blake3[],
     OUT ordinal bigint, OUT id @extschema@.blake3, OUT seed @extschema@.blake3, OUT via @extschema@.blake3,
     OUT claim @extschema@.blake3, OUT relation @extschema@.blake3, OUT rating double precision,
     OUT deviation double precision, OUT cost double precision, OUT hops integer, OUT hub boolean,

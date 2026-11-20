@@ -666,12 +666,18 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
     TupleDesc td;Tuplestorestate *out=set_begin(fcinfo,"laplace_holders_with_standings",&td);
     if(PG_ARGISNULL(0)||PG_ARGISNULL(1)||PG_ARGISNULL(2)||PG_ARGISNULL(3)||PG_ARGISNULL(4)||PG_ARGISNULL(5))
         return (Datum)0;
+    bool has_scope=PG_NARGS()>8&&!PG_ARGISNULL(8);
+    lp_id *witnesses=NULL;int nwitnesses=0;
+    if(has_scope){
+        witnesses=ids_of(PG_GETARG_ARRAYTYPE_P(8),&nwitnesses);
+        if(!nwitnesses){pfree(witnesses);return (Datum)0;}
+    }
     HolderStandingCollect col={.by_entity=lp_idmap_sized(sizeof(int64)),
         .ctx=AllocSetContextCreate(CurrentMemoryContext,"HolderStandingCollect",ALLOCSET_DEFAULT_SIZES)};
     HolderRead read={.owner=CurrentMemoryContext,.per_part=PG_GETARG_BOOL(2),.floor=PG_GETARG_INT16(3),
         .cap=PG_GETARG_INT64(4),.kinds=PG_GETARG_INT16(5),.emit_hit=collect_holder_row,.emit_ctx=&col};
     if(PG_NARGS()>6&&!PG_ARGISNULL(6)&&!read_mask_bits(PG_GETARG_ARRAYTYPE_P(6),&read.bits)){
-        lp_idmap_free(col.by_entity);MemoryContextDelete(col.ctx);return (Datum)0;
+        if(witnesses)pfree(witnesses);lp_idmap_free(col.by_entity);MemoryContextDelete(col.ctx);return (Datum)0;
     }
     if(PG_NARGS()>7&&!PG_ARGISNULL(7)){
         read.endpoint=PG_GETARG_INT16(7);
@@ -684,6 +690,30 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
     int count,nrequired;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count),*required=ids_of(PG_GETARG_ARRAYTYPE_P(1),&nrequired);
     if(count>0){
         run_holders_query(&read,ids,count,required,nrequired);
+        if(has_scope&&col.rows.n>0){
+            lp_id *cands=palloc(col.rows.n*sizeof *cands);
+            size_t *cand_row=palloc(col.rows.n*sizeof *cand_row);
+            size_t ncand=0;
+            for(size_t i=0;i<col.rows.n;i++){
+                if(!col.rows.v[i].hit.hub){
+                    cands[ncand]=col.rows.v[i].hit.entity;
+                    cand_row[ncand]=i;
+                    ncand++;
+                }
+            }
+            if(ncand>0){
+                bool *keep_row=palloc0(col.rows.n*sizeof *keep_row);
+                for(size_t i=0;i<col.rows.n;i++)if(col.rows.v[i].hit.hub)keep_row[i]=true;
+                bool *allowed=palloc(ncand*sizeof *allowed);
+                lp_pg_filter_witness_entities(cands,ncand,witnesses,nwitnesses,allowed);
+                for(size_t k=0;k<ncand;k++)if(allowed[k])keep_row[cand_row[k]]=true;
+                size_t kept=0;
+                for(size_t i=0;i<col.rows.n;i++)if(keep_row[i])col.rows.v[kept++]=col.rows.v[i];
+                col.rows.n=kept;
+                pfree(allowed);pfree(keep_row);
+            }
+            pfree(cand_row);pfree(cands);
+        }
         if(col.rows.n>0){
             col.links=palloc((Size)col.rows.n*sizeof(int));
             for(size_t i=0;i<col.rows.n;i++){
@@ -695,15 +725,35 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
             }
             size_t nu=lp_idmap_count(col.by_entity);
             if(nu>0){
-                const char *scols[]={"claim","rating","deviation","volatility","matches"},*scol;
-                Oid starget=lp_pg_relation("consensus");
-                Relation sparent=lp_pg_read_parent(starget,&scol,scols,lengthof(scols));
-                PresenceKey *keys=palloc_extended(nu*sizeof(*keys),MCXT_ALLOC_HUGE);
-                for(size_t i=0;i<nu;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(col.by_entity,i),.ordinal=(int64)i+1};
-                struct { HolderStandingCollect *c; AttrNumber st[4]; } sctx={.c=&col};
-                for(int j=0;j<4;j++)sctx.st[j]=get_attnum(starget,scols[j+1]);
-                lp_pg_indexed_keys(sparent,scol,keys,nu,collect_holder_standing,&sctx);
-                pfree(keys);table_close(sparent,NoLock);
+                if(has_scope){
+                    lp_idmap *solved=lp_idmap_sized(sizeof(lp_standing));
+                    Oid idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
+                    PG_TRY();{
+                        lp_pg_solve_scoped_standings(lp_idmap_keys(col.by_entity),(int)nu,idarr,witnesses,nwitnesses,solved);
+                        for(size_t i=0;i<nu;i++){
+                            const lp_standing *st=lp_idmap_lookup(solved,lp_idmap_key(col.by_entity,i));
+                            if(!st)continue;
+                            int idx=(int)*(int64 *)lp_idmap_at(col.by_entity,i);
+                            for(int r=idx;r>=0;r=col.links[r]){
+                                HolderStandingRow *row=&col.rows.v[r];
+                                row->known=true;row->rating=st->rating;row->deviation=st->deviation;
+                                row->volatility=st->volatility;row->matches=(int64)st->matches;
+                            }
+                        }
+                    }PG_FINALLY();{
+                        lp_idmap_free(solved);
+                    }PG_END_TRY();
+                }else{
+                    const char *scols[]={"claim","rating","deviation","volatility","matches"},*scol;
+                    Oid starget=lp_pg_relation("consensus");
+                    Relation sparent=lp_pg_read_parent(starget,&scol,scols,lengthof(scols));
+                    PresenceKey *keys=palloc_extended(nu*sizeof(*keys),MCXT_ALLOC_HUGE);
+                    for(size_t i=0;i<nu;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(col.by_entity,i),.ordinal=(int64)i+1};
+                    struct { HolderStandingCollect *c; AttrNumber st[4]; } sctx={.c=&col};
+                    for(int j=0;j<4;j++)sctx.st[j]=get_attnum(starget,scols[j+1]);
+                    lp_pg_indexed_keys(sparent,scol,keys,nu,collect_holder_standing,&sctx);
+                    pfree(keys);table_close(sparent,NoLock);
+                }
             }
             pfree(col.links);
             for(size_t i=0;i<col.rows.n;i++){
@@ -733,6 +783,7 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
     lp_vec_free(&col.rows);
     lp_idmap_free(col.by_entity);
     MemoryContextDelete(col.ctx);
+    if(witnesses)pfree(witnesses);
     pfree(ids);pfree(required);
     return (Datum)0;
 }
@@ -744,7 +795,8 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
 typedef struct {CarrierLocation carrier;Datum path;int16 tier;bool known;double rating,deviation,volatility;int64 matches;} ClaimStanding;
 typedef struct {
     PresenceOutput output;lp_idmap *wanted,*parents,*required,*opposite;lp_id *refuse,*include;int nrefuse,ninclude,*links;
-    bool each,done;uint64 limit,sent,saturated,epoch,nom_epoch,nom_saturated;int floor,endpoint;int64 arity;lp_mask bits;
+    bool each,done,has_scope;const lp_id *witnesses;int nwitnesses;Oid idarr;
+    uint64 limit,sent,saturated,epoch,nom_epoch,nom_saturated;int floor,endpoint;int64 arity;lp_mask bits;
     AttrNumber id,path,tier,mask,standing[4];MemoryContext tuple_context;
     lp_pg_claim_visit visit;void *visit_context;
 } ClaimRead;
@@ -896,10 +948,26 @@ static void run_claims_query(ClaimRead *read,const lp_id *ids,int count,const lp
         table_close(paths,NoLock);
         n=lp_idmap_count(read->parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
         for(size_t i=0;i<n;i++)keys[i]=(PresenceKey){.id=*lp_idmap_key(read->parents,i),.ordinal=(int64)i+1};
-        const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
-        Relation standings=lp_pg_read_parent(target,&column,standing_columns,lengthof(standing_columns));
-        for(int i=0;i<4;i++)read->standing[i]=get_attnum(target,standing_columns[i+1]);
-        lp_pg_indexed_keys(standings,column,keys,n,claim_standing,read);table_close(standings,NoLock);
+        if(read->has_scope){
+            if(n>0&&read->nwitnesses>0){
+                lp_idmap *solved=lp_idmap_sized(sizeof(lp_standing));
+                PG_TRY();{
+                    lp_pg_solve_scoped_standings(lp_idmap_keys(read->parents),(int)n,read->idarr,read->witnesses,read->nwitnesses,solved);
+                    for(size_t i=0;i<n;i++){
+                        const lp_standing *st=lp_idmap_lookup(solved,&keys[i].id);
+                        if(!st)continue;
+                        ClaimStanding *standing=lp_idmap_at(read->parents,(size_t)keys[i].ordinal-1);
+                        standing->known=true;standing->rating=st->rating;standing->deviation=st->deviation;
+                        standing->volatility=st->volatility;standing->matches=(int64)st->matches;
+                    }
+                }PG_FINALLY();{lp_idmap_free(solved);}PG_END_TRY();
+            }
+        }else{
+            const char *standing_columns[]={"claim","rating","deviation","volatility","matches"};target=lp_pg_relation("consensus");
+            Relation standings=lp_pg_read_parent(target,&column,standing_columns,lengthof(standing_columns));
+            for(int i=0;i<4;i++)read->standing[i]=get_attnum(target,standing_columns[i+1]);
+            lp_pg_indexed_keys(standings,column,keys,n,claim_standing,read);table_close(standings,NoLock);
+        }
         for(size_t i=0;i<n && !read->done;i++){
             if(((ClaimStanding *)lp_idmap_at(read->parents,(size_t)keys[i].ordinal-1))->known)
                 claim_emit_cached(read,keys+i);
@@ -908,13 +976,15 @@ static void run_claims_query(ClaimRead *read,const lp_id *ids,int count,const lp
     }PG_FINALLY();{if(read->tuple_context)MemoryContextDelete(read->tuple_context);lp_idmap_free(read->wanted);lp_idmap_free(read->parents);lp_idmap_free(read->required);lp_idmap_free(read->opposite);}PG_END_TRY();
     pfree(read->links);
 }
-void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
-                              const lp_id *refuse,int nrefuse,int16 endpoint,
-                              const lp_id *include,int ninclude,int64 arity,
-                              const lp_id *opposite,int nopposite,
-                              lp_pg_claim_visit visit,void *context)
+void lp_pg_claims_each_scoped_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
+                                     const lp_id *refuse,int nrefuse,int16 endpoint,
+                                     const lp_id *include,int ninclude,int64 arity,
+                                     const lp_id *opposite,int nopposite,
+                                     bool has_scope,const lp_id *witnesses,int nwitnesses,Oid idarr,
+                                     lp_pg_claim_visit visit,void *context)
 {
     if(count<=0||!visit||fan==0)return;
+    if(has_scope&&nwitnesses<=0)return;
     if(endpoint<0||endpoint>3)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native claim endpoint must be 0 (any), 1 (first), 2 (last) or 3 (either)")));
     if(arity<0)
@@ -925,18 +995,34 @@ void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
     ClaimRead read={
         .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits,
+        .has_scope=has_scope,.witnesses=witnesses,.nwitnesses=nwitnesses,.idarr=idarr,
         .refuse=(lp_id *)refuse,.nrefuse=nrefuse,.include=(lp_id *)include,.ninclude=ninclude,
         .visit=visit,.visit_context=context
     };
     run_claims_query(&read,ids,count,opposite,nopposite);
+}
+void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
+                              const lp_id *refuse,int nrefuse,int16 endpoint,
+                              const lp_id *include,int ninclude,int64 arity,
+                              const lp_id *opposite,int nopposite,
+                              lp_pg_claim_visit visit,void *context)
+{
+    lp_pg_claims_each_scoped_direct(ids,count,fan,bits,refuse,nrefuse,endpoint,include,ninclude,arity,opposite,nopposite,false,NULL,0,InvalidOid,visit,context);
 }
 static Datum read_claims(FunctionCallInfo fcinfo,bool each)
 {
     ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX};
     read.output.output=set_begin(fcinfo,each?"laplace_claims_each":"laplace_claims",&read.output.descriptor);
     if(PG_ARGISNULL(0)||PG_ARGISNULL(2)||PG_ARGISNULL(3))return (Datum)0;
+    lp_id *scope_ids=NULL;
+    if(PG_NARGS()>8&&!PG_ARGISNULL(8)){
+        int nwit=0;scope_ids=ids_of(PG_GETARG_ARRAYTYPE_P(8),&nwit);
+        if(!nwit){pfree(scope_ids);return (Datum)0;}
+        read.has_scope=true;read.witnesses=scope_ids;read.nwitnesses=nwit;
+        read.idarr=get_fn_expr_argtype(fcinfo->flinfo,0);
+    }
     if(PG_NARGS()>4){
-        if(PG_ARGISNULL(4))return (Datum)0;
+        if(PG_ARGISNULL(4)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
         read.endpoint=PG_GETARG_INT16(4);
         if(read.endpoint<0 || read.endpoint>3)
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native claim endpoint must be 0 (any), 1 (first), 2 (last) or 3 (either)")));
@@ -948,25 +1034,25 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
     if(!PG_ARGISNULL(1)){
         int64 limit=PG_GETARG_INT64(1);
         if(limit<0)ereport(ERROR,(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),errmsg("Native claim fan must not be negative")));
-        read.limit=(uint64)limit;if(!limit)return (Datum)0;
+        read.limit=(uint64)limit;if(!limit){if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
-    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&read.bits))return (Datum)0;
+    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&read.bits)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
     read.refuse=ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
-    if(!count){pfree(ids);pfree(read.refuse);return (Datum)0;}
+    if(!count){pfree(ids);pfree(read.refuse);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     if(PG_NARGS()>5 && !PG_ARGISNULL(5)){
         read.include=ids_of(PG_GETARG_ARRAYTYPE_P(5),&read.ninclude);
-        if(!read.ninclude){pfree(ids);pfree(read.refuse);pfree(read.include);return (Datum)0;}
+        if(!read.ninclude){pfree(ids);pfree(read.refuse);pfree(read.include);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
     lp_id *opposite=NULL;int nopposite=0;
     if(PG_NARGS()>7 && !PG_ARGISNULL(7)){
         if(read.endpoint!=1 && read.endpoint!=2)
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
         opposite=ids_of(PG_GETARG_ARRAYTYPE_P(7),&nopposite);
-        if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);return (Datum)0;}
+        if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
     run_claims_query(&read,ids,count,opposite,nopposite);
-    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);return (Datum)0;
+    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;
 }
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}

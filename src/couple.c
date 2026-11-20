@@ -58,7 +58,7 @@ Datum laplace_fills(PG_FUNCTION_ARGS){
  * fetches the paths that hold a segment through the GIN container index; the runs are matched and what follows them is
  * counted here, by Laplace-Native: precedes, contains and co-occurrence from the trajectories, no softmax, no window. */
 /* A segment's observations: each path as it lies, and its tier. */
-typedef struct { Datum path; int16 tier; } Held;
+typedef struct { lp_id entity; Datum path; int16 tier; } Held;
 typedef lp_vec(Held) Helds;
 typedef struct { Helds *w_held; bool *w_hub; int nw; MemoryContext wordctx; } ForwardBatchCtx;
 static void forward_batch_hit(const PgHolderHit *hit, void *context){
@@ -69,7 +69,7 @@ static void forward_batch_hit(const PgHolderHit *hit, void *context){
     if (!hit->path) return;
     MemoryContext old = MemoryContextSwitchTo(c->wordctx);
     Datum copied = PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path));
-    lp_push(&c->w_held[ord], (Held){ copied, hit->tier });
+    lp_push(&c->w_held[ord], ((Held){ hit->entity, copied, hit->tier }));
     MemoryContextSwitchTo(old);
 }
 typedef struct { Helds *dst; bool is_hub; MemoryContext keepctx; } ForwardSegCtx;
@@ -79,8 +79,33 @@ static void forward_seg_hit(const PgHolderHit *hit, void *context){
     if (!hit->path) return;
     MemoryContext old = MemoryContextSwitchTo(c->keepctx);
     Datum copied = PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path));
-    lp_push(c->dst, (Held){ copied, hit->tier });
+    lp_push(c->dst, ((Held){ hit->entity, copied, hit->tier }));
     MemoryContextSwitchTo(old);
+}
+static void filter_forward_held(Helds *groups, size_t ng, const lp_id *witnesses, int nwitnesses){
+    size_t total = 0;
+    for (size_t g = 0; g < ng; g++) total += groups[g].n;
+    if (!total) return;
+    if (nwitnesses <= 0) {
+        for (size_t g = 0; g < ng; g++) groups[g].n = 0;
+        return;
+    }
+    lp_id *ids = palloc(total * sizeof *ids);
+    bool *allowed = palloc(total * sizeof *allowed);
+    size_t k = 0;
+    for (size_t g = 0; g < ng; g++)
+        for (size_t r = 0; r < groups[g].n; r++) ids[k++] = groups[g].v[r].entity;
+    lp_pg_filter_witness_entities(ids, total, witnesses, nwitnesses, allowed);
+    k = 0;
+    for (size_t g = 0; g < ng; g++) {
+        size_t kept = 0;
+        for (size_t r = 0; r < groups[g].n; r++) {
+            if (allowed[k++]) groups[g].v[kept++] = groups[g].v[r];
+        }
+        groups[g].n = kept;
+    }
+    pfree(allowed);
+    pfree(ids);
 }
 typedef struct {
     int32 i, j;
@@ -98,8 +123,15 @@ static int cmp_forward_suffix(const void *a, const void *b){
 
 static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
     TupleDesc td; Tuplestorestate *ts = set_begin(fcinfo, suffix_only ? "laplace_forward_suffix" : "laplace_forward", &td);
+    if (PG_ARGISNULL(0) || PG_ARGISNULL(1)) PG_RETURN_NULL();
+    bool has_scope = PG_NARGS() > 2 && !PG_ARGISNULL(2);
+    lp_id *witnesses = NULL; int nwitnesses = 0;
+    if (has_scope) {
+        witnesses = ids_of(PG_GETARG_ARRAYTYPE_P(2), &nwitnesses);
+        if (!nwitnesses) { pfree(witnesses); PG_RETURN_NULL(); }
+    }
     int n; lp_id *ids = ids_of(PG_GETARG_ARRAYTYPE_P(0), &n); int64 fan = PG_GETARG_INT64(1); if (n > 256) n = 256;
-    if (n < 2) { pfree(ids); PG_RETURN_NULL(); }
+    if (n < 2) { pfree(ids); if (witnesses) pfree(witnesses); PG_RETURN_NULL(); }
     int16 *tier = palloc(sizeof(int16) * (size_t)n);
     for (int i = 0; i < n; i++) tier[i] = -1;
     lp_pg_lookup_entity_tiers(ids, (size_t)n, tier);
@@ -118,6 +150,7 @@ static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
     if (nw > 0) {
         ForwardBatchCtx bctx = { w_held, w_hub, nw, wordctx };
         lp_pg_holders_direct(w_ids, nw, NULL, 0, true, 0, fan, 2, 0, 0, forward_batch_hit, &bctx);
+        if (has_scope) filter_forward_held(w_held, (size_t)nw, witnesses, nwitnesses);
     }
     Helds held[2] = { { 0 }, { 0 } };
     if (suffix_only) {
@@ -143,6 +176,7 @@ static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
                     int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
                     ForwardSegCtx sctx = { &held[next], false, keepctx };
                     lp_pg_holders_direct(ids + probe, 1, ids + i, np, true, (int16)floor, fan, 2, 0, 0, forward_seg_hit, &sctx);
+                    if (has_scope && !sctx.is_hub) filter_forward_held(&held[next], 1, witnesses, nwitnesses);
                     have = !sctx.is_hub;
                 }
                 if (!have) { cur = next; continue; }
@@ -210,6 +244,7 @@ static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
                             int probe = i; for (int k = i; k <= j; k++) if (tier[k] == floor) { probe = k; break; }
                             ForwardSegCtx sctx = { &held[next], false, keepctx };
                             lp_pg_holders_direct(ids + probe, 1, ids + i, np, true, (int16)floor, fan, 2, 0, 0, forward_seg_hit, &sctx);
+                            if (has_scope && !sctx.is_hub) filter_forward_held(&held[next], 1, witnesses, nwitnesses);
                             have = !sctx.is_hub;
                         }
                     }
@@ -240,6 +275,7 @@ static Datum run_laplace_forward(PG_FUNCTION_ARGS, bool suffix_only){
     }
     for (int k = 0; k < nw; k++) lp_vec_free(&w_held[k]);
     pfree(w_held); pfree(w_hub); pfree(w_ids); pfree(w_at); pfree(tier); pfree(ids);
+    if (witnesses) pfree(witnesses);
     MemoryContextDelete(keepctx); MemoryContextDelete(wordctx);
     lp_idmap_free(followed); lp_vec_free(&out); lp_vec_free(&held[0]); lp_vec_free(&held[1]);
     PG_RETURN_NULL();
@@ -346,6 +382,10 @@ typedef struct {
     int16 shape;
     Curves *cv;
     lp_idmap *seen;
+    bool buffer_only;
+    lp_vec(Held) buffered;
+    lp_vec(int) buffered_occ;
+    MemoryContext buf_ctx;
 } ContainCollect;
 static void couple_contain_hit(const PgHolderHit *hit, void *context){
     ContainCollect *c = context;
@@ -353,6 +393,14 @@ static void couple_contain_hit(const PgHolderHit *hit, void *context){
     int64 gidx = hit->ordinal - 1;
     if (gidx < 0 || gidx >= c->group_n) return;
     int orig = c->orig_idx[gidx];
+    if (c->buffer_only) {
+        MemoryContext old = MemoryContextSwitchTo(c->buf_ctx);
+        Held h = { hit->entity, PointerGetDatum(PG_DETOAST_DATUM_COPY(hit->path)), hit->tier };
+        lp_push(&c->buffered, h);
+        lp_push(&c->buffered_occ, orig);
+        MemoryContextSwitchTo(old);
+        return;
+    }
     emit(c->f, &hit->entity, orig + 1, ROUTE_CONTAIN, NULL, NULL, NULL, hit->tier, 0.0, NULL, 0);
     if (c->shape >= 0) nominate(c->cv, c->seen, &hit->entity, hit->path);
 }
@@ -365,6 +413,13 @@ static void couple_knn_path(const lp_id *id, Datum path, Datum mask, void *conte
 PG_FUNCTION_INFO_V1(laplace_couple);
 Datum laplace_couple(PG_FUNCTION_ARGS){
     Field f = { fcinfo, NULL, NULL, InvalidOid }; f.ts = set_begin(fcinfo, "laplace_couple", &f.td);
+    for (int a = 0; a <= 5; a++) if (PG_ARGISNULL(a)) PG_RETURN_NULL();
+    bool has_scope = PG_NARGS() > 6 && !PG_ARGISNULL(6);
+    lp_id *witnesses = NULL; int nwitnesses = 0;
+    if (has_scope) {
+        witnesses = ids_of(PG_GETARG_ARRAYTYPE_P(6), &nwitnesses);
+        if (!nwitnesses) { pfree(witnesses); PG_RETURN_NULL(); }
+    }
     Oid idarr = get_fn_expr_argtype(fcinfo->flinfo, 0); f.el = get_element_type(idarr);
     int nocc; lp_id *occ = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nocc);
     int64 fan = PG_GETARG_INT64(1);
@@ -373,10 +428,11 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
     /* strands: every claim holding an occurrence, refusals out before the fan; the strand answers with its other end */
     if (nocc > 0 && fan > 0) {
         StrandCollect sc = { occ, nocc, fan, palloc0(sizeof(int) * (size_t)(nocc + 1)), { 0 } };
-        lp_pg_claims_each_direct(occ, nocc, fan + 1, UINT64_C(1),
-                                 refuse, nrefuse, 0,
-                                 NULL, 0, 0, NULL, 0,
-                                 couple_strand_hit, &sc);
+        lp_pg_claims_each_scoped_direct(occ, nocc, fan + 1, UINT64_C(1),
+                                        refuse, nrefuse, 0,
+                                        NULL, 0, 0, NULL, 0,
+                                        has_scope, witnesses, nwitnesses, idarr,
+                                        couple_strand_hit, &sc);
         for (size_t r = 0; r < sc.hits.n; r++) {
             const StrandHit *s = &sc.hits.v[r];
             if (sc.held[s->idx] > fan) continue;
@@ -394,6 +450,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
         bool *done = palloc0(sizeof(bool) * (size_t)nocc);
         lp_id *g_ids = palloc(sizeof(lp_id) * (size_t)nocc);
         int *g_orig = palloc(sizeof(int) * (size_t)nocc);
+        MemoryContext cctx = has_scope ? AllocSetContextCreate(CurrentMemoryContext, "couple contain scope", ALLOCSET_DEFAULT_SIZES) : NULL;
         for (int i = 0; i < nocc; i++) {
             if (done[i] || occ_tier[i] < 0) continue;
             int16 t = occ_tier[i];
@@ -406,9 +463,24 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
                     gn++;
                 }
             }
-            ContainCollect cc = { &f, g_orig, gn, shape, &cv, seen };
+            ContainCollect cc = { &f, g_orig, gn, shape, &cv, seen, has_scope, { 0 }, { 0 }, cctx };
             lp_pg_holders_direct(g_ids, gn, NULL, 0, true, t, fan, 2, 0, 0, couple_contain_hit, &cc);
+            if (has_scope && cc.buffered.n > 0) {
+                lp_id *bids = palloc(cc.buffered.n * sizeof *bids);
+                bool *ballow = palloc(cc.buffered.n * sizeof *ballow);
+                for (size_t r = 0; r < cc.buffered.n; r++) bids[r] = cc.buffered.v[r].entity;
+                lp_pg_filter_witness_entities(bids, cc.buffered.n, witnesses, nwitnesses, ballow);
+                for (size_t r = 0; r < cc.buffered.n; r++) {
+                    if (!ballow[r]) continue;
+                    emit(&f, &cc.buffered.v[r].entity, cc.buffered_occ.v[r] + 1, ROUTE_CONTAIN, NULL, NULL, NULL, cc.buffered.v[r].tier, 0.0, NULL, 0);
+                    if (shape >= 0) nominate(&cv, seen, &cc.buffered.v[r].entity, cc.buffered.v[r].path);
+                }
+                pfree(ballow); pfree(bids);
+            }
+            lp_vec_free(&cc.buffered); lp_vec_free(&cc.buffered_occ);
+            if (cctx) MemoryContextReset(cctx);
         }
+        if (cctx) MemoryContextDelete(cctx);
         pfree(g_orig); pfree(g_ids); pfree(done); pfree(occ_tier);
     }
     if (shape >= 0 && keep > 0 && nocc > 0) {
@@ -427,8 +499,18 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
                 if (nk > 0) {
                     lp_id *knn_ids = palloc(sizeof(lp_id) * (size_t)nk);
                     for (int i = 0; i < nk; i++) knn_ids[i] = hits[i].id;
-                    KnnNominate kc = { &cv, seen };
-                    lp_pg_lookup_paths(knn_ids, (size_t)nk, false, couple_knn_path, &kc);
+                    if (has_scope) {
+                        bool *kallow = palloc(sizeof(bool) * (size_t)nk);
+                        lp_pg_filter_witness_entities(knn_ids, (size_t)nk, witnesses, nwitnesses, kallow);
+                        int kkept = 0;
+                        for (int i = 0; i < nk; i++) if (kallow[i]) knn_ids[kkept++] = knn_ids[i];
+                        nk = kkept;
+                        pfree(kallow);
+                    }
+                    if (nk > 0) {
+                        KnnNominate kc = { &cv, seen };
+                        lp_pg_lookup_paths(knn_ids, (size_t)nk, false, couple_knn_path, &kc);
+                    }
                     pfree(knn_ids);
                 }
                 pfree(hits);
@@ -447,6 +529,7 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
         }
         pfree(pa);
     }
+    if (witnesses) pfree(witnesses);
     lp_idmap_free(seen); lp_vec_free(&cv); pfree(occ);
     PG_RETURN_NULL();
 }

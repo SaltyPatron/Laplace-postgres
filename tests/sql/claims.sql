@@ -115,4 +115,28 @@ BEGIN
   RAISE EXCEPTION 'Native empty/null claim selection changed';
  END IF;
 END $$;
+DO $$
+DECLARE a blake3:=pg_temp.leaf(97); b blake3:=pg_temp.leaf(98);
+        w1 blake3:=md5('Laplace check regression claims witness-one')::blake3;
+        w2 blake3:=md5('Laplace check regression claims witness-two')::blake3;
+        ab blake3:=(SELECT id FROM selected_claim_fixture WHERE label='ab');
+        acb blake3:=(SELECT id FROM selected_claim_fixture WHERE label='acb');
+        keys blake3[]:=ARRAY[a,b];
+        bits smallint[]:=ARRAY[laplace_bank_bit('kind','claim')];
+BEGIN
+ INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES
+  (ab,w1,NULL,4,4,1.0,NULL,0.9),
+  (acb,w2,NULL,4,4,0.0,NULL,0.9);
+ IF (SELECT count(DISTINCT entity) FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,ARRAY[w1]))<>1
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,ARRAY[w1]) WHERE entity<>ab OR rating<=1500)
+ OR (SELECT count(DISTINCT entity) FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,ARRAY[w2]))<>1
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,ARRAY[w2]) WHERE entity<>acb OR rating>=1500)
+ OR EXISTS(SELECT FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,'{}'::blake3[]))
+ OR EXISTS((SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL))
+            EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,NULL::blake3[]))
+ OR EXISTS((SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL,NULL::blake3[]))
+            EXCEPT ALL SELECT * FROM laplace_claims_each(keys,NULL,bits,'{}',0::smallint,NULL,0,NULL)) THEN
+  RAISE EXCEPTION 'Witness-scoped laplace_claims_each failed isolation or unscoped parity';
+ END IF;
+END $$;
 ROLLBACK;

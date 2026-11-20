@@ -944,6 +944,96 @@ BEGIN
   SELECT count(*) INTO n FROM laplace_witness_trust(ARRAY[w1, w2, w1, stranger]);
   IF n <> 2 THEN RAISE EXCEPTION 'asked-witness form did not list each witness once: %', n; END IF;
 END $$;
+DO $$
+DECLARE
+  w1 blake3 := md5('Laplace check regression scoped w1')::blake3;
+  w2 blake3 := md5('Laplace check regression scoped w2')::blake3;
+  w_prefix blake3 := md5('Laplace check regression scoped tok-prefix')::blake3;
+  w_shared blake3 := md5('Laplace check regression scoped tok-shared')::blake3;
+  w_next1 blake3 := md5('Laplace check regression scoped tok-next1')::blake3;
+  w_next2 blake3 := md5('Laplace check regression scoped tok-next2')::blake3;
+  w_extra blake3 := md5('Laplace check regression scoped tok-extra')::blake3;
+  rel blake3 := md5('Laplace check regression scoped rel')::blake3;
+  obs_w1 blake3 := laplace_compose(ARRAY[w_prefix, w_shared, w_next1]);
+  obs_w2 blake3 := laplace_compose(ARRAY[w_prefix, w_shared, w_next2]);
+  doc_w1 blake3 := laplace_compose(ARRAY[obs_w1, w_extra]);
+  cl_both blake3 := laplace_compose(ARRAY[w_shared, rel, w_next1]);
+  cl_w2 blake3 := laplace_compose(ARRAY[w_shared, rel, w_next2]);
+  r1 double precision; r2 double precision;
+BEGIN
+  INSERT INTO entity(id,tier,coord,hilbert)
+  SELECT v.id, v.t, laplace_coord(v.lbl), laplace_hilbert(v.lbl)
+  FROM (VALUES
+    (w_prefix, 1::smallint, 'scopedprefix'),
+    (w_shared, 1::smallint, 'scopedshared'),
+    (w_next1, 1::smallint, 'scopednexta'),
+    (w_next2, 1::smallint, 'scopednextb'),
+    (w_extra, 1::smallint, 'scopedextra'),
+    (rel, 1::smallint, 'scopedrel'),
+    (obs_w1, 2::smallint, 'scopedobsa'),
+    (obs_w2, 2::smallint, 'scopedobsb'),
+    (doc_w1, 3::smallint, 'scopeddoca'),
+    (cl_both, 2::smallint, 'scopedclboth'),
+    (cl_w2, 2::smallint, 'scopedcltwo')
+  ) v(id, t, lbl);
+
+  INSERT INTO physicality(entity,tier,hilbert,path,mask)
+  SELECT e.id, e.tier, e.hilbert, p.path, p.mask
+  FROM (VALUES
+    (obs_w1, laplace_path(ARRAY[w_prefix, w_shared, w_next1]), B'0'::bit(64)),
+    (obs_w2, laplace_path(ARRAY[w_prefix, w_shared, w_next2]), B'0'::bit(64)),
+    (doc_w1, laplace_path(ARRAY[obs_w1, w_extra]), B'0'::bit(64)),
+    (cl_both, laplace_path(ARRAY[w_shared, rel, w_next1]), laplace_mask_slot('kind','claim')),
+    (cl_w2, laplace_path(ARRAY[w_shared, rel, w_next2]), laplace_mask_slot('kind','claim'))
+  ) p(id, path, mask)
+  JOIN entity e ON e.id = p.id;
+
+  INSERT INTO consensus(claim,rating,deviation,volatility,matches) VALUES
+    (cl_both, 1500, 350, 0.06, 2),
+    (cl_w2, 1650, 90, 0.06, 8);
+
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES
+    (doc_w1, w1, NULL, 4, 4, 1.0, NULL, 0.9),
+    (obs_w2, w2, NULL, 4, 4, 1.0, NULL, 0.9),
+    (cl_both, w1, NULL, 4, 4, 1.0, NULL, 0.9),
+    (cl_both, w2, NULL, 4, 4, 0.0, NULL, 0.9),
+    (cl_w2, w2, NULL, 8, 8, 1.0, NULL, 0.9);
+
+  IF EXISTS((SELECT ordinal,claim,rating,deviation,volatility,matches FROM laplace_standings_scoped(ARRAY[cl_both], NULL))
+            EXCEPT ALL SELECT ordinal,claim,rating,deviation,volatility,matches FROM laplace_standings(ARRAY[cl_both]))
+  OR EXISTS((SELECT ordinal,claim,rating,deviation,volatility,matches FROM laplace_standings(ARRAY[cl_both]))
+            EXCEPT ALL SELECT ordinal,claim,rating,deviation,volatility,matches FROM laplace_standings_scoped(ARRAY[cl_both], NULL))
+  OR EXISTS(SELECT FROM laplace_standings_scoped(ARRAY[cl_both], '{}'::blake3[])) THEN
+    RAISE EXCEPTION 'laplace_standings_scoped NULL/empty scope violated contract';
+  END IF;
+  SELECT rating INTO r1 FROM laplace_standings_scoped(ARRAY[cl_both], ARRAY[w1]);
+  SELECT rating INTO r2 FROM laplace_standings_scoped(ARRAY[cl_both], ARRAY[w2]);
+  IF r1 IS NULL OR r2 IS NULL OR r1 <= 1500 OR r2 >= 1500 THEN
+    RAISE EXCEPTION 'laplace_standings_scoped failed witness polarity isolation: r1=%, r2=%', r1, r2;
+  END IF;
+
+  IF NOT EXISTS(SELECT FROM laplace_holders_with_standings(ARRAY[w_shared], '{}', false, -1::smallint, -1::bigint, 2::smallint, '{}'::smallint[], 0::smallint, ARRAY[w1]) WHERE entity = obs_w1)
+  OR EXISTS(SELECT FROM laplace_holders_with_standings(ARRAY[w_shared], '{}', false, -1::smallint, -1::bigint, 2::smallint, '{}'::smallint[], 0::smallint, ARRAY[w1]) WHERE entity = obs_w2)
+  OR NOT EXISTS(SELECT FROM laplace_holders_with_standings(ARRAY[w_shared], '{}', false, -1::smallint, -1::bigint, 2::smallint, '{}'::smallint[], 0::smallint, ARRAY[w2]) WHERE entity = obs_w2)
+  OR EXISTS(SELECT FROM laplace_holders_with_standings(ARRAY[w_shared], '{}', false, -1::smallint, -1::bigint, 2::smallint, '{}'::smallint[], 0::smallint, ARRAY[w2]) WHERE entity = obs_w1)
+  OR EXISTS(SELECT FROM laplace_holders_with_standings(ARRAY[w_shared], '{}', false, -1::smallint, -1::bigint, 2::smallint, '{}'::smallint[], 0::smallint, '{}'::blake3[])) THEN
+    RAISE EXCEPTION 'laplace_holders_with_standings failed upward containment witness isolation';
+  END IF;
+
+  IF NOT EXISTS(SELECT FROM laplace_forward(ARRAY[w_prefix, w_shared], 64::bigint, ARRAY[w1]) WHERE next = w_next1)
+  OR EXISTS(SELECT FROM laplace_forward(ARRAY[w_prefix, w_shared], 64::bigint, ARRAY[w1]) WHERE next = w_next2)
+  OR NOT EXISTS(SELECT FROM laplace_forward_suffix(ARRAY[w_prefix, w_shared], 64::bigint, ARRAY[w1]) WHERE next = w_next1)
+  OR EXISTS(SELECT FROM laplace_forward_suffix(ARRAY[w_prefix, w_shared], 64::bigint, ARRAY[w1]) WHERE next = w_next2)
+  OR EXISTS(SELECT FROM laplace_forward(ARRAY[w_prefix, w_shared], 64::bigint, '{}'::blake3[])) THEN
+    RAISE EXCEPTION 'laplace_forward / suffix failed witness isolation';
+  END IF;
+
+  IF NOT EXISTS(SELECT FROM laplace_couple(ARRAY[w_shared], 64::bigint, '{}'::blake3[], -1::smallint, 0.0::float8, 8, ARRAY[w1]) WHERE entity IN (cl_both, obs_w1))
+  OR EXISTS(SELECT FROM laplace_couple(ARRAY[w_shared], 64::bigint, '{}'::blake3[], -1::smallint, 0.0::float8, 8, ARRAY[w1]) WHERE entity IN (cl_w2, obs_w2))
+  OR EXISTS(SELECT FROM laplace_couple(ARRAY[w_shared], 64::bigint, '{}'::blake3[], -1::smallint, 0.0::float8, 8, '{}'::blake3[])) THEN
+    RAISE EXCEPTION 'laplace_couple failed witness isolation';
+  END IF;
+END $$;
 SELECT 'attestation: witness trust reads one first-lineage row per witness';
 ROLLBACK;
 SELECT 'attestation: real containment, cumulative replay, independent agreement, rooted folding, lineage, signed trust and bigint games passed';

@@ -1171,3 +1171,162 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
     PG_END_TRY();
     return (Datum)0;
 }
+
+typedef struct { size_t child, parent; } WitnessUpEdge;
+typedef struct {
+    lp_idmap *scope, *nodes, *front, *next, *seen_level;
+    lp_vec(uint8_t) allowed;
+    lp_vec(WitnessUpEdge) edges;
+    lp_vec(lp_id) new_ids;
+    lp_vec(size_t) new_nodes;
+    lp_vec(lp_vertex) vertices;
+    size_t max_nodes, max_edges;
+} WitnessFilterCtx;
+
+static void witness_filter_visit(const lp_id *parent, Datum path, Datum mask, void *context)
+{
+    WitnessFilterCtx *c = context; (void)mask;
+    if (c->edges.n >= c->max_edges) return;
+    bool level_fresh = false;
+    lp_idmap_put(c->seen_level, parent, &level_fresh);
+    if (!level_fresh) return;
+    Geo g = geo_of(path);
+    int nv = (int)g.p.n;
+    if (nv <= 0) return;
+    lp_vec_reserve(&c->vertices, (size_t)nv);
+    if (lp_path_decode(g.p, c->vertices.v, (size_t)nv) != (size_t)nv) return;
+    size_t p_idx = SIZE_MAX;
+    for (int k = 0; k < nv; k++) {
+        const lp_vertex *v = &c->vertices.v[k];
+        if (v->said == LP_SAID_METADATA || v->said == LP_SAID_DEPENDENCE) continue;
+        int64_t f_ord = lp_idmap_find(c->front, &v->id);
+        if (f_ord < 0) continue;
+        int64_t ch_ord = lp_idmap_find(c->nodes, &v->id);
+        if (ch_ord < 0) continue;
+        if (p_idx == SIZE_MAX) {
+            bool p_fresh = false;
+            int64_t existing = lp_idmap_find(c->nodes, parent);
+            if (existing >= 0) {
+                p_idx = (size_t)existing;
+            } else {
+                if (lp_idmap_count(c->nodes) >= c->max_nodes) return;
+                p_idx = lp_idmap_put(c->nodes, parent, &p_fresh);
+                uint8_t hit = (lp_idmap_find(c->scope, parent) >= 0) ? 1 : 0;
+                lp_push(&c->allowed, hit);
+                if (!hit && p_fresh) {
+                    lp_idmap_put(c->next, parent, NULL);
+                    lp_push(&c->new_ids, *parent);
+                    lp_push(&c->new_nodes, p_idx);
+                }
+            }
+        }
+        if (c->edges.n < c->max_edges) {
+            WitnessUpEdge e = { (size_t)ch_ord, p_idx };
+            lp_push(&c->edges, e);
+        }
+    }
+}
+
+void lp_pg_filter_witness_entities(const lp_id *entities, size_t count,
+                                   const lp_id *witnesses, int nwitnesses, bool *allowed)
+{
+    if (!entities || !allowed || !count) return;
+    memset(allowed, 0, count * sizeof *allowed);
+    if (!witnesses || nwitnesses <= 0) return;
+
+    MemoryContext caller = CurrentMemoryContext;
+    MemoryContext context = AllocSetContextCreate(caller, "Native witness entity filter", ALLOCSET_DEFAULT_SIZES);
+    MemoryContextSwitchTo(context);
+
+    size_t *orig_node = palloc(count * sizeof *orig_node);
+    WitnessFilterCtx wf = {
+        .scope = lp_idmap_new(),
+        .nodes = lp_idmap_new(),
+        .front = lp_idmap_new(),
+        .max_nodes = 131072,
+        .max_edges = 262144
+    };
+    lp_vec(lp_id) check_att = {0};
+    PG_TRY(); {
+        for (int i = 0; i < nwitnesses; i++) lp_idmap_put(wf.scope, witnesses + i, NULL);
+        for (size_t i = 0; i < count; i++) {
+            bool fresh = false;
+            size_t idx = lp_idmap_put(wf.nodes, entities + i, &fresh);
+            orig_node[i] = idx;
+            if (fresh) {
+                uint8_t direct = (lp_idmap_find(wf.scope, entities + i) >= 0) ? 1 : 0;
+                lp_push(&wf.allowed, direct);
+                if (!direct) lp_push(&check_att, entities[i]);
+            }
+        }
+        if (check_att.n > 0) {
+            PgAttrRows att = {0};
+            lp_pg_read_attestation_pk(check_att.v, (int)check_att.n, wf.scope, &att, NULL);
+            for (size_t k = 0; k < att.n; k++) {
+                int64_t idx = lp_idmap_find(wf.nodes, &att.v[k].claim);
+                if (idx >= 0) wf.allowed.v[idx] = 1;
+            }
+            lp_vec_free(&att);
+            for (size_t k = 0; k < check_att.n; k++) {
+                int64_t idx = lp_idmap_find(wf.nodes, &check_att.v[k]);
+                if (idx >= 0 && !wf.allowed.v[idx]) lp_idmap_put(wf.front, &check_att.v[k], NULL);
+            }
+        }
+        for (int lvl = 0; lvl < 16 && lp_idmap_count(wf.front) > 0
+             && lp_idmap_count(wf.nodes) < wf.max_nodes && wf.edges.n < wf.max_edges; lvl++) {
+            CHECK_FOR_INTERRUPTS();
+            wf.next = lp_idmap_new();
+            wf.seen_level = lp_idmap_new();
+            wf.new_ids.n = 0;
+            wf.new_nodes.n = 0;
+            lp_pg_lookup_containers(lp_idmap_keys(wf.front), lp_idmap_count(wf.front),
+                                    false, false, witness_filter_visit, &wf);
+            if (wf.new_ids.n > 0) {
+                PgAttrRows att = {0};
+                lp_pg_read_attestation_pk(wf.new_ids.v, (int)wf.new_ids.n, wf.scope, &att, NULL);
+                for (size_t k = 0; k < att.n; k++) {
+                    int64_t idx = lp_idmap_find(wf.nodes, &att.v[k].claim);
+                    if (idx >= 0) wf.allowed.v[idx] = 1;
+                }
+                lp_vec_free(&att);
+            }
+            lp_idmap_free(wf.seen_level); wf.seen_level = NULL;
+            lp_idmap_free(wf.front);
+            /* Only continue climbing from nodes not yet proved allowed. */
+            lp_idmap *filtered_next = lp_idmap_new();
+            for (size_t k = 0; k < lp_idmap_count(wf.next); k++) {
+                const lp_id *nid = lp_idmap_key(wf.next, k);
+                int64_t nidx = lp_idmap_find(wf.nodes, nid);
+                if (nidx >= 0 && !wf.allowed.v[nidx]) lp_idmap_put(filtered_next, nid, NULL);
+            }
+            lp_idmap_free(wf.next); wf.next = NULL;
+            wf.front = filtered_next;
+        }
+        for (int pass = 0; pass < 16; pass++) {
+            bool changed = false;
+            for (size_t e = wf.edges.n; e-- > 0;) {
+                WitnessUpEdge edge = wf.edges.v[e];
+                if (wf.allowed.v[edge.parent] && !wf.allowed.v[edge.child]) {
+                    wf.allowed.v[edge.child] = 1;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+        for (size_t i = 0; i < count; i++) allowed[i] = wf.allowed.v[orig_node[i]] != 0;
+    } PG_FINALLY(); {
+        lp_idmap_free(wf.scope);
+        lp_idmap_free(wf.nodes);
+        lp_idmap_free(wf.front);
+        lp_idmap_free(wf.next);
+        lp_idmap_free(wf.seen_level);
+        lp_vec_free(&wf.allowed);
+        lp_vec_free(&wf.edges);
+        lp_vec_free(&wf.new_ids);
+        lp_vec_free(&wf.new_nodes);
+        lp_vec_free(&wf.vertices);
+        lp_vec_free(&check_att);
+        MemoryContextSwitchTo(caller);
+        MemoryContextDelete(context);
+    } PG_END_TRY();
+}

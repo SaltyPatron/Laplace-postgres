@@ -197,6 +197,7 @@ laplace_stage_retire	false
 laplace_stage_rewrite_witness	false
 laplace_standing_counts	false
 laplace_standings	false
+laplace_standings_scoped	false
 laplace_sweep_orphans	false
 laplace_testimony	false
 laplace_text	false

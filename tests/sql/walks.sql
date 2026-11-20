@@ -140,4 +140,30 @@ BEGIN
  BEGIN PERFORM laplace_chains(ARRAY[s],ARRAY[r1],ARRAY[1,2],ARRAY[0],ARRAY[false]); RAISE EXCEPTION 'ragged arrays accepted';
  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
+DO $$
+DECLARE s blake3:=pg_temp.leaf(30); x blake3:=pg_temp.leaf(31); y blake3:=pg_temp.leaf(32); g blake3:=pg_temp.leaf(33);
+        sx blake3; xg blake3; sy blake3; yg blake3;
+        w1 blake3:=md5('Laplace check regression walks witness-one')::blake3;
+        w2 blake3:=md5('Laplace check regression walks witness-two')::blake3;
+        hit record;
+BEGIN
+ SELECT id INTO sx FROM walk_claims WHERE label='sx'; SELECT id INTO xg FROM walk_claims WHERE label='xg';
+ SELECT id INTO sy FROM walk_claims WHERE label='sy'; SELECT id INTO yg FROM walk_claims WHERE label='yg';
+ INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES
+  (sx,w1,NULL,10,10,1.0,NULL,0.9),
+  (xg,w1,NULL,10,10,1.0,NULL,0.9),
+  (sy,w2,NULL,10,10,1.0,NULL,0.9),
+  (yg,w2,NULL,10,10,1.0,NULL,0.9);
+ SELECT * INTO hit FROM laplace_pull(ARRAY[s],ARRAY[g],4,64,256,NULL,'{}',400.0,0.25,ARRAY[w2]) WHERE goal;
+ IF hit IS NULL OR hit.chain<>ARRAY[s,y,g] OR hit.claims<>ARRAY[sy,yg]
+ OR EXISTS(SELECT FROM laplace_pull(ARRAY[s],ARRAY[g],4,64,256,NULL,'{}',400.0,0.25,ARRAY[w2]) WHERE id=x) THEN
+  RAISE EXCEPTION 'Witness-scoped laplace_pull (w2) leaked out-of-scope route';
+ END IF;
+ SELECT * INTO hit FROM laplace_pull(ARRAY[s],ARRAY[g],4,64,256,NULL,'{}',400.0,0.25,ARRAY[w1]) WHERE goal;
+ IF hit IS NULL OR hit.chain<>ARRAY[s,x,g] OR hit.claims<>ARRAY[sx,xg]
+ OR EXISTS(SELECT FROM laplace_pull(ARRAY[s],ARRAY[g],4,64,256,NULL,'{}',400.0,0.25,ARRAY[w1]) WHERE id=y)
+ OR EXISTS(SELECT FROM laplace_pull(ARRAY[s],ARRAY[g],4,64,256,NULL,'{}',400.0,0.25,'{}'::blake3[]) WHERE hops>0) THEN
+  RAISE EXCEPTION 'Witness-scoped laplace_pull (w1/empty) failed isolation';
+ END IF;
+END $$;
 ROLLBACK;

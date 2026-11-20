@@ -528,6 +528,43 @@ Datum laplace_physicalities(PG_FUNCTION_ARGS){return stored_rows(fcinfo,true);}
 PG_FUNCTION_INFO_V1(laplace_standings);
 Datum laplace_standings(PG_FUNCTION_ARGS){return stored_rows(fcinfo,2);}
 
+PG_FUNCTION_INFO_V1(laplace_standings_scoped);
+Datum laplace_standings_scoped(PG_FUNCTION_ARGS)
+{
+    if(PG_ARGISNULL(0)){
+        TupleDesc td;
+        set_begin(fcinfo,"laplace_standings_scoped",&td);
+        return (Datum)0;
+    }
+    if(PG_NARGS()<2||PG_ARGISNULL(1))return stored_rows(fcinfo,2);
+    TupleDesc td;
+    Tuplestorestate *result=set_begin(fcinfo,"laplace_standings_scoped",&td);
+    int nw=0;lp_id *witnesses=ids_of(PG_GETARG_ARRAYTYPE_P(1),&nw);
+    if(!nw){pfree(witnesses);return (Datum)0;}
+    int count=0;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
+    if(!count){pfree(ids);pfree(witnesses);return (Datum)0;}
+    lp_idmap *solved=lp_idmap_sized(sizeof(lp_standing));
+    PG_TRY();{
+        lp_pg_solve_scoped_standings(ids,count,get_fn_expr_argtype(fcinfo->flinfo,0),witnesses,nw,solved);
+        for(int i=0;i<count;i++){
+            const lp_standing *st=lp_idmap_lookup(solved,&ids[i]);
+            if(!st)continue;
+            Datum values[6]={
+                Int64GetDatum((int64)i+1),id_datum(&ids[i]),
+                Float8GetDatum(st->rating),Float8GetDatum(st->deviation),
+                Float8GetDatum(st->volatility),Int64GetDatum((int64)st->matches)
+            };
+            bool missing[6]={false};
+            set_put(fcinfo,result,td,values,missing);
+            pfree(DatumGetPointer(values[1]));
+        }
+    }PG_FINALLY();{
+        lp_idmap_free(solved);
+        pfree(ids);pfree(witnesses);
+    }PG_END_TRY();
+    return (Datum)0;
+}
+
 typedef struct {
     lp_pg_path_visit visit;void *context;AttrNumber path,mask;MemoryContext tuple_context;
 } PathFrontier;

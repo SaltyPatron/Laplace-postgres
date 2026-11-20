@@ -108,6 +108,8 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
     bool no_middle = PG_ARGISNULL(5);
     int nmid = 0; lp_id *mids = no_middle ? NULL : ids_of(PG_GETARG_ARRAYTYPE_P(5), &nmid);
     int nref = 0; lp_id *refuse = PG_ARGISNULL(6) ? NULL : ids_of(PG_GETARG_ARRAYTYPE_P(6), &nref);
+    bool has_scope = PG_NARGS() > 9 && !PG_ARGISNULL(9);
+    int nwit = 0; lp_id *witnesses = has_scope ? ids_of(PG_GETARG_ARRAYTYPE_P(9), &nwit) : NULL;
     lp_frontier *f = lp_frontier_new();
     lp_idmap *info = lp_idmap_sized(sizeof(PullInfo)), *goal = lp_idmap_new(), *seedset = lp_idmap_new();
     PG_TRY(); {
@@ -133,10 +135,11 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
             for (int i = 0; i < nb; i++) if ((int64)batch[i].hops < maxhops) { ids[m] = batch[i].id; who[m++] = i; }
             if (!m) continue;
             WalkClaimCollect col = { .rows = { 0 }, .seen = 0, .cap = 0, .check_cap = false };
-            lp_pg_claims_each_direct(ids, m, fan + 1, UINT64_C(1),
-                                     refuse, nref, 3,
-                                     no_middle ? NULL : mids, nmid, 3, NULL, 0,
-                                     walk_claim_visit, &col);
+            lp_pg_claims_each_scoped_direct(ids, m, fan + 1, UINT64_C(1),
+                                            refuse, nref, 3,
+                                            no_middle ? NULL : mids, nmid, 3, NULL, 0,
+                                            has_scope, witnesses, nwit, idarr,
+                                            walk_claim_visit, &col);
             size_t nc = col.rows.n; WalkClaim *cl = col.rows.v;
             lp_sort(cl, nc, sizeof(WalkClaim), by_claim);                         /* each entity's claims in ID order */
             int64 held[PULL_BATCH] = { 0 }, used[PULL_BATCH] = { 0 };
@@ -176,6 +179,7 @@ Datum laplace_pull(PG_FUNCTION_ARGS){
             set_put(fcinfo, ts, td, o, nl); pfree(chain); pfree(claims);
         }
     } PG_FINALLY(); { lp_frontier_free(f); lp_idmap_free(info); lp_idmap_free(goal); lp_idmap_free(seedset); } PG_END_TRY();
+    if (witnesses) pfree(witnesses);
     if (refuse) pfree(refuse);
     if (mids) pfree(mids);
     if (goals) pfree(goals);
