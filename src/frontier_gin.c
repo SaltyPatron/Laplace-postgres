@@ -8,6 +8,7 @@
 #include "access/htup_details.h"
 #include "access/genam.h"
 #include "access/gin.h"
+#include "access/gin_private.h"
 #include "access/tupconvert.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
@@ -18,9 +19,11 @@
 #include "nodes/tidbitmap.h"
 #include "parser/parse_func.h"
 #include "storage/bufmgr.h"
+#include "utils/syscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "partitioning/partdesc.h"
+#include <math.h>
 #include <limits.h>
 
 /* GIN is the retained containment access contract, just as the primary index
@@ -1571,4 +1574,791 @@ Datum laplace_held_closure(PG_FUNCTION_ARGS){
         pfree(ids);
     } PG_END_TRY();
     return (Datum)0;
+}
+
+/* Microsecond trajectory salience over physicality_paths GIN + LineStringZM
+ * (continuous self-information I(e), local span contraction / PMI, and
+ * M-outcome / attestation WIN vs LOSS differential), zero heap/TOAST scans. */
+static bool sal_is_glue(const lp_tier0_record *t0, const lp_layout *flags,
+                        const lp_field *gc, const lp_field *ws, int32 ws_yes,
+                        bool has_crlf, const lp_id *crlf, const lp_id *id)
+{
+    if (has_crlf && lp_id_eq(id, crlf)) return true;
+    int64_t cp = lp_tier0_codepoint(t0, id);
+    if (cp < 0) return false;
+    if (cp == '\r' || cp == '\n') return true;
+    if (flags && ws && ws_yes >= 0 && lp_flags_get(flags, (uint32)cp, ws) == (uint32)ws_yes)
+        return true;
+    if (flags && gc) {
+        uint32 v = lp_flags_get(flags, (uint32)cp, gc);
+        if (v < gc->nvalues) {
+            const char *nm = flags->value[gc->first + v].name;
+            if (nm[0] == 'P' || nm[0] == 'Z' || nm[0] == 'C') return true;
+        }
+    }
+    return false;
+}
+
+static int64 sal_part_rows(Relation table, Oid relid, Oid pk_oid, int64 pending, Snapshot snap)
+{
+    float4 reltuples = -1.0f;
+    HeapTuple ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+    if (HeapTupleIsValid(ctup)) {
+        reltuples = ((Form_pg_class)GETSTRUCT(ctup))->reltuples;
+        ReleaseSysCache(ctup);
+    }
+    BlockNumber nblocks = RelationGetNumberOfBlocks(table);
+    if ((reltuples <= 0.0f || (reltuples <= 200.0f && nblocks <= 16)) && nblocks <= 256 && OidIsValid(pk_oid)) {
+        Relation pk_idx = index_open(pk_oid, AccessShareLock);
+        IndexScanDesc pk_scan = index_beginscan(table, pk_idx, snap, NULL, 0, 0);
+        int64 count = 0;
+        ItemPointer tid;
+        index_rescan(pk_scan, NULL, 0, NULL, 0);
+        while ((tid = index_getnext_tid(pk_scan, ForwardScanDirection)) != NULL && ItemPointerIsValid(tid)) {
+            CHECK_FOR_INTERRUPTS();
+            count++;
+        }
+        index_endscan(pk_scan);
+        index_close(pk_idx, NoLock);
+        return count;
+    }
+    if (reltuples > 0.0f) return (int64)llround((double)reltuples) + pending;
+    return Max(pending, (int64)nblocks * 32);
+}
+
+static Datum sal_path_member_key(const lp_id *id)
+{
+    uint8 bytes[17];
+    bytes[0] = 0;
+    memcpy(bytes + 1, id->b, 16);
+    return PointerGetDatum(bytes_datum(bytes, sizeof bytes));
+}
+
+static int64 sal_tbm_consume_count(TIDBitmap *tmp)
+{
+    if (!tmp || tbm_is_empty(tmp)) {
+        if (tmp) tbm_free(tmp);
+        return 0;
+    }
+    OffsetNumber offsets[TBM_MAX_TUPLES_PER_PAGE];
+    TBMPrivateIterator *it = tbm_begin_private_iterate(tmp);
+    TBMIterateResult res;
+    int64 count = 0;
+    while (tbm_private_iterate(it, &res)) {
+        if (res.lossy) count += 32;
+        else count += tbm_extract_page_tuple(&res, offsets, TBM_MAX_TUPLES_PER_PAGE);
+    }
+    tbm_end_private_iterate(it);
+    tbm_free(tmp);
+    return count;
+}
+
+static int64 sal_tbm_count_copy(const TIDBitmap *src, Size bm_mem)
+{
+    if (!src || tbm_is_empty(src)) return 0;
+    TIDBitmap *tmp = tbm_create(bm_mem, NULL);
+    tbm_union(tmp, src);
+    return sal_tbm_consume_count(tmp);
+}
+
+static int64 sal_tbm_intersect_count(const TIDBitmap *a, const TIDBitmap *b, Size bm_mem)
+{
+    if (!a || !b || tbm_is_empty(a) || tbm_is_empty(b)) return 0;
+    TIDBitmap *tmp = tbm_create(bm_mem, NULL);
+    tbm_union(tmp, a);
+    tbm_intersect(tmp, b);
+    return sal_tbm_consume_count(tmp);
+}
+
+typedef struct { int ua, ub; int64 co; bool stored; } SalPair;
+typedef struct { lp_id entity; Datum path; } SalHolder;
+typedef struct {
+    lp_idmap *wanted;
+    lp_idmap *holders;
+    lp_mask bits;
+    AttrNumber id_att, path_att, mask_att;
+    MemoryContext hctx;
+} SalLossCollect;
+
+static bool sal_loss_visit(TupleTableSlot *slot, void *context)
+{
+    SalLossCollect *lc = context;
+    bool missing = false;
+    if (lc->bits) {
+        Datum mv = slot_getattr(slot, lc->mask_att, &missing);
+        if (missing || (lp_pg_mask_native(mv) & lc->bits) != lc->bits) return true;
+    }
+    Datum ev = slot_getattr(slot, lc->id_att, &missing);
+    if (missing) return true;
+    const lp_id *eid = (const lp_id *)DatumGetPointer(ev);
+    Datum pv = slot_getattr(slot, lc->path_att, &missing);
+    if (missing) return true;
+    bytea *det = (bytea *)PG_DETOAST_DATUM(pv);
+    Geo g = geo_of(PointerGetDatum(det));
+    bool any_active = false;
+    for (size_t i = 0; i < g.p.n; i++) {
+        lp_id cid = lp_path_id(g.p, i);
+        int64 at = lp_idmap_find(lc->wanted, &cid);
+        if (at >= 0) {
+            HolderKey *hk = lp_idmap_at(lc->wanted, (size_t)at);
+            hk->held[0]++;
+            if (hk->held[0] <= 64) any_active = true;
+        }
+    }
+    if (!any_active) return true;
+    bool fresh = false;
+    size_t h_at = lp_idmap_put(lc->holders, eid, &fresh);
+    if (fresh) {
+        Size sz = VARSIZE_ANY(det);
+        bytea *copy = MemoryContextAlloc(lc->hctx, sz);
+        memcpy(copy, det, sz);
+        SalHolder *sh = lp_idmap_at(lc->holders, h_at);
+        sh->entity = *eid;
+        sh->path = PointerGetDatum(copy);
+    }
+    return true;
+}
+
+void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, PgSalience *out)
+{
+    if (nocc <= 0 || !out) return;
+    memset(out, 0, sizeof(PgSalience) * (size_t)nocc);
+
+    const lp_tier0_record *t0 = lp_pg_tier0();
+    const lp_layout *flags = lp_pg_flags();
+    const lp_field *gc = flags ? lp_flags_field(flags, "gc") : NULL;
+    const lp_field *ws = flags ? lp_flags_field(flags, "White_Space") : NULL;
+    int32 ws_yes = (flags && ws) ? lp_flags_value(flags, ws, "Yes") : -1;
+    if (flags && ws && ws_yes < 0) ws_yes = lp_flags_value(flags, ws, "Y");
+    lp_id crlf = { { 0 } };
+    bool has_crlf = false;
+    const lp_tier0_record *cr_rec = lp_tier0_at(t0, 13);
+    const lp_tier0_record *lf_rec = lp_tier0_at(t0, 10);
+    if (cr_rec && lf_rec) {
+        lp_id cr_lf[2] = { cr_rec->id, lf_rec->id };
+        lp_id_compose(cr_lf, 2, &crlf);
+        has_crlf = true;
+    }
+
+    int16 *occ_tiers = palloc(sizeof(int16) * (size_t)nocc);
+    lp_pg_lookup_entity_tiers(occ, (size_t)nocc, occ_tiers);
+    bool *is_glue = palloc0(sizeof(bool) * (size_t)nocc);
+    int *occ_to_u = palloc(sizeof(int) * (size_t)nocc);
+    lp_idmap *umap = lp_idmap_sized(sizeof(int));
+    int nu = 0, ng = 0;
+    int16 min_active_tier = INT16_MAX, min_any_tier = INT16_MAX;
+
+    for (int i = 0; i < nocc; i++) {
+        if (occ_tiers[i] < 0 && lp_tier0_codepoint(t0, &occ[i]) >= 0) occ_tiers[i] = 0;
+        out[i].tier = occ_tiers[i];
+        is_glue[i] = sal_is_glue(t0, flags, gc, ws, ws_yes, has_crlf, &crlf, &occ[i]);
+        if (occ_tiers[i] >= 0 && occ_tiers[i] < min_any_tier) min_any_tier = occ_tiers[i];
+        if (!is_glue[i]) {
+            ng++;
+            if (occ_tiers[i] >= 0 && occ_tiers[i] < min_active_tier) min_active_tier = occ_tiers[i];
+        }
+        bool fresh = false;
+        size_t at = lp_idmap_put(umap, &occ[i], &fresh);
+        int *slot = lp_idmap_at(umap, at);
+        if (fresh) *slot = nu++;
+        occ_to_u[i] = *slot;
+    }
+    if (min_active_tier == INT16_MAX)
+        min_active_tier = (min_any_tier == INT16_MAX) ? -1 : min_any_tier;
+
+    const lp_id *u_ids = lp_idmap_keys(umap);
+    int16 *u_tiers = palloc(sizeof(int16) * (size_t)nu);
+    bool *u_glue = palloc0(sizeof(bool) * (size_t)nu);
+    for (int i = 0; i < nocc; i++) {
+        u_tiers[occ_to_u[i]] = occ_tiers[i];
+        if (is_glue[i]) u_glue[occ_to_u[i]] = true;
+    }
+
+    int *ng_pos = palloc(sizeof(int) * (size_t)(ng ? ng : 1));
+    int ng_k = 0;
+    for (int i = 0; i < nocc; i++) if (!is_glue[i]) ng_pos[ng_k++] = i;
+
+    int npairs = 0;
+    SalPair *pairs = palloc(sizeof(SalPair) * (size_t)(ng > 1 ? ng - 1 : 1));
+    int *step_pair = palloc(sizeof(int) * (size_t)(ng > 1 ? ng - 1 : 1));
+    for (int k = 0; k < ng - 1; k++) {
+        int ua = occ_to_u[ng_pos[k]], ub = occ_to_u[ng_pos[k + 1]];
+        if (ua == ub) { step_pair[k] = -1; continue; }
+        int lo = ua < ub ? ua : ub, hi = ua < ub ? ub : ua;
+        int found = -1;
+        for (int j = 0; j < npairs; j++)
+            if (pairs[j].ua == lo && pairs[j].ub == hi) { found = j; break; }
+        if (found < 0) {
+            found = npairs++;
+            pairs[found] = (SalPair){ lo, hi, 0, false };
+        }
+        step_pair[k] = found;
+    }
+    if (ng > 1) {
+        lp_id *cand_ids = palloc(sizeof(lp_id) * (size_t)(2 * (ng - 1)));
+        int16 *cand_tiers = palloc(sizeof(int16) * (size_t)(2 * (ng - 1)));
+        int *cand_step = palloc(sizeof(int) * (size_t)(2 * (ng - 1)));
+        int ncand = 0;
+        for (int k = 0; k < ng - 1; k++) {
+            if (step_pair[k] < 0) continue;
+            int pa = ng_pos[k], pb = ng_pos[k + 1];
+            lp_id full_id;
+            lp_id_compose(&occ[pa], (size_t)(pb - pa + 1), &full_id);
+            cand_ids[ncand] = full_id;
+            cand_step[ncand] = step_pair[k];
+            ncand++;
+            if (pb - pa > 1) {
+                lp_id pair_id;
+                lp_id two[2] = { occ[pa], occ[pb] };
+                lp_id_compose(two, 2, &pair_id);
+                cand_ids[ncand] = pair_id;
+                cand_step[ncand] = step_pair[k];
+                ncand++;
+            }
+        }
+        if (ncand > 0) {
+            lp_pg_lookup_entity_tiers(cand_ids, (size_t)ncand, cand_tiers);
+            for (int c = 0; c < ncand; c++)
+                if (cand_tiers[c] >= 0) pairs[cand_step[c]].stored = true;
+        }
+        pfree(cand_step); pfree(cand_tiers); pfree(cand_ids);
+    }
+
+    int64 *df = palloc0(sizeof(int64) * (size_t)nu);
+    int64 total = 0;
+    double *info_bits = palloc0(sizeof(double) * (size_t)nu);
+    double *loss_c = palloc0(sizeof(double) * (size_t)nu);
+
+    Oid phys_oid = lp_pg_relation("physicality");
+    Relation phys_parent = table_open(phys_oid, AccessShareLock);
+    Oid element = get_atttype(phys_oid, get_attnum(phys_oid, "entity"));
+    Oid array_type = get_array_type(element);
+
+    const Oid *canon_parts = NULL, *canon_pks = NULL;
+    const int16 *min_t = NULL, *max_t = NULL;
+    int n_canon = lp_pg_canonical_partitions("physicality", &canon_parts, &canon_pks, NULL, NULL);
+    (void)lp_pg_canonical_tier_bounds("physicality", &min_t, &max_t);
+    int nparts = n_canon > 0 ? n_canon : 1;
+
+    static Oid cached_sal_parent = InvalidOid, cached_sal_idx[256];
+    static int cached_sal_col[256];
+    static uint64 cached_sal_gen = 0;
+    if (cached_sal_gen != lp_pg_binding_generation()) {
+        memset(cached_sal_idx, 0, sizeof(cached_sal_idx));
+        memset(cached_sal_col, 0, sizeof(cached_sal_col));
+        cached_sal_parent = InvalidOid;
+        cached_sal_gen = lp_pg_binding_generation();
+    }
+    if (cached_sal_parent != phys_oid) {
+        memset(cached_sal_idx, 0, sizeof(cached_sal_idx));
+        memset(cached_sal_col, 0, sizeof(cached_sal_col));
+        cached_sal_parent = phys_oid;
+    }
+
+    Snapshot snap = GetActiveSnapshot();
+    Size bm_mem = Min((Size)work_mem * 1024, (Size)4 * 1024 * 1024);
+    TIDBitmap **part_bms = palloc0(sizeof(TIDBitmap *) * (size_t)nu);
+    bool *part_high_df = palloc0(sizeof(bool) * (size_t)nu);
+    int64 *part_est_df = palloc0(sizeof(int64) * (size_t)nu);
+
+    PG_TRY(); {
+        for (int p = 0; p < nparts; p++) {
+            CHECK_FOR_INTERRUPTS();
+            Oid part_oid = n_canon > 0 ? canon_parts[p] : phys_oid;
+            Oid pk_oid = (n_canon > 0 && canon_pks) ? canon_pks[p] : InvalidOid;
+            if (n_canon > 0 && min_t && max_t && min_active_tier >= 0 && max_t[p] <= min_active_tier)
+                continue;
+
+            Relation table = table_open(part_oid, AccessShareLock);
+            if (table->rd_rel->relkind == RELKIND_PARTITIONED_TABLE || RelationGetNumberOfBlocks(table) == 0) {
+                table_close(table, NoLock);
+                continue;
+            }
+            AttrNumber path_att = get_attnum(part_oid, "path");
+            int index_col = 0;
+            Oid operation = InvalidOid;
+            Oid *slot_id = (p < 256) ? &cached_sal_idx[p] : NULL;
+            int *slot_col = (p < 256) ? &cached_sal_col[p] : NULL;
+            Relation index = container_index(table, path_att, array_type, 7, NIL, &index_col, &operation, slot_id, slot_col);
+
+            bool has_pending = false;
+            int64 pending_tups = 0;
+            if (RelationGetNumberOfBlocks(index) > GIN_METAPAGE_BLKNO) {
+                Buffer mbuf = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+                LockBuffer(mbuf, GIN_SHARE);
+                GinMetaPageData *meta = GinPageGetMeta(BufferGetPage(mbuf));
+                has_pending = (meta->head != InvalidBlockNumber);
+                if (meta->nPendingHeapTuples > 0) pending_tups = meta->nPendingHeapTuples;
+                UnlockReleaseBuffer(mbuf);
+            }
+
+            int64 p_rows = sal_part_rows(table, part_oid, pk_oid, pending_tups, snap);
+            total += p_rows;
+
+            memset(part_high_df, 0, sizeof(bool) * (size_t)nu);
+            memset(part_est_df, 0, sizeof(int64) * (size_t)nu);
+            GinState ginstate;
+            initGinState(&ginstate, index);
+
+            for (int u = 0; u < nu; u++) {
+                if (n_canon > 0 && max_t && u_tiers[u] >= 0 && max_t[p] <= u_tiers[u]) continue;
+                Datum kdatum = sal_path_member_key(&u_ids[u]);
+                GinBtreeData btreeEntry;
+                ginPrepareEntryScan(&btreeEntry, (OffsetNumber)index_col, kdatum, GIN_CAT_NORM_KEY, &ginstate);
+                GinBtreeStack *stackEntry = ginFindLeafPage(&btreeEntry, true, false);
+                Page page = BufferGetPage(stackEntry->buffer);
+                bool needUnlock = true;
+
+                if (btreeEntry.findItem(&btreeEntry, stackEntry)) {
+                    IndexTuple itup = (IndexTuple)PageGetItem(page, PageGetItemId(page, stackEntry->off));
+                    if (GinIsPostingTree(itup)) {
+                        BlockNumber rootBlk = GinGetPostingTree(itup);
+                        LockBuffer(stackEntry->buffer, GIN_UNLOCK);
+                        needUnlock = false;
+
+                        GinBtreeData btreeData;
+                        GinBtreeStack *stack = ginScanBeginPostingTree(&btreeData, index, rootBlk);
+                        uint32 pred_pages = stack->predictNumber > 0 ? stack->predictNumber : 1;
+                        Page lpage = BufferGetPage(stack->buffer);
+                        ItemPointerData minItem;
+                        ItemPointerSetMin(&minItem);
+                        int nfirst = 0;
+                        ItemPointer firstItems = NULL;
+                        if (!GinPageIsDeleted(lpage))
+                            firstItems = GinDataLeafPageGetItems(lpage, &nfirst, minItem);
+
+                        if (u_glue[u] || pred_pages > 8 || (int64)pred_pages * nfirst > 4096) {
+                            part_est_df[u] += (int64)pred_pages * (int64)(nfirst > 0 ? nfirst : 512);
+                            part_high_df[u] = true;
+                            if (firstItems) pfree(firstItems);
+                            LockBuffer(stack->buffer, GIN_UNLOCK);
+                            freeGinBtreeStack(stack);
+                        } else {
+                            Buffer lbuf = stack->buffer;
+                            IncrBufferRefCount(lbuf);
+                            freeGinBtreeStack(stack);
+                            part_bms[u] = tbm_create(bm_mem, NULL);
+                            if (firstItems) {
+                                if (nfirst > 0) tbm_add_tuples(part_bms[u], firstItems, nfirst, false);
+                                pfree(firstItems);
+                            }
+                            uint32 walked = 1;
+                            int64 seen_items = nfirst;
+                            while (!GinPageRightMost(lpage) && walked < 16) {
+                                lbuf = ginStepRight(lbuf, index, GIN_SHARE);
+                                lpage = BufferGetPage(lbuf);
+                                walked++;
+                                if (!GinPageIsDeleted(lpage)) {
+                                    int nitems = 0;
+                                    ItemPointer items = GinDataLeafPageGetItems(lpage, &nitems, minItem);
+                                    if (items) {
+                                        if (nitems > 0) {
+                                            tbm_add_tuples(part_bms[u], items, nitems, false);
+                                            seen_items += nitems;
+                                        }
+                                        pfree(items);
+                                    }
+                                }
+                            }
+                            bool more = !GinPageRightMost(lpage);
+                            UnlockReleaseBuffer(lbuf);
+                            if (more) {
+                                int64 avg = walked > 0 ? (seen_items / walked) : 512;
+                                part_est_df[u] += Max(seen_items, (int64)Max(pred_pages, walked) * Max(avg, (int64)1));
+                                tbm_free(part_bms[u]);
+                                part_bms[u] = NULL;
+                                part_high_df[u] = true;
+                            }
+                        }
+                    } else if (GinGetNPosting(itup) > 0) {
+                        int nlist = 0;
+                        ItemPointer items = ginReadTuple(&ginstate, (OffsetNumber)index_col, itup, &nlist);
+                        if (items) {
+                            if (nlist > 0) {
+                                if (u_glue[u]) {
+                                    part_est_df[u] += nlist;
+                                } else {
+                                    part_bms[u] = tbm_create(bm_mem, NULL);
+                                    tbm_add_tuples(part_bms[u], items, nlist, false);
+                                }
+                            }
+                            pfree(items);
+                        }
+                    }
+                }
+                if (needUnlock) LockBuffer(stackEntry->buffer, GIN_UNLOCK);
+                freeGinBtreeStack(stackEntry);
+                pfree(DatumGetPointer(kdatum));
+            }
+
+            if (has_pending) {
+                bool need_pending = false;
+                for (int u = 0; u < nu; u++) {
+                    if (!(u_glue[u] || part_high_df[u]) && !(n_canon > 0 && max_t && u_tiers[u] >= 0 && max_t[p] <= u_tiers[u])) {
+                        need_pending = true;
+                        break;
+                    }
+                }
+                if (need_pending) {
+                    Buffer mbuf = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+                    LockBuffer(mbuf, GIN_SHARE);
+                    BlockNumber pblk = GinPageGetMeta(BufferGetPage(mbuf))->head;
+                    if (pblk == InvalidBlockNumber) {
+                        UnlockReleaseBuffer(mbuf);
+                    } else {
+                        Buffer pbuf = ReadBuffer(index, pblk);
+                        LockBuffer(pbuf, GIN_SHARE);
+                        UnlockReleaseBuffer(mbuf);
+                        for (;;) {
+                            CHECK_FOR_INTERRUPTS();
+                            Page ppage = BufferGetPage(pbuf);
+                            if (!GinPageIsDeleted(ppage)) {
+                                OffsetNumber maxoff = PageGetMaxOffsetNumber(ppage);
+                                for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++) {
+                                    IndexTuple itup = (IndexTuple)PageGetItem(ppage, PageGetItemId(ppage, off));
+                                    if (gintuple_get_attrnum(&ginstate, itup) != (OffsetNumber)index_col) continue;
+                                    GinNullCategory cat = GIN_CAT_NORM_KEY;
+                                    Datum kd = gintuple_get_key(&ginstate, itup, &cat);
+                                    if (cat != GIN_CAT_NORM_KEY || VARSIZE_ANY_EXHDR(kd) != 17) continue;
+                                    const uint8 *kb = (const uint8 *)VARDATA_ANY(kd);
+                                    if (kb[0] != 0) continue;
+                                    int64 u_at = lp_idmap_find(umap, (const lp_id *)(kb + 1));
+                                    if (u_at < 0) continue;
+                                    int u = *(int *)lp_idmap_at(umap, (size_t)u_at);
+                                    if (u_glue[u] || part_high_df[u] ||
+                                        (n_canon > 0 && max_t && u_tiers[u] >= 0 && max_t[p] <= u_tiers[u]))
+                                        continue;
+                                    if (!part_bms[u]) part_bms[u] = tbm_create(bm_mem, NULL);
+                                    tbm_add_tuples(part_bms[u], &itup->t_tid, 1, false);
+                                }
+                            }
+                            BlockNumber next_blk = GinPageGetOpaque(ppage)->rightlink;
+                            if (next_blk == InvalidBlockNumber) {
+                                UnlockReleaseBuffer(pbuf);
+                                break;
+                            }
+                            Buffer nbuf = ReadBuffer(index, next_blk);
+                            LockBuffer(nbuf, GIN_SHARE);
+                            UnlockReleaseBuffer(pbuf);
+                            pbuf = nbuf;
+                        }
+                    }
+                }
+            }
+
+            index_close(index, NoLock);
+            table_close(table, NoLock);
+
+            for (int u = 0; u < nu; u++) {
+                int64 u_p_df = part_est_df[u] + (part_bms[u] ? sal_tbm_count_copy(part_bms[u], bm_mem) : 0);
+                part_est_df[u] = u_p_df;
+                df[u] += u_p_df;
+            }
+            for (int k = 0; k < npairs; k++) {
+                int pa = pairs[k].ua, pb = pairs[k].ub;
+                if (!part_high_df[pa] && !part_high_df[pb]) {
+                    if (part_bms[pa] && part_bms[pb])
+                        pairs[k].co += sal_tbm_intersect_count(part_bms[pa], part_bms[pb], bm_mem);
+                } else if (part_est_df[pa] > 0 && part_est_df[pb] > 0 && p_rows > 0) {
+                    int64 denom = Max(p_rows, Max(part_est_df[pa], part_est_df[pb]));
+                    int64 exp_co = (int64)llround(((double)part_est_df[pa] * (double)part_est_df[pb]) / (double)denom);
+                    pairs[k].co += Max((int64)0, Min(exp_co, Min(part_est_df[pa], part_est_df[pb])));
+                }
+            }
+            for (int u = 0; u < nu; u++) {
+                if (part_bms[u]) { tbm_free(part_bms[u]); part_bms[u] = NULL; }
+            }
+        }
+    } PG_FINALLY(); {
+        for (int u = 0; u < nu; u++) {
+            if (part_bms[u]) { tbm_free(part_bms[u]); part_bms[u] = NULL; }
+        }
+    } PG_END_TRY();
+    pfree(part_est_df);
+    pfree(part_high_df);
+    pfree(part_bms);
+
+    for (int u = 0; u < nu; u++) if (total < df[u]) total = df[u];
+    for (int u = 0; u < nu; u++)
+        info_bits[u] = -log2((double)(df[u] + 1) / (double)(total + 1));
+
+    /* Loss contrast over bounded claim & physicality_assertions holders + attestation fallback. */
+    if (ng > 0 && (!scope || nscope > 0)) {
+        const char *selected[] = { "entity", "path", "mask" }, *path_col = NULL;
+        Relation loss_parent = lp_pg_read_parent(phys_oid, &path_col, selected, lengthof(selected));
+        AttrNumber id_att = get_attnum(phys_oid, "entity");
+        AttrNumber p_att = get_attnum(phys_oid, "path");
+        AttrNumber m_att = get_attnum(phys_oid, "mask");
+        MemoryContext hctx = AllocSetContextCreate(CurrentMemoryContext, "SalienceLoss", ALLOCSET_DEFAULT_SIZES);
+        lp_idmap *wanted_c = lp_idmap_sized(sizeof(HolderKey));
+        lp_idmap *wanted_a = lp_idmap_sized(sizeof(HolderKey));
+        lp_idmap *holders = lp_idmap_sized(sizeof(SalHolder));
+        lp_idmap *scope_map = nscope > 0 ? lp_idmap_new() : NULL;
+        double *win_w = palloc0(sizeof(double) * (size_t)nu);
+        double *loss_w = palloc0(sizeof(double) * (size_t)nu);
+
+        PG_TRY(); {
+            for (int u = 0; u < nu; u++) {
+                if (u_glue[u] || df[u] <= 0 || df[u] > 4096) continue;
+                bool fr;
+                HolderKey *kc = lp_idmap_get(wanted_c, &u_ids[u], &fr);
+                if (fr) memset(kc, 0, sizeof(*kc));
+                HolderKey *ka = lp_idmap_get(wanted_a, &u_ids[u], &fr);
+                if (fr) memset(ka, 0, sizeof(*ka));
+            }
+            if (scope_map) for (int s = 0; s < nscope; s++) lp_idmap_put(scope_map, &scope[s], NULL);
+
+            if (lp_idmap_count(wanted_c) > 0) {
+                uint64 nom_cap = (UINT64_C(2) << 60) | 64;
+                SalLossCollect lc = { wanted_c, holders, UINT64_C(1), id_att, p_att, m_att, hctx };
+                scan_container_rows(loss_parent, path_col, wanted_c, 3, NULL, false, 0, NULL, UINT64_C(1), false, nom_cap, min_active_tier, sal_loss_visit, &lc);
+
+                lc.wanted = wanted_a;
+                lc.bits = 0;
+                scan_container_rows(loss_parent, path_col, wanted_a, 3, NULL, false, 0, NULL, 0, true, nom_cap, min_active_tier, sal_loss_visit, &lc);
+            }
+
+            size_t nh = lp_idmap_count(holders);
+            if (nh > 0) {
+                bool *h_allow = palloc(sizeof(bool) * nh);
+                if (nscope > 0) {
+                    lp_id *h_ids = palloc(sizeof(lp_id) * nh);
+                    for (size_t h = 0; h < nh; h++) h_ids[h] = ((SalHolder *)lp_idmap_at(holders, h))->entity;
+                    lp_pg_filter_witness_entities(h_ids, nh, scope, nscope, h_allow);
+                    pfree(h_ids);
+                } else {
+                    for (size_t h = 0; h < nh; h++) h_allow[h] = true;
+                }
+
+                lp_id *all_claims = palloc(sizeof(lp_id) * nh);
+                int n_all = 0;
+                lp_idmap *h_claim_map = lp_idmap_sized(sizeof(size_t));
+                for (size_t h = 0; h < nh; h++) {
+                    if (!h_allow[h]) continue;
+                    SalHolder *sh = lp_idmap_at(holders, h);
+                    all_claims[n_all++] = sh->entity;
+                    size_t at = lp_idmap_put(h_claim_map, &sh->entity, NULL);
+                    *(size_t *)lp_idmap_at(h_claim_map, at) = h;
+                }
+
+                double *h_trust = palloc0(sizeof(double) * nh);
+                double *h_att_win = palloc0(sizeof(double) * nh);
+                double *h_att_loss = palloc0(sizeof(double) * nh);
+                if (n_all > 0) {
+                    PgAttrRows att_rows = { 0 };
+                    lp_pg_read_attestation_pk(all_claims, n_all, scope_map, &att_rows, NULL);
+                    for (size_t r = 0; r < att_rows.n; r++) {
+                        PgAttrRow *ar = &att_rows.v[r];
+                        int64 hm = lp_idmap_find(h_claim_map, &ar->claim);
+                        if (hm < 0) continue;
+                        size_t h = *(size_t *)lp_idmap_at(h_claim_map, (size_t)hm);
+                        double mean_s = (ar->games > 0.0) ? (ar->score / ar->games) : 0.5;
+                        if (mean_s < 0.0) mean_s = 0.0;
+                        if (mean_s > 1.0) mean_s = 1.0;
+                        double w = ar->trust > 0.0 ? ar->trust : 1.0;
+                        h_trust[h] += w;
+                        h_att_win[h] += w * mean_s;
+                        h_att_loss[h] += w * (1.0 - mean_s);
+                    }
+                    lp_vec_free(&att_rows);
+                }
+
+                for (size_t h = 0; h < nh; h++) {
+                    if (!h_allow[h]) continue;
+                    SalHolder *sh = lp_idmap_at(holders, h);
+                    Geo g = geo_of(sh->path);
+                    lp_vertex stack_v[64];
+                    lp_vertex *verts = g.p.n <= 64 ? stack_v : palloc(sizeof(lp_vertex) * g.p.n);
+                    size_t nv = lp_path_decode(g.p, verts, g.p.n);
+
+                    double p_sum = 0.0, p_cnt = 0.0;
+                    for (size_t v = 0; v < nv; v++) {
+                        if (verts[v].said == LP_SAID_RECORD || verts[v].said == LP_SAID_CLAIM || verts[v].outcome != 0) {
+                            double sc = lp_outcome_score(verts[v].outcome, verts[v].spare);
+                            double run = verts[v].run ? (double)verts[v].run : 1.0;
+                            p_sum += sc * run;
+                            p_cnt += run;
+                        }
+                    }
+
+                    bool seen_u_stack[64];
+                    bool *seen_u = nu <= 64 ? seen_u_stack : palloc0(sizeof(bool) * (size_t)nu);
+                    if (nu <= 64) memset(seen_u, 0, sizeof(bool) * (size_t)nu);
+
+                    if (p_cnt > 0.0) {
+                        double p_mean = p_sum / p_cnt;
+                        double hw = h_trust[h] > 0.0 ? h_trust[h] : 1.0;
+                        for (size_t v = 0; v < nv; v++) {
+                            int64 u_at = lp_idmap_find(umap, &verts[v].id);
+                            if (u_at < 0) continue;
+                            int u = *(int *)lp_idmap_at(umap, (size_t)u_at);
+                            if (u_glue[u] || seen_u[u]) continue;
+                            seen_u[u] = true;
+                            double u_score = p_mean;
+                            if (verts[v].said == LP_SAID_RECORD || verts[v].said == LP_SAID_CLAIM || verts[v].outcome != 0)
+                                u_score = lp_outcome_score(verts[v].outcome, verts[v].spare);
+                            if (u_score < 0.0) u_score = 0.0;
+                            if (u_score > 1.0) u_score = 1.0;
+                            win_w[u] += hw * u_score;
+                            loss_w[u] += hw * (1.0 - u_score);
+                        }
+                    } else if (h_att_win[h] + h_att_loss[h] > 0.0) {
+                        for (size_t v = 0; v < nv; v++) {
+                            int64 u_at = lp_idmap_find(umap, &verts[v].id);
+                            if (u_at < 0) continue;
+                            int u = *(int *)lp_idmap_at(umap, (size_t)u_at);
+                            if (u_glue[u] || seen_u[u]) continue;
+                            seen_u[u] = true;
+                            win_w[u] += h_att_win[h];
+                            loss_w[u] += h_att_loss[h];
+                        }
+                    }
+
+                    if (seen_u != seen_u_stack) pfree(seen_u);
+                    if (verts != stack_v) pfree(verts);
+                }
+
+                lp_idmap_free(h_claim_map);
+                pfree(all_claims);
+                pfree(h_trust);
+                pfree(h_att_win);
+                pfree(h_att_loss);
+                pfree(h_allow);
+            }
+
+            for (int u = 0; u < nu; u++) {
+                double d = win_w[u] + loss_w[u];
+                loss_c[u] = d > 0.0 ? (loss_w[u] - win_w[u]) / (d + 1.0) : 0.0;
+            }
+        } PG_FINALLY(); {
+            pfree(win_w); pfree(loss_w);
+            if (scope_map) lp_idmap_free(scope_map);
+            lp_idmap_free(holders);
+            lp_idmap_free(wanted_a);
+            lp_idmap_free(wanted_c);
+            MemoryContextDelete(hctx);
+            table_close(loss_parent, NoLock);
+        } PG_END_TRY();
+    }
+
+    table_close(phys_parent, NoLock);
+
+    /* Span lift (local span contraction & PMI) and normalized salience. */
+    double mean_info = 0.0;
+    if (ng > 0) {
+        for (int k = 0; k < ng; k++) mean_info += info_bits[occ_to_u[ng_pos[k]]];
+        mean_info /= (double)ng;
+    }
+
+    double *ng_lift_sum = palloc0(sizeof(double) * (size_t)(ng ? ng : 1));
+    int *ng_lift_cnt = palloc0(sizeof(int) * (size_t)(ng ? ng : 1));
+    double scale_denom = Max(16.0, 0.01 * (double)total);
+
+    for (int k = 0; k < ng - 1; k++) {
+        int pidx = step_pair[k];
+        if (pidx < 0) continue;
+        int ua = occ_to_u[ng_pos[k]], ub = occ_to_u[ng_pos[k + 1]];
+        int64 co = pairs[pidx].co;
+        double i_co = -log2((double)(co + 1) / (double)(total + 1));
+        double pmi = info_bits[ua] + info_bits[ub] - i_co;
+        double pmi_lift = pmi - log2(1.0 + (double)co / scale_denom);
+        int64 min_df = Min(df[ua], df[ub]);
+        double max_cond = (double)(co + 1) / (double)(min_df + 1);
+        double base_lift = (max_cond < 0.5)
+            ? log2(2.0 * max_cond)
+            : (pmi_lift < 0.0 ? pmi_lift : pmi_lift * max_cond);
+        if (pairs[pidx].stored) base_lift += 1.0;
+
+        double sa = 1.0 / (double)(df[ua] + 1), sb = 1.0 / (double)(df[ub] + 1);
+        double sh_a = sa / (sa + sb), sh_b = sb / (sa + sb);
+        double la = (base_lift >= 0.0 ? base_lift * sh_a : base_lift)
+                  + 0.5 * (info_bits[ua] - info_bits[ub]);
+        double lb = (base_lift >= 0.0 ? base_lift * sh_b : base_lift)
+                  + 0.5 * (info_bits[ub] - info_bits[ua]);
+        ng_lift_sum[k] += la; ng_lift_cnt[k]++;
+        ng_lift_sum[k + 1] += lb; ng_lift_cnt[k + 1]++;
+    }
+
+    for (int i = 0; i < nocc; i++) {
+        int u = occ_to_u[i];
+        out[i].df = df[u];
+        out[i].total = total;
+        out[i].info_bits = info_bits[u];
+        out[i].loss_contrast = loss_c[u];
+        out[i].span_lift = is_glue[i] ? -1.0 : 0.0;
+    }
+    for (int k = 0; k < ng; k++) {
+        int pos = ng_pos[k];
+        int u = occ_to_u[pos];
+        if (ng >= 2 && ng_lift_cnt[k] > 0) {
+            double avg_nb = ng_lift_sum[k] / (double)ng_lift_cnt[k];
+            out[pos].span_lift = 0.75 * avg_nb + 0.25 * (info_bits[u] - mean_info);
+        } else {
+            out[pos].span_lift = 0.0;
+        }
+    }
+
+    double *raw = palloc0(sizeof(double) * (size_t)nocc);
+    double raw_sum = 0.0;
+    for (int i = 0; i < nocc; i++) {
+        if (is_glue[i]) { out[i].salience = 0.0; continue; }
+        int u = occ_to_u[i];
+        double inv_df = 1.0 / sqrt((double)(df[u] + 1));
+        if (u_tiers[u] < 0 && df[u] == 0) inv_df *= 0.25;
+        double clamped_lift = out[i].span_lift < -4.0 ? -4.0 : (out[i].span_lift > 4.0 ? 4.0 : out[i].span_lift);
+        double lift_f = exp(0.25 * clamped_lift);
+        double loss_f = 1.0 + (loss_c[u] > 0.0 ? loss_c[u] : 0.0);
+        raw[i] = inv_df * lift_f * loss_f;
+        raw_sum += raw[i];
+    }
+    if (raw_sum > 0.0) {
+        for (int i = 0; i < nocc; i++) out[i].salience = raw[i] / raw_sum;
+    }
+
+    pfree(raw); pfree(ng_lift_cnt); pfree(ng_lift_sum);
+    pfree(loss_c); pfree(info_bits); pfree(df);
+    pfree(step_pair); pfree(pairs); pfree(ng_pos);
+    pfree(u_glue); pfree(u_tiers);
+    lp_idmap_free(umap);
+    pfree(occ_to_u); pfree(is_glue); pfree(occ_tiers);
+}
+
+PG_FUNCTION_INFO_V1(laplace_salience);
+Datum laplace_salience(PG_FUNCTION_ARGS)
+{
+    TupleDesc td;
+    Tuplestorestate *ts = set_begin(fcinfo, "laplace_salience", &td);
+    if (PG_ARGISNULL(0)) PG_RETURN_NULL();
+    int nocc = 0;
+    lp_id *occ = ids_of(PG_GETARG_ARRAYTYPE_P(0), &nocc);
+    if (nocc <= 0) { pfree(occ); PG_RETURN_NULL(); }
+
+    lp_id *scope = NULL;
+    int nscope = 0;
+    if (PG_NARGS() > 1 && !PG_ARGISNULL(1))
+        scope = ids_of(PG_GETARG_ARRAYTYPE_P(1), &nscope);
+
+    PgSalience *sal = palloc(sizeof(PgSalience) * (size_t)nocc);
+    lp_pg_salience(occ, nocc, scope, nscope, sal);
+
+    for (int i = 0; i < nocc; i++) {
+        Datum v[9] = {
+            Int32GetDatum(i + 1),
+            id_datum(&occ[i]),
+            Int16GetDatum(sal[i].tier),
+            Int64GetDatum(sal[i].df),
+            Int64GetDatum(sal[i].total),
+            Float8GetDatum(sal[i].info_bits),
+            Float8GetDatum(sal[i].span_lift),
+            Float8GetDatum(sal[i].loss_contrast),
+            Float8GetDatum(sal[i].salience)
+        };
+        bool nl[9] = { false, false, false, false, false, false, false, false, false };
+        set_put(fcinfo, ts, td, v, nl);
+        pfree(DatumGetPointer(v[1]));
+    }
+    pfree(sal);
+    if (scope) pfree(scope);
+    pfree(occ);
+    PG_RETURN_NULL();
 }

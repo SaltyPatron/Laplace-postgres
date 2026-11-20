@@ -20,5 +20,6 @@ container_frontier
 held_files
 frontier_runtime
 function_bindings
+salience
 walks
 chess

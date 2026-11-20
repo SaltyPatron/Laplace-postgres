@@ -338,3 +338,12 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_forward_suffix(ids @extschema@.bl
     OUT next @extschema@.blake3, OUT times bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_forward_suffix';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_salience(occ @extschema@.blake3[],
+    scope @extschema@.blake3[] DEFAULT '{}'::@extschema@.blake3[],
+    OUT ord integer, OUT id @extschema@.blake3, OUT tier smallint,
+    OUT df bigint, OUT total bigint,
+    OUT info_bits double precision, OUT span_lift double precision,
+    OUT loss_contrast double precision, OUT salience double precision) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_salience';

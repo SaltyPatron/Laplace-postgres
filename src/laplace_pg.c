@@ -1202,13 +1202,21 @@ Datum laplace_entity_tier_count(PG_FUNCTION_ARGS)
     table_close(ep, NoLock);
 
     const Oid *parts = NULL;
+    const int16 *min_t = NULL, *max_t = NULL;
     int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    (void)lp_pg_canonical_tier_bounds("entity", &min_t, &max_t);
     Snapshot snap = GetActiveSnapshot();
     int64 total = 0;
 
     for (int p = 0; p < nparts; p++) {
         CHECK_FOR_INTERRUPTS();
+        if (min_t && max_t && (target_tier < min_t[p] || target_tier > max_t[p]))
+            continue;
         Relation part = table_open(parts[p], AccessShareLock);
+        if (RelationGetNumberOfBlocks(part) == 0) {
+            table_close(part, NoLock);
+            continue;
+        }
         AttrNumber p_tier = get_attnum(parts[p], "tier");
         Oid idx_oid = find_tier_btree_index(part, p_tier);
         TupleTableSlot *slot = table_slot_create(part, NULL);

@@ -243,4 +243,16 @@ void lp_pg_solve_scoped_standings(const lp_id *claims, int n, Oid idarr,
 void lp_pg_filter_witness_entities(const lp_id *entities, size_t count,
                                    const lp_id *witnesses, int nwitnesses, bool *allowed);
 void lp_pg_truncate_rel(Oid rel1, Oid rel2);
+
+typedef struct PgSalience {
+    int16 tier;
+    int64 df;
+    int64 total;
+    double info_bits;
+    double span_lift;
+    double loss_contrast;
+    double salience;
+} PgSalience;
+
+void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, PgSalience *out);
 #endif

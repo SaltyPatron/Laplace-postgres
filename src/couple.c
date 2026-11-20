@@ -484,12 +484,29 @@ Datum laplace_couple(PG_FUNCTION_ARGS){
         pfree(g_orig); pfree(g_ids); pfree(done); pfree(occ_tier);
     }
     if (shape >= 0 && keep > 0 && nocc > 0) {
-        /* the observation's own curve, and its centroid for the GiST */
+        /* the observation's own curve, and its salience-weighted centroid for the GiST */
+        PgSalience *sal = palloc(sizeof(PgSalience) * (size_t)nocc);
+        lp_pg_salience(occ, nocc, has_scope ? witnesses : NULL, has_scope ? nwitnesses : 0, sal);
         lp_idmap *oc = lp_idmap_sized(sizeof(Coord4)); for (int i = 0; i < nocc; i++) lp_idmap_put(oc, &occ[i], NULL); coords_load(oc);
-        double *pa = palloc(sizeof(double) * 4 * (size_t)nocc), cen[4] = { 0 }; int npa = 0;
-        for (int i = 0; i < nocc; i++) { const Coord4 *c = lp_idmap_lookup(oc, &occ[i]); if (c && c->has) memcpy(pa + 4 * npa++, c->x, 32); }
+        double *pa = palloc(sizeof(double) * 4 * (size_t)nocc), cen[4] = { 0 }, wsum = 0.0; int npa = 0;
+        for (int i = 0; i < nocc; i++) {
+            const Coord4 *c = lp_idmap_lookup(oc, &occ[i]);
+            if (c && c->has) {
+                memcpy(pa + 4 * npa++, c->x, 32);
+                double w = sal[i].salience;
+                if (w > 0.0) {
+                    for (int k = 0; k < 4; k++) cen[k] += w * c->x[k];
+                    wsum += w;
+                }
+            }
+        }
         lp_idmap_free(oc);
-        for (int i = 0; i < npa; i++) for (int k = 0; k < 4; k++) cen[k] += pa[4 * i + k] / npa;
+        pfree(sal);
+        if (wsum > 0.0) {
+            for (int k = 0; k < 4; k++) cen[k] /= wsum;
+        } else {
+            for (int i = 0; i < npa; i++) for (int k = 0; k < 4; k++) cen[k] += pa[4 * i + k] / npa;
+        }
         if (npa >= 2) {
             /* the GiST's nominations: what lies nearest the centroid, at a tier that composes */
             if (fan > 0) {

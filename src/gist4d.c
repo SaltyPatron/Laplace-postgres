@@ -27,8 +27,12 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "partitioning/partdesc.h"
+#include "partitioning/partbounds.h"
+#include "storage/bufmgr.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
@@ -940,7 +944,19 @@ static void constellation_path_len(const lp_id *id, Datum path, Datum mask, void
     *(int32 *)lp_idmap_get(lens, id, NULL) = len;
 }
 
-/* Direct-AM equi-width Hilbert bucket constellation sampler replacing 1024-LATERAL SQL. */
+static void constellation_stride_id(int32 i, int32 n, lp_id *out)
+{
+    memset(out->b, 0, sizeof(out->b));
+    if (i <= 0 || n <= 0) return;
+    unsigned __int128 num = ((unsigned __int128)(uint32)i) << 64;
+    uint64 hi = (uint64)(num / (uint32)n);
+    uint64 rem = (uint64)(num % (uint32)n);
+    uint64 lo = (uint64)((((unsigned __int128)rem) << 64) / (uint32)n);
+    lp_put_be(out->b, hi, 8);
+    lp_put_be(out->b + 8, lo, 8);
+}
+
+/* Direct-AM equi-width BLAKE3 identity-stride constellation sampler over entity pkeys (100% inside B^4). */
 PG_FUNCTION_INFO_V1(laplace_constellation_sample);
 Datum laplace_constellation_sample(PG_FUNCTION_ARGS)
 {
@@ -954,19 +970,28 @@ Datum laplace_constellation_sample(PG_FUNCTION_ARGS)
     Oid target = lp_pg_relation("entity");
     const char *cols[] = { "id", "coord", "hilbert" }, *col = NULL;
     Relation parent = lp_pg_read_parent(target, &col, cols, 3);
-    table_close(parent, NoLock);
+    Oid native_id = get_atttype(target, get_attnum(target, "id"));
+    AttrNumber parent_id_att = get_attnum(target, "id");
+    PartitionKey pkey = RelationGetPartitionKey(parent);
+    PartitionDesc pdesc = pkey ? RelationGetPartitionDesc(parent, true) : NULL;
+    bool by_id_range = (pkey && pdesc && pkey->strategy == PARTITION_STRATEGY_RANGE &&
+                        pkey->partnatts == 1 && pkey->partattrs[0] == parent_id_att);
 
-    const Oid *parts = NULL;
-    int nparts = lp_pg_canonical_partitions("entity", &parts, NULL, NULL, NULL);
+    const Oid *parts = NULL, *pks = NULL;
+    int nparts = lp_pg_canonical_partitions("entity", &parts, &pks, NULL, NULL);
     Snapshot snap = GetActiveSnapshot();
 
     typedef struct {
         Relation part, idx;
         TupleTableSlot *slot;
         IndexScanDesc scan;
+        Oid part_oid;
+        RegProcedure ge_proc;
         AttrNumber a_id, a_coord, a_hilb;
-    } HilbPart;
-    HilbPart *hp = palloc0((Size)nparts * sizeof(*hp));
+    } IdPart;
+    IdPart *hp = palloc0((Size)nparts * sizeof(*hp));
+    int *ordered = palloc(sizeof(int) * (Size)(nparts > 0 ? nparts : 1));
+    int n_ordered = 0;
     ConstellationPick *picks = palloc0((Size)n * sizeof(*picks));
     lp_idmap *seen = lp_idmap_new();
     lp_idmap *lens = lp_idmap_sized(sizeof(int32));
@@ -975,53 +1000,95 @@ Datum laplace_constellation_sample(PG_FUNCTION_ARGS)
     PG_TRY();
     {
         for (int p = 0; p < nparts; p++) {
-            hp[p].part = table_open(parts[p], AccessShareLock);
+            hp[p].part_oid = parts[p];
+            Relation part = table_open(parts[p], AccessShareLock);
+            if (RelationGetNumberOfBlocks(part) == 0) {
+                table_close(part, NoLock);
+                continue;
+            }
+            hp[p].part = part;
             hp[p].a_id = get_attnum(parts[p], "id");
             hp[p].a_coord = get_attnum(parts[p], "coord");
             hp[p].a_hilb = get_attnum(parts[p], "hilbert");
-            Oid idx_oid = find_btree_on(hp[p].part, hp[p].a_hilb, 1, InvalidAttrNumber);
+            Oid idx_oid = (pks && OidIsValid(pks[p])) ? pks[p] : find_btree_on(part, hp[p].a_id, 1, InvalidAttrNumber);
             if (!OidIsValid(idx_oid))
-                ereport(ERROR, (errmsg("laplace_constellation_sample: entity partition missing (hilbert) index")));
+                ereport(ERROR, (errmsg("laplace_constellation_sample: entity partition missing (id) unique index")));
             hp[p].idx = index_open(idx_oid, AccessShareLock);
+            Oid ge_op = get_opfamily_member(hp[p].idx->rd_opfamily[0], native_id, native_id, BTGreaterEqualStrategyNumber);
+            if (!OidIsValid(ge_op))
+                ereport(ERROR, (errmsg("laplace_constellation_sample: entity (id) index missing >= operator")));
+            hp[p].ge_proc = get_opcode(ge_op);
             hp[p].slot = table_slot_create(hp[p].part, NULL);
             hp[p].scan = index_beginscan(hp[p].part, hp[p].idx, snap, NULL, 1, 0);
         }
 
+        if (by_id_range && pdesc->boundinfo && pdesc->boundinfo->ndatums >= 2) {
+            PartitionBoundInfo bi = pdesc->boundinfo;
+            for (int b = 0; b + 1 < bi->ndatums; b++) {
+                int pi = bi->indexes[b + 1];
+                if (pi < 0 || pi >= pdesc->nparts) continue;
+                Oid poid = pdesc->oids[pi];
+                for (int p = 0; p < nparts; p++) {
+                    if (hp[p].part_oid == poid) {
+                        ordered[n_ordered++] = p;
+                        break;
+                    }
+                }
+            }
+        }
+        if (n_ordered == 0) {
+            for (int p = 0; p < nparts; p++) ordered[n_ordered++] = p;
+        }
+
         for (int32 i = 0; i < n; i++) {
             CHECK_FOR_INTERRUPTS();
-            int32 lo16 = (int32)(((int64)i * 65536) / n);
-            int32 hi16 = (int32)(((int64)(i + 1) * 65536) / n);
-            int64 lo_key = ((int64)(lo16 - 32768)) << 48;
-            bool has_hi = (hi16 < 65536);
-            int64 hi_key = has_hi ? (((int64)(hi16 - 32768)) << 48) : 0;
+            lp_id lo_id, hi_id;
+            constellation_stride_id(i, n, &lo_id);
+            bool has_hi = (i + 1 < n);
+            if (has_hi) constellation_stride_id(i + 1, n, &hi_id);
+
+            int start_k = 0;
+            if (by_id_range) {
+                Oid start_oid = lp_pg_enrichment_partition(target, pkey, pdesc, PointerGetDatum(&lo_id));
+                for (int k = 0; k < n_ordered; k++) {
+                    if (hp[ordered[k]].part_oid == start_oid) { start_k = k; break; }
+                }
+            }
 
             ConstellationPick best = { .found = false };
-            for (int p = 0; p < nparts; p++) {
+            for (int k = start_k; k < n_ordered; k++) {
+                int p = ordered[k];
+                if (!hp[p].scan) continue;
                 ScanKeyData sk;
-                ScanKeyEntryInitialize(&sk, 0, 1, BTGreaterEqualStrategyNumber, INT8OID,
-                                       hp[p].idx->rd_indcollation[0], F_INT8GE, Int64GetDatum(lo_key));
+                ScanKeyEntryInitialize(&sk, 0, 1, BTGreaterEqualStrategyNumber, native_id,
+                                       hp[p].idx->rd_indcollation[0], hp[p].ge_proc, PointerGetDatum(&lo_id));
                 index_rescan(hp[p].scan, &sk, 1, NULL, 0);
+                bool done_bucket = false;
                 while (index_getnext_slot(hp[p].scan, ForwardScanDirection, hp[p].slot)) {
                     bool ni = true, nc = true, nh = true;
                     Datum di = slot_getattr(hp[p].slot, hp[p].a_id, &ni);
                     Datum dc = slot_getattr(hp[p].slot, hp[p].a_coord, &nc);
                     Datum dh = slot_getattr(hp[p].slot, hp[p].a_hilb, &nh);
                     if (ni || nc || nh) { ExecClearTuple(hp[p].slot); continue; }
-                    int64 hval = DatumGetInt64(dh);
-                    if (has_hi && hval >= hi_key) { ExecClearTuple(hp[p].slot); break; }
-                    if (best.found && hval > best.hilbert) { ExecClearTuple(hp[p].slot); break; }
                     lp_id cid;
                     memcpy(cid.b, DatumGetPointer(di), sizeof(lp_id));
-                    if (!best.found || hval < best.hilbert || memcmp(cid.b, best.id.b, sizeof(lp_id)) < 0) {
+                    if (has_hi && memcmp(cid.b, hi_id.b, sizeof(lp_id)) >= 0) {
+                        ExecClearTuple(hp[p].slot);
+                        if (by_id_range) done_bucket = true;
+                        break;
+                    }
+                    if (!best.found || memcmp(cid.b, best.id.b, sizeof(lp_id)) < 0) {
                         const double *pt = point_of(dc);
                         best.id = cid;
                         memcpy(best.c, pt, sizeof(best.c));
-                        best.hilbert = hval;
+                        best.hilbert = DatumGetInt64(dh);
                         best.found = true;
                     }
                     ExecClearTuple(hp[p].slot);
+                    if (by_id_range) done_bucket = true;
                     break;
                 }
+                if (done_bucket) break;
             }
 
             if (best.found) {
@@ -1069,6 +1136,8 @@ Datum laplace_constellation_sample(PG_FUNCTION_ARGS)
             if (hp[p].idx) index_close(hp[p].idx, NoLock);
             if (hp[p].part) table_close(hp[p].part, NoLock);
         }
+        table_close(parent, NoLock);
+        pfree(ordered);
         pfree(hp);
         pfree(picks);
         lp_vec_free(&distinct_ids);

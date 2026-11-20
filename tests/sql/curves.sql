@@ -10,7 +10,7 @@ CREATE TEMP TABLE curve_fixture AS
 SELECT laplace_id(word) AS id, laplace_tier(word) AS tier, laplace_coord(word) AS coord,
   laplace_hilbert(word) AS hilbert,
   laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(word,'') WITH ORDINALITY t(c,n) ORDER BY n)) AS path
-FROM unnest(ARRAY['dog','cat']) word;
+FROM unnest(ARRAY['dog','cat','act','tac','caaat']) word;
 INSERT INTO curve_fixture
 SELECT laplace_compose(parts),greatest(laplace_tier('dog'),laplace_tier('cat'))+1,point,
   laplace_hilbert4(point) # '-9223372036854775808'::bigint,laplace_path(parts)
@@ -60,6 +60,31 @@ BEGIN
         <>laplace_frechet4d(cat_line,dog_line) THEN
     RAISE EXCEPTION 'shape measures disagree with the realized curves';
   END IF;
+  -- Permutations share one deterministic 4D centroid while ordered shapes diverge monotonically forward.
+  DECLARE
+    cat_c geometry := ST_GeomFromEWKB((SELECT curve_ewkb FROM laplace_curves(ARRAY[laplace_id('cat')])));
+    act_c geometry := ST_GeomFromEWKB((SELECT curve_ewkb FROM laplace_curves(ARRAY[laplace_id('act')])));
+    tac_c geometry := ST_GeomFromEWKB((SELECT curve_ewkb FROM laplace_curves(ARRAY[laplace_id('tac')])));
+    caaat_c geometry := ST_GeomFromEWKB((SELECT curve_ewkb FROM laplace_curves(ARRAY[laplace_id('caaat')])));
+  BEGIN
+    IF ST_AsEWKB(laplace_coord('cat'))<>ST_AsEWKB(laplace_coord('act'))
+       OR ST_AsEWKB(laplace_coord('cat'))<>ST_AsEWKB(laplace_coord('tac'))
+       OR ST_AsEWKB(laplace_coord('cat'))=ST_AsEWKB(laplace_coord('caaat')) THEN
+      RAISE EXCEPTION 'centroid invariance vs multiplicity check failed on cat/act/tac/caaat';
+    END IF;
+    IF laplace_hausdorff4d(cat_c,tac_c)<>0 THEN
+      RAISE EXCEPTION 'unordered hausdorff4d(cat,tac) should be 0, got %', laplace_hausdorff4d(cat_c,tac_c);
+    END IF;
+    IF laplace_frechet4d(cat_c,tac_c)<=0 OR laplace_dtw4d(cat_c,tac_c)<=0 OR laplace_edr4d(cat_c,tac_c,0.0001)<=0 THEN
+      RAISE EXCEPTION 'directed curve distances between cat and reversed tac must be > 0';
+    END IF;
+    IF laplace_frechet4d(cat_c,act_c)<=0 OR laplace_dtw4d(cat_c,act_c)<=0 OR laplace_edr4d(cat_c,act_c,0.0001)<=0 THEN
+      RAISE EXCEPTION 'directed curve distances between cat and permuted act must be > 0';
+    END IF;
+    IF laplace_frechet4d(cat_c,caaat_c)<>0 THEN
+      RAISE EXCEPTION 'frechet4d(cat,caaat) should absorb continuous repeat runs to 0, got %', laplace_frechet4d(cat_c,caaat_c);
+    END IF;
+  END;
 END $$;
 ROLLBACK;
 SELECT 'curves: words and runs realize at their constituents'' real coordinates; atoms, absent ids and carriers are not shape';

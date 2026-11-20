@@ -180,6 +180,7 @@ laplace_resolve_refs	false
 laplace_restore_function_bindings	true
 laplace_roles_of	false
 laplace_said	false
+laplace_salience	false
 laplace_segments	false
 laplace_separator_ids	false
 laplace_series	false
