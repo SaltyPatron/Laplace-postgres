@@ -220,6 +220,12 @@ BEGIN
   -- answers "first lineage of witness w" with one probe.
   CREATE INDEX IF NOT EXISTS attestation_witness_lineage ON @extschema@.attestation (witness, lineage NULLS FIRST) INCLUDE (trust);
   DROP INDEX IF EXISTS @extschema@.attestation_witness;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'laplace_modular_web') THEN
+    EXECUTE pg_catalog.format('GRANT CONNECT ON DATABASE %I TO laplace_modular_web', pg_catalog.current_database());
+    GRANT USAGE ON SCHEMA @extschema@ TO laplace_modular_web;
+    GRANT SELECT ON ALL TABLES IN SCHEMA @extschema@ TO laplace_modular_web;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA @extschema@ GRANT SELECT ON TABLES TO laplace_modular_web;
+  END IF;
 END $$;
 SELECT @extschema@.laplace_schema_indexes();
 

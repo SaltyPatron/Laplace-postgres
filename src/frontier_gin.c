@@ -1672,6 +1672,87 @@ static int64 sal_tbm_intersect_count(const TIDBitmap *a, const TIDBitmap *b, Siz
 
 typedef struct { int ua, ub; int64 co; bool stored; } SalPair;
 typedef struct { lp_id entity; Datum path; } SalHolder;
+
+static uint32 sal_simple_lower(uint32 cp)
+{
+    if (cp >= 'A' && cp <= 'Z') return cp + 32;
+    if ((cp >= 0x00C0 && cp <= 0x00D6) || (cp >= 0x00D8 && cp <= 0x00DE)) return cp + 32;
+    if (cp >= 0x0100 && cp <= 0x017E) {
+        if (cp == 0x0130 || cp == 0x0149 || cp == 0x0178) return cp == 0x0178 ? 0x00FF : cp;
+        if (cp <= 0x0137) return (cp & 1) == 0 ? cp + 1 : cp;
+        if (cp >= 0x0139 && cp <= 0x0148) return (cp & 1) == 1 ? cp + 1 : cp;
+        if (cp >= 0x014A && cp <= 0x0177) return (cp & 1) == 0 ? cp + 1 : cp;
+        if (cp >= 0x0179 && cp <= 0x017E) return (cp & 1) == 1 ? cp + 1 : cp;
+    }
+    if ((cp >= 0x0391 && cp <= 0x03A1) || (cp >= 0x03A3 && cp <= 0x03AB)) return cp + 32;
+    if (cp >= 0x0410 && cp <= 0x042F) return cp + 32;
+    if (cp == 0x0401) return 0x0451;
+    return cp;
+}
+
+typedef struct {
+    const lp_tier0_record *t0;
+    lp_idmap *umap;
+    const lp_id *u_ids;
+    int *u_to_l;
+    lp_idmap *lmap;
+    lp_id *l_ids;
+    int nl;
+} SalLowerCtx;
+
+static void sal_t1_path_visit(const lp_id *id, Datum path, Datum mask, void *context)
+{
+    (void)mask;
+    SalLowerCtx *ctx = context;
+    int64 u_at = lp_idmap_find(ctx->umap, id);
+    if (u_at < 0) return;
+    int u = *(int *)lp_idmap_at(ctx->umap, (size_t)u_at);
+    if (ctx->u_to_l[u] >= 0) return;
+
+    bytea *det = (bytea *)PG_DETOAST_DATUM(path);
+    Geo g = geo_of(PointerGetDatum(det));
+    lp_vertex stack_v[64];
+    lp_vertex *verts = g.p.n <= 64 ? stack_v : palloc(sizeof(lp_vertex) * g.p.n);
+    size_t nv = lp_path_decode(g.p, verts, g.p.n);
+
+    size_t tot_cp = 0;
+    for (size_t i = 0; i < nv; i++) tot_cp += verts[i].run ? (size_t)verts[i].run : 1;
+    if (tot_cp > 0 && tot_cp <= 256) {
+        lp_id lc_stack[64];
+        lp_id *lc = tot_cp <= 64 ? lc_stack : palloc(sizeof(lp_id) * tot_cp);
+        bool all_t0 = true, changed = false;
+        size_t pos = 0;
+        for (size_t i = 0; i < nv && all_t0; i++) {
+            int64_t cp = lp_tier0_codepoint(ctx->t0, &verts[i].id);
+            if (cp < 0) { all_t0 = false; break; }
+            uint32 lcp = sal_simple_lower((uint32)cp);
+            if (lcp != (uint32)cp) changed = true;
+            const lp_tier0_record *lr = lp_tier0_at(ctx->t0, lcp);
+            if (!lr) { all_t0 = false; break; }
+            size_t run = verts[i].run ? (size_t)verts[i].run : 1;
+            for (size_t r = 0; r < run; r++) lc[pos++] = lr->id;
+        }
+        if (all_t0 && changed && pos > 0) {
+            lp_id lid;
+            if (pos == 1) lid = lc[0];
+            else lp_id_compose(lc, pos, &lid);
+            if (!lp_id_eq(&lid, &ctx->u_ids[u])) {
+                bool fresh = false;
+                size_t l_at = lp_idmap_put(ctx->lmap, &lid, &fresh);
+                int *lslot = lp_idmap_at(ctx->lmap, l_at);
+                if (fresh) {
+                    *lslot = ctx->nl;
+                    ctx->l_ids[ctx->nl++] = lid;
+                }
+                ctx->u_to_l[u] = *lslot;
+            }
+        }
+        if (lc != lc_stack) pfree(lc);
+    }
+
+    if (verts != stack_v) pfree(verts);
+    if ((Pointer)det != DatumGetPointer(path)) pfree(det);
+}
 typedef struct {
     lp_idmap *wanted;
     lp_idmap *holders;
@@ -1825,6 +1906,25 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
     }
 
     int64 *df = palloc0(sizeof(int64) * (size_t)nu);
+    int64 *l_df = palloc0(sizeof(int64) * (size_t)nu);
+    int *u_to_l = palloc(sizeof(int) * (size_t)nu);
+    for (int u = 0; u < nu; u++) u_to_l[u] = -1;
+    lp_id *l_ids = palloc(sizeof(lp_id) * (size_t)nu);
+    lp_idmap *lmap = lp_idmap_sized(sizeof(int));
+    int nl = 0;
+    {
+        lp_id *t1_ids = palloc(sizeof(lp_id) * (size_t)nu);
+        int nt1 = 0;
+        for (int u = 0; u < nu; u++) {
+            if (!u_glue[u] && u_tiers[u] == 1) t1_ids[nt1++] = u_ids[u];
+        }
+        if (nt1 > 0) {
+            SalLowerCtx lctx = { t0, umap, u_ids, u_to_l, lmap, l_ids, 0 };
+            lp_pg_lookup_paths(t1_ids, (size_t)nt1, false, sal_t1_path_visit, &lctx);
+            nl = lctx.nl;
+        }
+        pfree(t1_ids);
+    }
     int64 total = 0;
     double *info_bits = palloc0(sizeof(double) * (size_t)nu);
     double *loss_c = palloc0(sizeof(double) * (size_t)nu);
@@ -1912,10 +2012,105 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
                 if (btreeEntry.findItem(&btreeEntry, stackEntry)) {
                     IndexTuple itup = (IndexTuple)PageGetItem(page, PageGetItemId(page, stackEntry->off));
                     if (GinIsPostingTree(itup)) {
+                        if (u_glue[u]) {
+                            part_est_df[u] += Max((int64)512, p_rows / 4);
+                            part_high_df[u] = true;
+                        } else {
+                            BlockNumber rootBlk = GinGetPostingTree(itup);
+                            LockBuffer(stackEntry->buffer, GIN_UNLOCK);
+                            needUnlock = false;
+
+                            GinBtreeData btreeData;
+                            GinBtreeStack *stack = ginScanBeginPostingTree(&btreeData, index, rootBlk);
+                            uint32 pred_pages = stack->predictNumber > 0 ? stack->predictNumber : 1;
+                            Page lpage = BufferGetPage(stack->buffer);
+                            ItemPointerData minItem;
+                            ItemPointerSetMin(&minItem);
+                            int nfirst = 0;
+                            ItemPointer firstItems = NULL;
+                            if (!GinPageIsDeleted(lpage))
+                                firstItems = GinDataLeafPageGetItems(lpage, &nfirst, minItem);
+
+                            if (pred_pages > 8 || (int64)pred_pages * nfirst > 4096) {
+                                part_est_df[u] += (int64)pred_pages * (int64)(nfirst > 0 ? nfirst : 512);
+                                part_high_df[u] = true;
+                                if (firstItems) pfree(firstItems);
+                                LockBuffer(stack->buffer, GIN_UNLOCK);
+                                freeGinBtreeStack(stack);
+                            } else {
+                                Buffer lbuf = stack->buffer;
+                                IncrBufferRefCount(lbuf);
+                                freeGinBtreeStack(stack);
+                                part_bms[u] = tbm_create(bm_mem, NULL);
+                                if (firstItems) {
+                                    if (nfirst > 0) tbm_add_tuples(part_bms[u], firstItems, nfirst, false);
+                                    pfree(firstItems);
+                                }
+                                uint32 walked = 1;
+                                int64 seen_items = nfirst;
+                                while (!GinPageRightMost(lpage) && walked < 16) {
+                                    lbuf = ginStepRight(lbuf, index, GIN_SHARE);
+                                    lpage = BufferGetPage(lbuf);
+                                    walked++;
+                                    if (!GinPageIsDeleted(lpage)) {
+                                        int nitems = 0;
+                                        ItemPointer items = GinDataLeafPageGetItems(lpage, &nitems, minItem);
+                                        if (items) {
+                                            if (nitems > 0) {
+                                                tbm_add_tuples(part_bms[u], items, nitems, false);
+                                                seen_items += nitems;
+                                            }
+                                            pfree(items);
+                                        }
+                                    }
+                                }
+                                bool more = !GinPageRightMost(lpage);
+                                UnlockReleaseBuffer(lbuf);
+                                if (more) {
+                                    int64 avg = walked > 0 ? (seen_items / walked) : 512;
+                                    part_est_df[u] += Max(seen_items, (int64)Max(pred_pages, walked) * Max(avg, (int64)1));
+                                    tbm_free(part_bms[u]);
+                                    part_bms[u] = NULL;
+                                    part_high_df[u] = true;
+                                }
+                            }
+                        }
+                    } else if (GinGetNPosting(itup) > 0) {
+                        if (u_glue[u]) {
+                            part_est_df[u] += GinGetNPosting(itup);
+                        } else {
+                            int nlist = 0;
+                            ItemPointer items = ginReadTuple(&ginstate, (OffsetNumber)index_col, itup, &nlist);
+                            if (items) {
+                                if (nlist > 0) {
+                                    part_bms[u] = tbm_create(bm_mem, NULL);
+                                    tbm_add_tuples(part_bms[u], items, nlist, false);
+                                }
+                                pfree(items);
+                            }
+                        }
+                    }
+                }
+                if (needUnlock) LockBuffer(stackEntry->buffer, GIN_UNLOCK);
+                freeGinBtreeStack(stackEntry);
+                pfree(DatumGetPointer(kdatum));
+            }
+
+            /* Fast count-only GIN estimation for lowercase case-variants (tier 1 words). */
+            for (int l = 0; l < nl; l++) {
+                if (n_canon > 0 && max_t && max_t[p] <= 1) break;
+                Datum kdatum = sal_path_member_key(&l_ids[l]);
+                GinBtreeData btreeEntry;
+                ginPrepareEntryScan(&btreeEntry, (OffsetNumber)index_col, kdatum, GIN_CAT_NORM_KEY, &ginstate);
+                GinBtreeStack *stackEntry = ginFindLeafPage(&btreeEntry, true, false);
+                Page page = BufferGetPage(stackEntry->buffer);
+                bool needUnlock = true;
+                if (btreeEntry.findItem(&btreeEntry, stackEntry)) {
+                    IndexTuple itup = (IndexTuple)PageGetItem(page, PageGetItemId(page, stackEntry->off));
+                    if (GinIsPostingTree(itup)) {
                         BlockNumber rootBlk = GinGetPostingTree(itup);
                         LockBuffer(stackEntry->buffer, GIN_UNLOCK);
                         needUnlock = false;
-
                         GinBtreeData btreeData;
                         GinBtreeStack *stack = ginScanBeginPostingTree(&btreeData, index, rootBlk);
                         uint32 pred_pages = stack->predictNumber > 0 ? stack->predictNumber : 1;
@@ -1926,10 +2121,8 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
                         ItemPointer firstItems = NULL;
                         if (!GinPageIsDeleted(lpage))
                             firstItems = GinDataLeafPageGetItems(lpage, &nfirst, minItem);
-
-                        if (u_glue[u] || pred_pages > 8 || (int64)pred_pages * nfirst > 4096) {
-                            part_est_df[u] += (int64)pred_pages * (int64)(nfirst > 0 ? nfirst : 512);
-                            part_high_df[u] = true;
+                        if (pred_pages > 8 || (int64)pred_pages * nfirst > 4096) {
+                            l_df[l] += (int64)pred_pages * (int64)(nfirst > 0 ? nfirst : 512);
                             if (firstItems) pfree(firstItems);
                             LockBuffer(stack->buffer, GIN_UNLOCK);
                             freeGinBtreeStack(stack);
@@ -1937,13 +2130,9 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
                             Buffer lbuf = stack->buffer;
                             IncrBufferRefCount(lbuf);
                             freeGinBtreeStack(stack);
-                            part_bms[u] = tbm_create(bm_mem, NULL);
-                            if (firstItems) {
-                                if (nfirst > 0) tbm_add_tuples(part_bms[u], firstItems, nfirst, false);
-                                pfree(firstItems);
-                            }
-                            uint32 walked = 1;
                             int64 seen_items = nfirst;
+                            if (firstItems) pfree(firstItems);
+                            uint32 walked = 1;
                             while (!GinPageRightMost(lpage) && walked < 16) {
                                 lbuf = ginStepRight(lbuf, index, GIN_SHARE);
                                 lpage = BufferGetPage(lbuf);
@@ -1951,39 +2140,20 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
                                 if (!GinPageIsDeleted(lpage)) {
                                     int nitems = 0;
                                     ItemPointer items = GinDataLeafPageGetItems(lpage, &nitems, minItem);
-                                    if (items) {
-                                        if (nitems > 0) {
-                                            tbm_add_tuples(part_bms[u], items, nitems, false);
-                                            seen_items += nitems;
-                                        }
-                                        pfree(items);
-                                    }
+                                    if (items) { seen_items += nitems; pfree(items); }
                                 }
                             }
                             bool more = !GinPageRightMost(lpage);
                             UnlockReleaseBuffer(lbuf);
                             if (more) {
                                 int64 avg = walked > 0 ? (seen_items / walked) : 512;
-                                part_est_df[u] += Max(seen_items, (int64)Max(pred_pages, walked) * Max(avg, (int64)1));
-                                tbm_free(part_bms[u]);
-                                part_bms[u] = NULL;
-                                part_high_df[u] = true;
+                                l_df[l] += Max(seen_items, (int64)Max(pred_pages, walked) * Max(avg, (int64)1));
+                            } else {
+                                l_df[l] += seen_items;
                             }
                         }
                     } else if (GinGetNPosting(itup) > 0) {
-                        int nlist = 0;
-                        ItemPointer items = ginReadTuple(&ginstate, (OffsetNumber)index_col, itup, &nlist);
-                        if (items) {
-                            if (nlist > 0) {
-                                if (u_glue[u]) {
-                                    part_est_df[u] += nlist;
-                                } else {
-                                    part_bms[u] = tbm_create(bm_mem, NULL);
-                                    tbm_add_tuples(part_bms[u], items, nlist, false);
-                                }
-                            }
-                            pfree(items);
-                        }
+                        l_df[l] += GinGetNPosting(itup);
                     }
                 }
                 if (needUnlock) LockBuffer(stackEntry->buffer, GIN_UNLOCK);
@@ -2022,6 +2192,8 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
                                     if (cat != GIN_CAT_NORM_KEY || VARSIZE_ANY_EXHDR(kd) != 17) continue;
                                     const uint8 *kb = (const uint8 *)VARDATA_ANY(kd);
                                     if (kb[0] != 0) continue;
+                                    int64 l_at = nl > 0 ? lp_idmap_find(lmap, (const lp_id *)(kb + 1)) : -1;
+                                    if (l_at >= 0) l_df[*(int *)lp_idmap_at(lmap, (size_t)l_at)]++;
                                     int64 u_at = lp_idmap_find(umap, (const lp_id *)(kb + 1));
                                     if (u_at < 0) continue;
                                     int u = *(int *)lp_idmap_at(umap, (size_t)u_at);
@@ -2078,9 +2250,17 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
     pfree(part_high_df);
     pfree(part_bms);
 
-    for (int u = 0; u < nu; u++) if (total < df[u]) total = df[u];
-    for (int u = 0; u < nu; u++)
+    int64 *eff_df = palloc(sizeof(int64) * (size_t)nu);
+    double *eff_info = palloc(sizeof(double) * (size_t)nu);
+    for (int u = 0; u < nu; u++) {
+        int64 ldf = (u_to_l[u] >= 0) ? l_df[u_to_l[u]] : 0;
+        eff_df[u] = (ldf > df[u]) ? (df[u] + ldf) : df[u];
+        if (total < eff_df[u]) total = eff_df[u];
+    }
+    for (int u = 0; u < nu; u++) {
         info_bits[u] = -log2((double)(df[u] + 1) / (double)(total + 1));
+        eff_info[u] = -log2((double)(eff_df[u] + 1) / (double)(total + 1));
+    }
 
     /* Loss contrast over bounded claim & physicality_assertions holders + attestation fallback. */
     if (ng > 0 && (!scope || nscope > 0)) {
@@ -2246,7 +2426,7 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
     /* Span lift (local span contraction & PMI) and normalized salience. */
     double mean_info = 0.0;
     if (ng > 0) {
-        for (int k = 0; k < ng; k++) mean_info += info_bits[occ_to_u[ng_pos[k]]];
+        for (int k = 0; k < ng; k++) mean_info += eff_info[occ_to_u[ng_pos[k]]];
         mean_info /= (double)ng;
     }
 
@@ -2259,22 +2439,30 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
         if (pidx < 0) continue;
         int ua = occ_to_u[ng_pos[k]], ub = occ_to_u[ng_pos[k + 1]];
         int64 co = pairs[pidx].co;
-        double i_co = -log2((double)(co + 1) / (double)(total + 1));
-        double pmi = info_bits[ua] + info_bits[ub] - i_co;
-        double pmi_lift = pmi - log2(1.0 + (double)co / scale_denom);
-        int64 min_df = Min(df[ua], df[ub]);
-        double max_cond = (double)(co + 1) / (double)(min_df + 1);
-        double base_lift = (max_cond < 0.5)
-            ? log2(2.0 * max_cond)
-            : (pmi_lift < 0.0 ? pmi_lift : pmi_lift * max_cond);
-        if (pairs[pidx].stored) base_lift += 1.0;
+        double la = 0.0, lb = 0.0;
+        if (co > 0 || pairs[pidx].stored) {
+            double i_co = -log2((double)(co + 1) / (double)(total + 1));
+            double pmi = eff_info[ua] + eff_info[ub] - i_co;
+            double pmi_lift = pmi - log2(1.0 + (double)co / scale_denom);
+            int64 min_df = Min(eff_df[ua], eff_df[ub]);
+            double max_cond = (double)(co + 1) / (double)(min_df + 1);
+            double base_lift = (max_cond < 0.5)
+                ? log2(2.0 * max_cond)
+                : (pmi_lift < 0.0 ? pmi_lift : pmi_lift * max_cond);
+            if (pairs[pidx].stored) base_lift += 1.0;
 
-        double sa = 1.0 / (double)(df[ua] + 1), sb = 1.0 / (double)(df[ub] + 1);
-        double sh_a = sa / (sa + sb), sh_b = sb / (sa + sb);
-        double la = (base_lift >= 0.0 ? base_lift * sh_a : base_lift)
-                  + 0.5 * (info_bits[ua] - info_bits[ub]);
-        double lb = (base_lift >= 0.0 ? base_lift * sh_b : base_lift)
-                  + 0.5 * (info_bits[ub] - info_bits[ua]);
+            double sa = 1.0 / (double)(eff_df[ua] + 1), sb = 1.0 / (double)(eff_df[ub] + 1);
+            double sh_a = sa / (sa + sb), sh_b = sb / (sa + sb);
+            la = (base_lift >= 0.0 ? base_lift * sh_a : base_lift)
+               + 0.5 * (eff_info[ua] - eff_info[ub]);
+            lb = (base_lift >= 0.0 ? base_lift * sh_b : base_lift)
+               + 0.5 * (eff_info[ub] - eff_info[ua]);
+            if (base_lift < 0.0) {
+                double cap_neg = 0.25 * base_lift;
+                if (la > cap_neg) la = cap_neg;
+                if (lb > cap_neg) lb = cap_neg;
+            }
+        }
         ng_lift_sum[k] += la; ng_lift_cnt[k]++;
         ng_lift_sum[k + 1] += lb; ng_lift_cnt[k + 1]++;
     }
@@ -2292,7 +2480,7 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
         int u = occ_to_u[pos];
         if (ng >= 2 && ng_lift_cnt[k] > 0) {
             double avg_nb = ng_lift_sum[k] / (double)ng_lift_cnt[k];
-            out[pos].span_lift = 0.75 * avg_nb + 0.25 * (info_bits[u] - mean_info);
+            out[pos].span_lift = 0.75 * avg_nb + 0.25 * (eff_info[u] - mean_info);
         } else {
             out[pos].span_lift = 0.0;
         }
@@ -2303,7 +2491,7 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
     for (int i = 0; i < nocc; i++) {
         if (is_glue[i]) { out[i].salience = 0.0; continue; }
         int u = occ_to_u[i];
-        double inv_df = 1.0 / sqrt((double)(df[u] + 1));
+        double inv_df = 1.0 / sqrt((double)(eff_df[u] + 1));
         if (u_tiers[u] < 0 && df[u] == 0) inv_df *= 0.25;
         double clamped_lift = out[i].span_lift < -4.0 ? -4.0 : (out[i].span_lift > 4.0 ? 4.0 : out[i].span_lift);
         double lift_f = exp(0.25 * clamped_lift);
@@ -2316,6 +2504,8 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
     }
 
     pfree(raw); pfree(ng_lift_cnt); pfree(ng_lift_sum);
+    pfree(eff_info); pfree(eff_df);
+    pfree(l_df); pfree(u_to_l); pfree(l_ids); lp_idmap_free(lmap);
     pfree(loss_c); pfree(info_bits); pfree(df);
     pfree(step_pair); pfree(pairs); pfree(ng_pos);
     pfree(u_glue); pfree(u_tiers);

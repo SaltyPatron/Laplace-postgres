@@ -5,6 +5,9 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/relscan.h"
+#include "access/genam.h"
+#include "access/skey.h"
+#include "access/stratnum.h"
 #include "access/htup_details.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -1227,6 +1230,139 @@ static void witness_filter_visit(const lp_id *parent, Datum path, Datum mask, vo
     }
 }
 
+typedef struct {
+    lp_idmap *closure;
+    lp_idmap *next_front;
+    lp_vec(lp_vertex) vertices;
+    size_t limit;
+    bool complete;
+} DownwardWitnessCtx;
+
+static void downward_closure_visit(const lp_id *entity, Datum path, Datum mask, void *context)
+{
+    DownwardWitnessCtx *c = context;
+    (void)entity; (void)mask;
+    if (!c->complete) return;
+    Geo g = geo_of(path);
+    size_t nv = g.p.n;
+    if (!nv) return;
+    lp_vec_reserve(&c->vertices, nv);
+    if (lp_path_decode(g.p, c->vertices.v, nv) != nv) return;
+    for (size_t k = 0; k < nv; k++) {
+        const lp_vertex *v = &c->vertices.v[k];
+        if (v->said == LP_SAID_METADATA || v->said == LP_SAID_DEPENDENCE) continue;
+        bool fresh = false;
+        lp_idmap_put(c->closure, &v->id, &fresh);
+        if (fresh) {
+            if (lp_idmap_count(c->closure) > c->limit) {
+                c->complete = false;
+                return;
+            }
+            lp_idmap_put(c->next_front, &v->id, NULL);
+        }
+    }
+}
+
+static void try_downward_witness_closure(const lp_id *witnesses, int nwitnesses,
+                                         lp_idmap *closure, bool *complete)
+{
+    *complete = false;
+    if (!witnesses || nwitnesses <= 0 || !closure) return;
+
+    Oid target = lp_pg_relation("attestation");
+    const char *selected[] = { "claim", "witness" };
+    const char *column = NULL;
+    Relation parent = lp_pg_read_parent(target, &column, selected, 2);
+    Oid native_id = get_atttype(target, get_attnum(target, "witness"));
+    table_close(parent, NoLock);
+
+    const Oid *parts = NULL, *aux = NULL;
+    int nparts = lp_pg_canonical_partitions("attestation", &parts, NULL, &aux, NULL);
+    Snapshot snap = GetActiveSnapshot();
+
+    lp_idmap *front = lp_idmap_new();
+    lp_vec(lp_id) uniq_w = { 0 };
+    bool ok = true;
+
+    PG_TRY(); {
+        for (int i = 0; i < nwitnesses; i++) {
+            bool fresh = false;
+            lp_idmap_put(closure, witnesses + i, &fresh);
+            if (fresh) {
+                lp_idmap_put(front, witnesses + i, NULL);
+                lp_push(&uniq_w, witnesses[i]);
+            }
+        }
+
+        for (int p = 0; p < nparts && ok; p++) {
+            CHECK_FOR_INTERRUPTS();
+            if (!OidIsValid(aux[p])) { ok = false; break; }
+            Relation part = table_open(parts[p], AccessShareLock);
+            Relation idx = index_open(aux[p], AccessShareLock);
+            AttrNumber ac = get_attnum(parts[p], "claim");
+            Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
+            if (!OidIsValid(eq_op)) {
+                index_close(idx, NoLock);
+                table_close(part, NoLock);
+                ok = false;
+                break;
+            }
+            RegProcedure eq_proc = get_opcode(eq_op);
+            IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 1, 0);
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+
+            for (size_t wi = 0; wi < uniq_w.n && ok; wi++) {
+                ScanKeyData sk;
+                ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, native_id,
+                                       idx->rd_indcollation[0], eq_proc, PointerGetDatum(&uniq_w.v[wi]));
+                index_rescan(scan, &sk, 1, NULL, 0);
+                while (ok && index_getnext_slot(scan, ForwardScanDirection, slot)) {
+                    CHECK_FOR_INTERRUPTS();
+                    bool isnull = true;
+                    Datum dc = slot_getattr(slot, ac, &isnull);
+                    if (!isnull) {
+                        const lp_id *cid = (const lp_id *)DatumGetPointer(dc);
+                        bool fresh = false;
+                        lp_idmap_put(closure, cid, &fresh);
+                        if (fresh) {
+                            lp_idmap_put(front, cid, NULL);
+                            if (lp_idmap_count(closure) > 8192) ok = false;
+                        }
+                    }
+                    ExecClearTuple(slot);
+                }
+            }
+
+            ExecDropSingleTupleTableSlot(slot);
+            index_endscan(scan);
+            index_close(idx, NoLock);
+            table_close(part, NoLock);
+        }
+
+        DownwardWitnessCtx dctx = {
+            .closure = closure,
+            .next_front = NULL,
+            .limit = 16384,
+            .complete = ok
+        };
+        for (int depth = 0; depth < 16 && lp_idmap_count(front) > 0 && dctx.complete; depth++) {
+            CHECK_FOR_INTERRUPTS();
+            dctx.next_front = lp_idmap_new();
+            lp_pg_lookup_paths(lp_idmap_keys(front), lp_idmap_count(front), false, downward_closure_visit, &dctx);
+            lp_idmap_free(front);
+            front = dctx.next_front;
+            dctx.next_front = NULL;
+        }
+        lp_vec_free(&dctx.vertices);
+        ok = dctx.complete;
+    } PG_FINALLY(); {
+        lp_vec_free(&uniq_w);
+        lp_idmap_free(front);
+    } PG_END_TRY();
+
+    *complete = ok;
+}
+
 void lp_pg_filter_witness_entities(const lp_id *entities, size_t count,
                                    const lp_id *witnesses, int nwitnesses, bool *allowed)
 {
@@ -1246,75 +1382,85 @@ void lp_pg_filter_witness_entities(const lp_id *entities, size_t count,
         .max_nodes = 131072,
         .max_edges = 262144
     };
+    lp_idmap *down = lp_idmap_new();
     lp_vec(lp_id) check_att = {0};
     PG_TRY(); {
-        for (int i = 0; i < nwitnesses; i++) lp_idmap_put(wf.scope, witnesses + i, NULL);
-        for (size_t i = 0; i < count; i++) {
-            bool fresh = false;
-            size_t idx = lp_idmap_put(wf.nodes, entities + i, &fresh);
-            orig_node[i] = idx;
-            if (fresh) {
-                uint8_t direct = (lp_idmap_find(wf.scope, entities + i) >= 0) ? 1 : 0;
-                lp_push(&wf.allowed, direct);
-                if (!direct) lp_push(&check_att, entities[i]);
+        bool down_complete = false;
+        try_downward_witness_closure(witnesses, nwitnesses, down, &down_complete);
+        if (down_complete) {
+            for (size_t i = 0; i < count; i++)
+                allowed[i] = (lp_idmap_find(down, entities + i) >= 0);
+        } else {
+            for (int i = 0; i < nwitnesses; i++) lp_idmap_put(wf.scope, witnesses + i, NULL);
+            for (size_t i = 0; i < count; i++) {
+                bool fresh = false;
+                size_t idx = lp_idmap_put(wf.nodes, entities + i, &fresh);
+                orig_node[i] = idx;
+                if (fresh) {
+                    uint8_t direct = (lp_idmap_find(wf.scope, entities + i) >= 0 ||
+                                      lp_idmap_find(down, entities + i) >= 0) ? 1 : 0;
+                    lp_push(&wf.allowed, direct);
+                    if (!direct) lp_push(&check_att, entities[i]);
+                }
             }
-        }
-        if (check_att.n > 0) {
-            PgAttrRows att = {0};
-            lp_pg_read_attestation_pk(check_att.v, (int)check_att.n, wf.scope, &att, NULL);
-            for (size_t k = 0; k < att.n; k++) {
-                int64_t idx = lp_idmap_find(wf.nodes, &att.v[k].claim);
-                if (idx >= 0) wf.allowed.v[idx] = 1;
-            }
-            lp_vec_free(&att);
-            for (size_t k = 0; k < check_att.n; k++) {
-                int64_t idx = lp_idmap_find(wf.nodes, &check_att.v[k]);
-                if (idx >= 0 && !wf.allowed.v[idx]) lp_idmap_put(wf.front, &check_att.v[k], NULL);
-            }
-        }
-        for (int lvl = 0; lvl < 16 && lp_idmap_count(wf.front) > 0
-             && lp_idmap_count(wf.nodes) < wf.max_nodes && wf.edges.n < wf.max_edges; lvl++) {
-            CHECK_FOR_INTERRUPTS();
-            wf.next = lp_idmap_new();
-            wf.seen_level = lp_idmap_new();
-            wf.new_ids.n = 0;
-            wf.new_nodes.n = 0;
-            lp_pg_lookup_containers(lp_idmap_keys(wf.front), lp_idmap_count(wf.front),
-                                    false, false, witness_filter_visit, &wf);
-            if (wf.new_ids.n > 0) {
+            if (check_att.n > 0) {
                 PgAttrRows att = {0};
-                lp_pg_read_attestation_pk(wf.new_ids.v, (int)wf.new_ids.n, wf.scope, &att, NULL);
+                lp_pg_read_attestation_pk(check_att.v, (int)check_att.n, wf.scope, &att, NULL);
                 for (size_t k = 0; k < att.n; k++) {
                     int64_t idx = lp_idmap_find(wf.nodes, &att.v[k].claim);
                     if (idx >= 0) wf.allowed.v[idx] = 1;
                 }
                 lp_vec_free(&att);
-            }
-            lp_idmap_free(wf.seen_level); wf.seen_level = NULL;
-            lp_idmap_free(wf.front);
-            /* Only continue climbing from nodes not yet proved allowed. */
-            lp_idmap *filtered_next = lp_idmap_new();
-            for (size_t k = 0; k < lp_idmap_count(wf.next); k++) {
-                const lp_id *nid = lp_idmap_key(wf.next, k);
-                int64_t nidx = lp_idmap_find(wf.nodes, nid);
-                if (nidx >= 0 && !wf.allowed.v[nidx]) lp_idmap_put(filtered_next, nid, NULL);
-            }
-            lp_idmap_free(wf.next); wf.next = NULL;
-            wf.front = filtered_next;
-        }
-        for (int pass = 0; pass < 16; pass++) {
-            bool changed = false;
-            for (size_t e = wf.edges.n; e-- > 0;) {
-                WitnessUpEdge edge = wf.edges.v[e];
-                if (wf.allowed.v[edge.parent] && !wf.allowed.v[edge.child]) {
-                    wf.allowed.v[edge.child] = 1;
-                    changed = true;
+                for (size_t k = 0; k < check_att.n; k++) {
+                    int64_t idx = lp_idmap_find(wf.nodes, &check_att.v[k]);
+                    if (idx >= 0 && !wf.allowed.v[idx]) lp_idmap_put(wf.front, &check_att.v[k], NULL);
                 }
             }
-            if (!changed) break;
+            for (int lvl = 0; lvl < 16 && lp_idmap_count(wf.front) > 0
+                 && lp_idmap_count(wf.nodes) < wf.max_nodes && wf.edges.n < wf.max_edges; lvl++) {
+                CHECK_FOR_INTERRUPTS();
+                wf.next = lp_idmap_new();
+                wf.seen_level = lp_idmap_new();
+                wf.new_ids.n = 0;
+                wf.new_nodes.n = 0;
+                lp_pg_lookup_containers(lp_idmap_keys(wf.front), lp_idmap_count(wf.front),
+                                        false, false, witness_filter_visit, &wf);
+                if (wf.new_ids.n > 0) {
+                    PgAttrRows att = {0};
+                    lp_pg_read_attestation_pk(wf.new_ids.v, (int)wf.new_ids.n, wf.scope, &att, NULL);
+                    for (size_t k = 0; k < att.n; k++) {
+                        int64_t idx = lp_idmap_find(wf.nodes, &att.v[k].claim);
+                        if (idx >= 0) wf.allowed.v[idx] = 1;
+                    }
+                    lp_vec_free(&att);
+                }
+                lp_idmap_free(wf.seen_level); wf.seen_level = NULL;
+                lp_idmap_free(wf.front);
+                /* Only continue climbing from nodes not yet proved allowed. */
+                lp_idmap *filtered_next = lp_idmap_new();
+                for (size_t k = 0; k < lp_idmap_count(wf.next); k++) {
+                    const lp_id *nid = lp_idmap_key(wf.next, k);
+                    int64_t nidx = lp_idmap_find(wf.nodes, nid);
+                    if (nidx >= 0 && !wf.allowed.v[nidx]) lp_idmap_put(filtered_next, nid, NULL);
+                }
+                lp_idmap_free(wf.next); wf.next = NULL;
+                wf.front = filtered_next;
+            }
+            for (int pass = 0; pass < 16; pass++) {
+                bool changed = false;
+                for (size_t e = wf.edges.n; e-- > 0;) {
+                    WitnessUpEdge edge = wf.edges.v[e];
+                    if (wf.allowed.v[edge.parent] && !wf.allowed.v[edge.child]) {
+                        wf.allowed.v[edge.child] = 1;
+                        changed = true;
+                    }
+                }
+                if (!changed) break;
+            }
+            for (size_t i = 0; i < count; i++) allowed[i] = wf.allowed.v[orig_node[i]] != 0;
         }
-        for (size_t i = 0; i < count; i++) allowed[i] = wf.allowed.v[orig_node[i]] != 0;
     } PG_FINALLY(); {
+        lp_idmap_free(down);
         lp_idmap_free(wf.scope);
         lp_idmap_free(wf.nodes);
         lp_idmap_free(wf.front);
