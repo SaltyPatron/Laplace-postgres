@@ -813,8 +813,9 @@ static void eval_series_for_claims(Oid pending_oid, Oid native_id, lp_idmap *cla
         while (at < batch->observations.n && lp_id_eq(&batch->observations.v[at].claim, ordered + i)) {
             const PgSeriesObservation *o = batch->observations.v + at++;
             lp_id root = pg_series_root(batch, o->has_lineage ? o->lineage : o->witness);
+            double wins = fmin((double)o->games, fmax(0.0, (double)o->games * o->score));
             lp_series_entry entry;
-            if (!lp_series_attested(root, (double)o->games, (double)o->games * o->score, o->trust, &entry))
+            if (!lp_series_attested(root, (double)o->games, wins, o->trust, &entry))
                 pg_series_invalid();
             lp_push(&batch->entries, entry);
         }
@@ -1151,8 +1152,8 @@ static void write_acc_update(TupleTableSlot *old_s, TupleTableSlot *new_s, void 
 
     int64 ng = pg + d->games;
     int64 nt = pt + d->tokens;
-    double nw = pw + d->wins;
-    double nscore = nw / (double)ng;
+    double nw = fmin((double)ng, fmax(0.0, pw + d->wins));
+    double nscore = fmin(1.0, fmax(0.0, nw / (double)ng));
     bool npos_null;
     int32 npos = 0;
     if (pp_null || pp <= 0) {
