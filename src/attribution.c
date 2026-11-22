@@ -236,8 +236,16 @@ static void compute_attribution_rows(const lp_id *claims,int n,Oid idarr,const l
         lp_rating prior=lp_rating_stock();
         bool valid=solved?lp_series(batch->entries.v,batch->entries.n,&standing)
             :lp_series_evaluate(&prior,batch->entries.v,batch->entries.n,&standing,information,j-i,&written);
-        if(!valid||standing.matches>PG_INT64_MAX)
-            ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),errmsg("laplace attribution: invalid or non-convergent rooted series")));
+        if(!valid||standing.matches>PG_INT64_MAX){
+            const lp_series_entry *e0=batch->entries.v;
+            ereport(ERROR,(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+                errmsg("laplace attribution: invalid or non-convergent rooted series"),
+                errdetail("errno=%d entries=%zu matches=%llu e0=(games=%llu wins=%.17g trust=%.17g wdev=%.17g opp=%.17g/%.17g)",
+                    errno,batch->entries.n,(unsigned long long)standing.matches,
+                    (unsigned long long)(batch->entries.n?e0->games:0),batch->entries.n?e0->wins:0.0,
+                    batch->entries.n?e0->trust:0.0,batch->entries.n?e0->witness_deviation:0.0,
+                    batch->entries.n?e0->opponent.rating:0.0,batch->entries.n?e0->opponent.deviation:0.0)));
+        }
         if(solved)lp_push(solved,((PgSolvedStanding){rows->v[i].claim,standing}));
         else for(size_t k=i;k<j;k++){
             const lp_series_entry *entry=batch->entries.v+(k-i);
@@ -820,10 +828,16 @@ static void eval_series_for_claims(Oid pending_oid, Oid native_id, lp_idmap *cla
             lp_push(&batch->entries, entry);
         }
         if (batch->entries.n) {
-            lp_standing standing;
-            if (!lp_series(batch->entries.v, batch->entries.n, &standing) || standing.matches > PG_INT64_MAX)
+            lp_standing standing = {0};
+            if (!lp_series(batch->entries.v, batch->entries.n, &standing) || standing.matches > PG_INT64_MAX) {
+                const lp_series_entry *e0 = batch->entries.v;
                 ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-                                errmsg("laplace_series: invalid or non-convergent rooted series")));
+                                errmsg("laplace_series: invalid or non-convergent rooted series"),
+                                errdetail("errno=%d entries=%zu matches=%llu e0=(games=%llu wins=%.17g trust=%.17g wdev=%.17g opp=%.17g/%.17g)",
+                                          errno, batch->entries.n, (unsigned long long)standing.matches,
+                                          (unsigned long long)e0->games, e0->wins, e0->trust,
+                                          e0->witness_deviation, e0->opponent.rating, e0->opponent.deviation)));
+            }
             standings[i] = standing;
             present[i] = true;
         }
