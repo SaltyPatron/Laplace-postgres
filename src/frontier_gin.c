@@ -997,7 +997,7 @@ void lp_pg_claims_each_scoped_direct(const lp_id *ids,int count,int64 fan,lp_mas
     if(opposite && endpoint!=1 && endpoint!=2)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
     ClaimRead read={
-        .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits,
+        .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits|UINT64_C(1),
         .has_scope=has_scope,.witnesses=witnesses,.nwitnesses=nwitnesses,.idarr=idarr,
         .refuse=(lp_id *)refuse,.nrefuse=nrefuse,.include=(lp_id *)include,.ninclude=ninclude,
         .visit=visit,.visit_context=context
@@ -1014,9 +1014,9 @@ void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
 }
 static Datum read_claims(FunctionCallInfo fcinfo,bool each)
 {
-    ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX};
+    ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX,.bits=UINT64_C(1)};
     read.output.output=set_begin(fcinfo,each?"laplace_claims_each":"laplace_claims",&read.output.descriptor);
-    if(PG_ARGISNULL(0)||PG_ARGISNULL(2)||PG_ARGISNULL(3))return (Datum)0;
+    if(PG_ARGISNULL(0))return (Datum)0;
     lp_id *scope_ids=NULL;
     if(PG_NARGS()>8&&!PG_ARGISNULL(8)){
         int nwit=0;scope_ids=ids_of(PG_GETARG_ARRAYTYPE_P(8),&nwit);
@@ -1039,23 +1039,27 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         if(limit<0)ereport(ERROR,(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),errmsg("Native claim fan must not be negative")));
         read.limit=(uint64)limit;if(!limit){if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
-    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&read.bits)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
+    if(!PG_ARGISNULL(2)){
+        lp_mask extra=0;
+        if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&extra)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
+        read.bits|=extra;
+    }
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
-    read.refuse=ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
-    if(!count){pfree(ids);pfree(read.refuse);if(scope_ids)pfree(scope_ids);return (Datum)0;}
+    read.refuse=PG_ARGISNULL(3)?NULL:ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
+    if(!count){pfree(ids);if(read.refuse)pfree(read.refuse);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     if(PG_NARGS()>5 && !PG_ARGISNULL(5)){
         read.include=ids_of(PG_GETARG_ARRAYTYPE_P(5),&read.ninclude);
-        if(!read.ninclude){pfree(ids);pfree(read.refuse);pfree(read.include);if(scope_ids)pfree(scope_ids);return (Datum)0;}
+        if(!read.ninclude){pfree(ids);if(read.refuse)pfree(read.refuse);pfree(read.include);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
     lp_id *opposite=NULL;int nopposite=0;
     if(PG_NARGS()>7 && !PG_ARGISNULL(7)){
         if(read.endpoint!=1 && read.endpoint!=2)
             ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
         opposite=ids_of(PG_GETARG_ARRAYTYPE_P(7),&nopposite);
-        if(!nopposite){pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;}
+        if(!nopposite){pfree(ids);if(read.refuse)pfree(read.refuse);if(read.include)pfree(read.include);pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
     run_claims_query(&read,ids,count,opposite,nopposite);
-    pfree(ids);pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;
+    pfree(ids);if(read.refuse)pfree(read.refuse);if(read.include)pfree(read.include);if(opposite)pfree(opposite);if(scope_ids)pfree(scope_ids);return (Datum)0;
 }
 PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}

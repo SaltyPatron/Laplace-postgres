@@ -898,7 +898,6 @@ Datum laplace_estate_summary(PG_FUNCTION_ARGS) {
 
     char *dbname = get_database_name(MyDatabaseId);
     bool read_only = XactReadOnly || RecoveryInProgress();
-    int64 db_bytes = DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)));
 
     char *extversion = NULL;
     Oid ext_oid = get_extension_oid("laplace", true);
@@ -941,6 +940,11 @@ Datum laplace_estate_summary(PG_FUNCTION_ARGS) {
     collect_canonical_stats("physicality", exact, NULL, &path_s);
     collect_canonical_stats("attestation", exact, NULL, &att_s);
     collect_canonical_stats("consensus", exact, NULL, &con_s);
+    int64 db_bytes = exact
+        ? DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)))
+        : (ent_s.bytes + path_s.bytes + att_s.bytes + con_s.bytes);
+    if (!exact && db_bytes <= 0)
+        db_bytes = DatumGetInt64(DirectFunctionCall1(pg_database_size_oid, ObjectIdGetDatum(MyDatabaseId)));
 
     int64 witness_count = 0;
     lp_pg_scan_all_witnesses(count_witness_cb, &witness_count);
@@ -976,7 +980,9 @@ Datum laplace_estate_summary(PG_FUNCTION_ARGS) {
     jb_i64(&st, "entities", ent_s.rows);
     jb_i64(&st, "physicalities", path_s.rows);
     jb_i64(&st, "attestation_rows", att_s.rows);
+    jb_i64(&st, "attestations", att_s.rows);
     jb_i64(&st, "standing_rows", con_s.rows);
+    jb_i64(&st, "consensus", con_s.rows);
     jb_i64(&st, "registered_witness_rows", witness_count);
     jb_i64(&st, "entity_bytes", ent_s.bytes);
     jb_i64(&st, "physicality_bytes", path_s.bytes);
