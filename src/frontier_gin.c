@@ -2442,14 +2442,47 @@ void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, 
             size_t nh = lp_idmap_count(holders);
             if (nh > 0) {
                 bool *h_allow = palloc(sizeof(bool) * nh);
+                bool *h_has_path_out = palloc0(sizeof(bool) * nh);
+                for (size_t h = 0; h < nh; h++) {
+                    SalHolder *sh = lp_idmap_at(holders, h);
+                    Geo g = geo_of(sh->path);
+                    if (g.p.n == 0) continue;
+                    lp_vertex stack_v[64];
+                    lp_vertex *verts = g.p.n <= 64 ? stack_v : palloc(sizeof(lp_vertex) * g.p.n);
+                    size_t nv = lp_path_decode(g.p, verts, g.p.n);
+                    for (size_t v = 0; v < nv; v++) {
+                        if (verts[v].said == LP_SAID_RECORD || verts[v].said == LP_SAID_CLAIM || verts[v].outcome != 0) {
+                            h_has_path_out[h] = true;
+                            break;
+                        }
+                    }
+                    if (verts != stack_v) pfree(verts);
+                }
                 if (nscope > 0) {
                     lp_id *h_ids = palloc(sizeof(lp_id) * nh);
-                    for (size_t h = 0; h < nh; h++) h_ids[h] = ((SalHolder *)lp_idmap_at(holders, h))->entity;
-                    lp_pg_filter_witness_entities(h_ids, nh, scope, nscope, h_allow);
+                    size_t *h_map = palloc(sizeof(size_t) * nh);
+                    size_t n_filter = 0;
+                    for (size_t h = 0; h < nh; h++) {
+                        if (h_has_path_out[h]) {
+                            h_ids[n_filter] = ((SalHolder *)lp_idmap_at(holders, h))->entity;
+                            h_map[n_filter] = h;
+                            n_filter++;
+                        } else {
+                            h_allow[h] = true;
+                        }
+                    }
+                    if (n_filter > 0) {
+                        bool *f_allow = palloc(sizeof(bool) * n_filter);
+                        lp_pg_filter_witness_entities(h_ids, n_filter, scope, nscope, f_allow);
+                        for (size_t i = 0; i < n_filter; i++) h_allow[h_map[i]] = f_allow[i];
+                        pfree(f_allow);
+                    }
+                    pfree(h_map);
                     pfree(h_ids);
                 } else {
                     for (size_t h = 0; h < nh; h++) h_allow[h] = true;
                 }
+                pfree(h_has_path_out);
 
                 lp_id *all_claims = palloc(sizeof(lp_id) * nh);
                 int n_all = 0;
