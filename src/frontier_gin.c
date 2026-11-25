@@ -400,8 +400,8 @@ Datum laplace_containers(PG_FUNCTION_ARGS)
  * each key's claim and observation sets independently: a saturated set emits
  * one hub marker and none of whichever rows the heap happened to return. */
 typedef struct {
-    PresenceOutput output;lp_idmap *wanted,*required,*seen;int *links;
-    AttrNumber id,path,tier,mask;int floor,kinds,endpoint;bool per_part,count_only;int64 cap;lp_mask bits;
+    PresenceOutput output;lp_idmap *wanted,*active_wanted,*required,*seen;int *links;
+    AttrNumber id,path,tier,mask;int floor,kinds,active_kinds,endpoint;bool per_part,count_only;int64 cap;lp_mask bits;
     uint64 epoch,required_epoch,saturated;Tuplestorestate *pending;MemoryContext owner;
     void (*emit_hit)(const PgHolderHit *hit,Datum mask,void *ctx);
     void *emit_ctx;
@@ -433,9 +433,89 @@ static void holder_emit(HolderRead *read,size_t key,Datum *values,bool *nulls)
         set_put(read->output.fcinfo,read->output.output,read->output.descriptor,values,nulls);
     }
 }
+static Datum sal_path_member_key(const lp_id *id);
+
+static void estimate_holders_gin_df(Relation phys_parent,int16 floor,const lp_id *ids,int nu,int64 *est_df)
+{
+    if(nu<=0)return;
+    memset(est_df,0,sizeof(int64)*(size_t)nu);
+    Oid phys_oid=RelationGetRelid(phys_parent);
+    Oid element=get_atttype(phys_oid,get_attnum(phys_oid,"entity"));
+    Oid array_type=get_array_type(element);
+    const Oid *canon_parts=NULL;const int16 *min_t=NULL,*max_t=NULL;
+    int n_canon=lp_pg_canonical_partitions("physicality",&canon_parts,NULL,NULL,NULL);
+    (void)lp_pg_canonical_tier_bounds("physicality",&min_t,&max_t);
+    int nparts=n_canon>0?n_canon:1;
+    static Oid cached_hdr_parent=InvalidOid,cached_hdr_idx[256];
+    static int cached_hdr_col[256];
+    static uint64 cached_hdr_gen=0;
+    if(cached_hdr_gen!=lp_pg_binding_generation()){
+        memset(cached_hdr_idx,0,sizeof(cached_hdr_idx));
+        memset(cached_hdr_col,0,sizeof(cached_hdr_col));
+        cached_hdr_parent=InvalidOid;
+        cached_hdr_gen=lp_pg_binding_generation();
+    }
+    if(cached_hdr_parent!=phys_oid){
+        memset(cached_hdr_idx,0,sizeof(cached_hdr_idx));
+        memset(cached_hdr_col,0,sizeof(cached_hdr_col));
+        cached_hdr_parent=phys_oid;
+    }
+    for(int p=0;p<nparts;p++){
+        CHECK_FOR_INTERRUPTS();
+        Oid part_oid=n_canon>0?canon_parts[p]:phys_oid;
+        if(n_canon>0 && floor>=0 && max_t && max_t[p]<=floor)continue;
+        Relation table=table_open(part_oid,AccessShareLock);
+        if(table->rd_rel->relkind==RELKIND_PARTITIONED_TABLE || RelationGetNumberOfBlocks(table)==0){
+            table_close(table,NoLock);continue;
+        }
+        AttrNumber path_att=get_attnum(part_oid,"path");
+        int index_col=0;Oid operation=InvalidOid;
+        Oid *slot_id=(p<256)?&cached_hdr_idx[p]:NULL;
+        int *slot_col=(p<256)?&cached_hdr_col[p]:NULL;
+        Relation index=container_index(table,path_att,array_type,7,NIL,&index_col,&operation,slot_id,slot_col);
+        GinState ginstate;
+        initGinState(&ginstate,index);
+        for(int u=0;u<nu;u++){
+            Datum kdatum=sal_path_member_key(&ids[u]);
+            GinBtreeData btreeEntry;
+            ginPrepareEntryScan(&btreeEntry,(OffsetNumber)index_col,kdatum,GIN_CAT_NORM_KEY,&ginstate);
+            GinBtreeStack *stackEntry=ginFindLeafPage(&btreeEntry,true,false);
+            Page page=BufferGetPage(stackEntry->buffer);
+            bool needUnlock=true;
+            if(btreeEntry.findItem(&btreeEntry,stackEntry)){
+                IndexTuple itup=(IndexTuple)PageGetItem(page,PageGetItemId(page,stackEntry->off));
+                if(GinIsPostingTree(itup)){
+                    BlockNumber rootBlk=GinGetPostingTree(itup);
+                    LockBuffer(stackEntry->buffer,GIN_UNLOCK);
+                    needUnlock=false;
+                    GinBtreeData btreeData;
+                    GinBtreeStack *stack=ginScanBeginPostingTree(&btreeData,index,rootBlk);
+                    uint32 pred_pages=stack->predictNumber>0?stack->predictNumber:1;
+                    Page lpage=BufferGetPage(stack->buffer);
+                    ItemPointerData minItem;ItemPointerSetMin(&minItem);
+                    int nfirst=0;ItemPointer firstItems=NULL;
+                    if(!GinPageIsDeleted(lpage))firstItems=GinDataLeafPageGetItems(lpage,&nfirst,minItem);
+                    est_df[u]+=(int64)pred_pages*(int64)(nfirst>0?nfirst:512);
+                    if(firstItems)pfree(firstItems);
+                    LockBuffer(stack->buffer,GIN_UNLOCK);
+                    freeGinBtreeStack(stack);
+                }else if(GinGetNPosting(itup)>0){
+                    est_df[u]+=GinGetNPosting(itup);
+                }
+            }
+            if(needUnlock)LockBuffer(stackEntry->buffer,GIN_UNLOCK);
+            freeGinBtreeStack(stackEntry);
+            pfree(DatumGetPointer(kdatum));
+        }
+        index_close(index,NoLock);
+        table_close(table,NoLock);
+    }
+}
+
 static bool holder_row(TupleTableSlot *slot,void *context)
 {
     HolderRead *read=context;bool missing;
+    int eff_kinds=read->active_kinds?read->active_kinds:read->kinds;
     Datum tier=slot_getattr(slot,read->tier,&missing);
     if(missing)ereport(ERROR,(errmsg("Native holder tier is null")));
     if(DatumGetInt16(tier)<=read->floor)return true;
@@ -444,7 +524,7 @@ static bool holder_row(TupleTableSlot *slot,void *context)
     lp_mask native_mask=lp_pg_mask_native(mask);
     if((native_mask&read->bits)!=read->bits)return true;
     int kind=(native_mask&UINT64_C(1))?1:0;
-    if(!(read->kinds&(kind?1:2)))return true;
+    if(!(eff_kinds&(kind?1:2)))return true;
     Datum id=slot_getattr(slot,read->id,&missing);
     if(missing)ereport(ERROR,(errmsg("Native holder ID is null")));
     bool fresh;lp_idmap_put(read->seen,(const lp_id *)DatumGetPointer(id),&fresh);if(!fresh)return true;
@@ -464,20 +544,28 @@ static bool holder_row(TupleTableSlot *slot,void *context)
             bool first=i==0,last=i+1==geometry.p.n;
             if(!((read->endpoint&1 && first) || (read->endpoint&2 && last)))continue;
         }
-        lp_id child=lp_path_id(geometry.p,i);int64 at=lp_idmap_find(read->wanted,&child);if(at<0)continue;
+        lp_id child=lp_path_id(geometry.p,i);
+        if(read->active_wanted && lp_idmap_find(read->active_wanted,&child)<0)continue;
+        int64 at=lp_idmap_find(read->wanted,&child);if(at<0)continue;
         HolderKey *key=lp_idmap_at(read->wanted,(size_t)at);
         if(key->epoch==read->epoch)continue;key->epoch=read->epoch;
         if(read->count_only){key->held[kind]++;continue;}
         if(read->cap<0){holder_emit(read,(size_t)at,values,nulls);continue;}
         if(key->held[kind]>(uint64)read->cap)continue;
-        if(++key->held[kind]>(uint64)read->cap){read->saturated++;continue;}
+        uint64 cur=++key->held[kind];
+        if(read->active_wanted){
+            int64 sub_at=lp_idmap_find(read->active_wanted,&child);
+            if(sub_at>=0)((HolderKey *)lp_idmap_at(read->active_wanted,(size_t)sub_at))->held[kind]=cur;
+        }
+        if(cur>(uint64)read->cap){read->saturated++;continue;}
         values[0]=Int64GetDatum(at+1);
         MemoryContext previous=MemoryContextSwitchTo(read->owner);
         tuplestore_putvalues(read->pending,read->output.descriptor,values,nulls);
         MemoryContextSwitchTo(previous);
     }
     if(read->count_only)return true;
-    size_t groups=lp_idmap_count(read->wanted)*((read->kinds&1?1:0)+(read->kinds&2?1:0));
+    size_t n_active=read->active_wanted?lp_idmap_count(read->active_wanted):lp_idmap_count(read->wanted);
+    size_t groups=n_active*((eff_kinds&1?1:0)+(eff_kinds&2?1:0));
     return read->cap<0 || read->saturated<groups;
 }
 static void run_holders_query(HolderRead *read,const lp_id *ids,int count,const lp_id *required,int nrequired)
@@ -511,8 +599,57 @@ static void run_holders_query(HolderRead *read,const lp_id *ids,int count,const 
             read->links[i]=key->head;key->head=i;
         }
         for(int i=0;i<nrequired;i++){bool fresh;size_t at=lp_idmap_put(read->required,required+i,&fresh);if(fresh)*(uint64 *)lp_idmap_at(read->required,at)=0;}
-        uint64 h_cap=(!read->count_only && read->cap>=0)?(((uint64)read->kinds<<60)|((uint64)read->cap+1)):0;
-        scan_container_rows(parent,column,read->wanted,3,read->required,false,read->endpoint,NULL,read->bits,false,h_cap,(int16)read->floor,holder_row,read);
+        size_t nu=lp_idmap_count(read->wanted);
+        bool split_passes=!read->count_only && read->cap>=0 && read->per_part && !nrequired && read->endpoint==0 && (nu>1 || read->kinds==3);
+        if(split_passes){
+            int64 *est_df=palloc(sizeof(int64)*nu);
+            estimate_holders_gin_df(parent,(int16)read->floor,lp_idmap_keys(read->wanted),(int)nu,est_df);
+            int64 high_thresh=((int64)read->cap+1)*4;
+            lp_idmap *sel_wanted=lp_idmap_sized(sizeof(HolderKey));
+            for(size_t u=0;u<nu;u++){
+                if(est_df[u]<=high_thresh){
+                    bool f=false;size_t sat=lp_idmap_put(sel_wanted,lp_idmap_key(read->wanted,u),&f);
+                    HolderKey *sk=lp_idmap_at(sel_wanted,sat);memset(sk,0,sizeof(*sk));sk->head=-1;
+                }
+            }
+            if(lp_idmap_count(sel_wanted)>0){
+                uint64 h_cap=((uint64)read->kinds<<60)|((uint64)read->cap+1);
+                read->active_wanted=sel_wanted;read->active_kinds=read->kinds;read->saturated=0;
+                scan_container_rows(parent,column,sel_wanted,3,read->required,false,0,NULL,read->bits,false,h_cap,(int16)read->floor,holder_row,read);
+                lp_idmap_free(read->seen);read->seen=lp_idmap_new();
+            }
+            lp_idmap_free(sel_wanted);
+            for(size_t u=0;u<nu;u++){
+                if(est_df[u]<=high_thresh)continue;
+                const lp_id *uk=lp_idmap_key(read->wanted,u);
+                if(read->kinds&1){
+                    lp_idmap *one=lp_idmap_sized(sizeof(HolderKey));
+                    bool f=false;size_t oat=lp_idmap_put(one,uk,&f);
+                    HolderKey *ok=lp_idmap_at(one,oat);memset(ok,0,sizeof(*ok));ok->head=-1;
+                    uint64 h_cap=(UINT64_C(1)<<60)|((uint64)read->cap+1);
+                    read->active_wanted=one;read->active_kinds=1;read->saturated=0;
+                    scan_container_rows(parent,column,one,3,read->required,false,0,NULL,read->bits|UINT64_C(1),false,h_cap,(int16)read->floor,holder_row,read);
+                    lp_idmap_free(read->seen);read->seen=lp_idmap_new();
+                    lp_idmap_free(one);
+                }
+                if(read->kinds&2){
+                    lp_idmap *one=lp_idmap_sized(sizeof(HolderKey));
+                    bool f=false;size_t oat=lp_idmap_put(one,uk,&f);
+                    HolderKey *ok=lp_idmap_at(one,oat);memset(ok,0,sizeof(*ok));ok->head=-1;
+                    uint64 h_cap=(UINT64_C(2)<<60)|((uint64)read->cap+1);
+                    read->active_wanted=one;read->active_kinds=2;read->saturated=0;
+                    scan_container_rows(parent,column,one,3,read->required,false,0,NULL,read->bits,false,h_cap,(int16)read->floor,holder_row,read);
+                    lp_idmap_free(read->seen);read->seen=lp_idmap_new();
+                    lp_idmap_free(one);
+                }
+            }
+            read->active_wanted=NULL;read->active_kinds=0;
+            pfree(est_df);
+        }else{
+            uint64 h_cap=(!read->count_only && read->cap>=0)?(((uint64)read->kinds<<60)|((uint64)read->cap+1)):0;
+            read->active_wanted=NULL;read->active_kinds=read->kinds;
+            scan_container_rows(parent,column,read->wanted,3,read->required,false,read->endpoint,NULL,read->bits,false,h_cap,(int16)read->floor,holder_row,read);
+        }
         if(read->count_only && !read->emit_hit){
             for(int i=0;i<count;i++){
                 int64 at=lp_idmap_find(read->wanted,ids+i);
