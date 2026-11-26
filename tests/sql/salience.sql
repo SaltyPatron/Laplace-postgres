@@ -226,12 +226,12 @@ BEGIN
   END IF;
 
   -- Salience-weighted centroid in laplace_couple GiST k=1 (using target_t3 placed at salience centroid without changing df)
-  t_b := pg_temp.make_word(repeat(chr(9889), 12) || 'sallightcln' || repeat(chr(9889), 12));
+  t_b := pg_temp.make_word(repeat(chr(9889), 12) || 'asllight' || repeat(chr(9889), 12));
   t_a := pg_temp.put_node(
-      array_fill(t_b, ARRAY[greatest(1, round(100.0 * s_light)::int)]) ||
-      array_fill(w_work, ARRAY[greatest(1, round(100.0 * s_work)::int)]) ||
-      array_fill(w_how, ARRAY[greatest(1, round(100.0 * s_how)::int)]) ||
-      array_fill(w_does, ARRAY[greatest(1, round(100.0 * s_does)::int)]));
+      array_fill(t_b, ARRAY[greatest(1, round(1000.0 * s_light)::int)]) ||
+      array_fill(w_work, ARRAY[greatest(1, round(1000.0 * s_work)::int)]) ||
+      array_fill(w_how, ARRAY[greatest(1, round(1000.0 * s_how)::int)]) ||
+      array_fill(w_does, ARRAY[greatest(1, round(1000.0 * s_does)::int)]));
   target_t3 := t_a;
   d_a := pg_temp.put_node(ARRAY[sp, sp, qm]);
   d_b := pg_temp.put_node(ARRAY[qm, sp, qm]);

@@ -909,7 +909,8 @@ typedef struct {
 
 typedef struct {
     const lp_highway *hw;
-    lp_idmap *matched_claim_map;
+    const bool *want_list;
+    const lp_idmap *attested_claims; /* maps claim -> int32 head index into links */
     lp_vec(SlotClaimHit) hits;
 } AuditPathCtx;
 
@@ -917,16 +918,17 @@ static void audit_visit_claim_path(const lp_id *claim, Datum path, Datum mask, v
 {
     (void)mask;
     AuditPathCtx *ac = ctx;
+    int64 cord = lp_idmap_find(ac->attested_claims, claim);
+    if (cord < 0) return; /* unattested claim: skip before detoasting path */
     Geo g = geo_of(path);
     size_t n = lp_path_len(g.p);
-    int64 cord = -1;
     for (size_t i = 0; i < n; i++) {
         lp_id vid = lp_path_id(g.p, i);
         if (!lp_highway_contains(ac->hw, &vid)) continue;
         for (size_t li = 0; li < ac->hw->nlists; li++) {
+            if (ac->want_list && !ac->want_list[li]) continue;
             int64 slot = lp_highway_slot(ac->hw, &ac->hw->list[li], &vid);
             if (slot < 0) continue;
-            if (cord < 0) cord = (int64)lp_idmap_put(ac->matched_claim_map, claim, NULL);
             lp_push(&ac->hits, ((SlotClaimHit){ (int32)li, (uint32)slot, (size_t)cord }));
         }
     }
@@ -952,14 +954,6 @@ static size_t dedup_size_t(size_t *arr, size_t n)
     return w;
 }
 
-static lp_id slot_key_id(int32 list_idx, uint32 slot)
-{
-    lp_id k = {0};
-    memcpy(k.b, &list_idx, sizeof(list_idx));
-    memcpy(k.b + 4, &slot, sizeof(slot));
-    return k;
-}
-
 /* Native Direct-AM highway provenance and 1-hop crosswalk audit (zero SPI). */
 PG_FUNCTION_INFO_V1(laplace_highway_audit);
 Datum laplace_highway_audit(PG_FUNCTION_ARGS)
@@ -967,16 +961,17 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
     static const char *const audit_lists[8] = {
         "ili", "Synset", "fnframe", "fnfe", "fnlu", "vnclass", "pbroleset", "vaframe"
     };
+    typedef struct { uint32 root_ord; int32 next; } ClaimRootLink;
     TupleDesc td;
     Tuplestorestate *ts = set_begin(fcinfo, "laplace_highway_audit", &td);
     const lp_highway *hw = lp_pg_highway();
 
     WitnessGraphCtx wgraph = { {0}, lp_idmap_new() };
-    lp_vec(lp_id) chunk_claims = {0};
-    AuditPathCtx apctx = { hw, lp_idmap_new(), {0} };
-    PgAttrRows att_rows = {0};
+    bool *want_list = (hw && hw->nlists > 0) ? palloc0(sizeof(bool) * hw->nlists) : NULL;
+    lp_idmap *attested_claims = lp_idmap_sized(sizeof(int32));
+    lp_vec(ClaimRootLink) links = {0};
+    AuditPathCtx apctx = { hw, want_list, attested_claims, {0} };
     lp_idmap *distinct_roots = lp_idmap_new();
-    lp_idmap *slot_map = lp_idmap_new();
 
     PG_TRY();
     {
@@ -984,87 +979,86 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
         int64 invalid_lineage = 0;
         resolve_witness_roots(&wgraph, &invalid_lineage);
 
-        Oid con_oid = lp_pg_relation("consensus");
-        AttrNumber a_claim = get_attnum(con_oid, "claim");
-        const Oid *parts = NULL;
-        int nparts = lp_pg_canonical_partitions("consensus", &parts, NULL, NULL, NULL);
-        Snapshot snap = GetActiveSnapshot();
+        if (hw && want_list) {
+            for (int li = 0; li < 8; li++) {
+                const lp_list *lst = lp_highway_list(hw, audit_lists[li]);
+                if (!lst) continue;
+                size_t src_idx = (size_t)(lst - hw->list);
+                if (src_idx < hw->nlists) want_list[src_idx] = true;
+                for (size_t el = 0; el < hw->nedgelists; el++) {
+                    if (strcmp(hw->edges[el].a, audit_lists[li]) != 0) continue;
+                    const lp_list *dst = lp_highway_list(hw, hw->edges[el].b);
+                    if (!dst) continue;
+                    size_t dst_idx = (size_t)(dst - hw->list);
+                    if (dst_idx < hw->nlists) want_list[dst_idx] = true;
+                }
+            }
+        }
 
-        for (int p = 0; p < nparts; p++) {
+        const Oid *att_parts = NULL;
+        int n_att_parts = lp_pg_canonical_partitions("attestation", &att_parts, NULL, NULL, NULL);
+        Snapshot snap = GetActiveSnapshot();
+        for (int p = 0; p < n_att_parts; p++) {
             CHECK_FOR_INTERRUPTS();
-            Relation part = table_open(parts[p], AccessShareLock);
+            Relation part = table_open(att_parts[p], AccessShareLock);
+            if (part->rd_rel->relkind == RELKIND_PARTITIONED_TABLE) {
+                table_close(part, NoLock);
+                continue;
+            }
+            AttrNumber a_claim = get_attnum(att_parts[p], "claim");
+            AttrNumber a_witness = get_attnum(att_parts[p], "witness");
             TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
             TupleTableSlot *slot = table_slot_create(part, NULL);
             while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
                 CHECK_FOR_INTERRUPTS();
-                bool isnull = true;
-                Datum dc = slot_getattr(slot, a_claim, &isnull);
-                if (!isnull) lp_push(&chunk_claims, *(const lp_id *)DatumGetPointer(dc));
-                ExecClearTuple(slot);
-                if (chunk_claims.n >= 16384) {
-                    lp_pg_lookup_paths(chunk_claims.v, chunk_claims.n, false, audit_visit_claim_path, &apctx);
-                    chunk_claims.n = 0;
+                bool c_null = true, w_null = true;
+                Datum dc = slot_getattr(slot, a_claim, &c_null);
+                Datum dw = slot_getattr(slot, a_witness, &w_null);
+                if (!c_null && !w_null) {
+                    const lp_id claim_id = *(const lp_id *)DatumGetPointer(dc);
+                    lp_id term = *(const lp_id *)DatumGetPointer(dw);
+                    int64 widx = lp_idmap_find(wgraph.by_id, &term);
+                    bool cyclic = false;
+                    if (widx >= 0) {
+                        if (wgraph.nodes.v[widx].state == 3) cyclic = true;
+                        else if (wgraph.nodes.v[widx].state == 2) term = wgraph.nodes.v[widx].terminal;
+                    }
+                    if (!cyclic) {
+                        uint32 rord = (uint32)lp_idmap_put(distinct_roots, &term, NULL);
+                        bool fresh = false;
+                        size_t cord = lp_idmap_put(attested_claims, &claim_id, &fresh);
+                        int32 *head = lp_idmap_at(attested_claims, cord);
+                        if (fresh) *head = -1;
+                        int32 node = (int32)links.n;
+                        lp_push(&links, ((ClaimRootLink){ rord, *head }));
+                        *head = node;
+                    }
                 }
+                ExecClearTuple(slot);
             }
             table_endscan(scan);
             ExecDropSingleTupleTableSlot(slot);
             table_close(part, NoLock);
         }
-        if (chunk_claims.n > 0) {
-            lp_pg_lookup_paths(chunk_claims.v, chunk_claims.n, false, audit_visit_claim_path, &apctx);
-            chunk_claims.n = 0;
-        }
 
-        size_t n_mc = lp_idmap_count(apctx.matched_claim_map);
-        if (n_mc > 0)
-            lp_pg_read_attestation_pk(lp_idmap_keys(apctx.matched_claim_map), (int)n_mc, NULL, &att_rows, NULL);
+        if (lp_idmap_count(attested_claims) > 0)
+            lp_pg_scan_claims_by_mask(UINT64_C(1), audit_visit_claim_path, &apctx);
 
-        typedef struct { size_t claim_ord; size_t root_ord; } ClaimRootPair;
-        lp_vec(ClaimRootPair) cr_pairs = {0};
-        for (size_t i = 0; i < att_rows.n; i++) {
-            int64 cord = lp_idmap_find(apctx.matched_claim_map, &att_rows.v[i].claim);
-            if (cord < 0) continue;
-            lp_id term = att_rows.v[i].trunk;
-            int64 widx = lp_idmap_find(wgraph.by_id, &att_rows.v[i].trunk);
-            if (widx >= 0) {
-                if (wgraph.nodes.v[widx].state == 3) continue;
-                if (wgraph.nodes.v[widx].state == 2) term = wgraph.nodes.v[widx].terminal;
-            }
-            size_t rord = lp_idmap_put(distinct_roots, &term, NULL);
-            lp_push(&cr_pairs, ((ClaimRootPair){ (size_t)cord, rord }));
-        }
-
-        size_t *claim_row_begin = n_mc ? palloc(sizeof(size_t) * n_mc) : NULL;
-        size_t *claim_row_end = n_mc ? palloc(sizeof(size_t) * n_mc) : NULL;
-        size_t *c_counts = n_mc ? palloc0(sizeof(size_t) * n_mc) : NULL;
-        for (size_t i = 0; i < cr_pairs.n; i++) c_counts[cr_pairs.v[i].claim_ord]++;
-        size_t total_cr = 0;
-        for (size_t i = 0; i < n_mc; i++) {
-            claim_row_begin[i] = total_cr;
-            claim_row_end[i] = total_cr;
-            total_cr += c_counts[i];
-        }
-        size_t *cr_flat = total_cr ? palloc(sizeof(size_t) * total_cr) : NULL;
-        for (size_t i = 0; i < cr_pairs.n; i++) {
-            size_t c = cr_pairs.v[i].claim_ord;
-            cr_flat[claim_row_end[c]++] = cr_pairs.v[i].root_ord;
-        }
-        lp_vec_free(&cr_pairs);
-        if (c_counts) pfree(c_counts);
-
+        size_t n_slots = hw ? hw->nrec : 0;
         lp_vec(SlotRootPair) sr_pairs = {0};
         for (size_t i = 0; i < apctx.hits.n; i++) {
             SlotClaimHit *h = &apctx.hits.v[i];
-            lp_id sk = slot_key_id(h->list_idx, h->slot);
-            size_t sord = lp_idmap_put(slot_map, &sk, NULL);
-            for (size_t k = claim_row_begin[h->claim_ord]; k < claim_row_end[h->claim_ord]; k++)
-                lp_push(&sr_pairs, ((SlotRootPair){ sord, cr_flat[k] }));
+            int32 node = *(const int32 *)lp_idmap_at(attested_claims, h->claim_ord);
+            if (node < 0) continue;
+            size_t sord = (size_t)hw->list[h->list_idx].first + h->slot;
+            if (sord >= n_slots) continue;
+            for (; node >= 0; node = links.v[node].next)
+                lp_push(&sr_pairs, ((SlotRootPair){ sord, (size_t)links.v[node].root_ord }));
         }
-        if (cr_flat) pfree(cr_flat);
-        if (claim_row_begin) pfree(claim_row_begin);
-        if (claim_row_end) pfree(claim_row_end);
+        lp_vec_free(&links);
+        lp_idmap_free(attested_claims);
+        attested_claims = NULL;
 
-        size_t n_slots = lp_idmap_count(slot_map);
         size_t *s_counts = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
         size_t *s_begin = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
         size_t *s_end = n_slots ? palloc0(sizeof(size_t) * n_slots) : NULL;
@@ -1098,14 +1092,11 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
                     if (!lp_highway_at(hw, lst, s)) continue;
                     cached++;
 
-                    lp_id sk = slot_key_id(src_list_idx, s);
-                    int64 sord = lp_idmap_find(slot_map, &sk);
-                    size_t direct_n = 0;
-                    const size_t *direct_ptr = NULL;
-                    if (sord >= 0) {
+                    size_t sord = (size_t)lst->first + s;
+                    size_t direct_n = (sord < n_slots) ? (s_end[sord] - s_begin[sord]) : 0;
+                    const size_t *direct_ptr = direct_n ? &s_flat[s_begin[sord]] : NULL;
+                    if (direct_n > 0) {
                         attested++;
-                        direct_n = s_end[sord] - s_begin[sord];
-                        direct_ptr = &s_flat[s_begin[sord]];
                         if (direct_n >= 2) ind2++;
                         if (direct_n >= 3) ind3++;
                         if (direct_n >= 4) ind4++;
@@ -1118,14 +1109,12 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
                         if (strcmp(hw->edges[el].a, lname) != 0) continue;
                         const lp_list *dst_lst = lp_highway_list(hw, hw->edges[el].b);
                         if (!dst_lst) continue;
-                        int dst_list_idx = (int)(dst_lst - hw->list);
                         const lp_edge *edges = NULL;
                         size_t ne = lp_highway_edges(hw, lname, s, hw->edges[el].b, &edges);
                         for (size_t k = 0; k < ne; k++) {
                             if (!lp_highway_at(hw, dst_lst, edges[k].to)) continue;
-                            lp_id tsk = slot_key_id(dst_list_idx, edges[k].to);
-                            int64 tord = lp_idmap_find(slot_map, &tsk);
-                            if (tord < 0) continue;
+                            size_t tord = (size_t)dst_lst->first + edges[k].to;
+                            if (tord >= n_slots) continue;
                             size_t tn = s_end[tord] - s_begin[tord];
                             for (size_t j = 0; j < tn; j++) lp_push(&scratch, s_flat[s_begin[tord] + j]);
                         }
@@ -1162,12 +1151,11 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
     }
     PG_FINALLY();
     {
-        lp_idmap_free(slot_map);
         lp_idmap_free(distinct_roots);
-        lp_vec_free(&att_rows);
-        lp_idmap_free(apctx.matched_claim_map);
+        lp_vec_free(&links);
+        if (attested_claims) lp_idmap_free(attested_claims);
         lp_vec_free(&apctx.hits);
-        lp_vec_free(&chunk_claims);
+        if (want_list) pfree(want_list);
         lp_idmap_free(wgraph.by_id);
         lp_vec_free(&wgraph.nodes);
     }

@@ -57,6 +57,9 @@ void lp_pg_scan_all_witnesses(lp_pg_witness_visit visit,void *context);
 /* Complete direct-container frontier through canonical GIN indexes, with
  * PostgreSQL bitmap visibility/lossy rechecks and ascending parent-ID visits. */
 void lp_pg_lookup_containers(const lp_id *ids,size_t count,bool masks,bool assertions,lp_pg_path_visit visit,void *context);
+/* Scan all canonical physicality partitions whose mask carries every bit in `bits`
+ * via the composite GIN mask index (zero SPI, bitmap heap order, flat per-tuple memory). */
+void lp_pg_scan_claims_by_mask(lp_mask bits, lp_pg_path_visit visit, void *context);
 /* Assertion frontiers select actual CLAIM/RECORD vertices before acquiring
  * ordinary content parents. The path remains the authority for every edge. */
 bool lp_pg_path_has_roles(Datum path,uint8 roles);

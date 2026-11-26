@@ -1134,7 +1134,7 @@ void lp_pg_claims_each_scoped_direct(const lp_id *ids,int count,int64 fan,lp_mas
     if(opposite && endpoint!=1 && endpoint!=2)
         ereport(ERROR,(errcode(ERRCODE_INVALID_PARAMETER_VALUE),errmsg("Native opposite endpoint requires first or last endpoint selection")));
     ClaimRead read={
-        .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits|UINT64_C(1),
+        .each=true,.limit=fan<0?UINT64_MAX:(uint64)fan,.endpoint=endpoint,.arity=arity,.bits=bits,
         .has_scope=has_scope,.witnesses=witnesses,.nwitnesses=nwitnesses,.idarr=idarr,
         .refuse=(lp_id *)refuse,.nrefuse=nrefuse,.include=(lp_id *)include,.ninclude=ninclude,
         .visit=visit,.visit_context=context
@@ -1151,9 +1151,9 @@ void lp_pg_claims_each_direct(const lp_id *ids,int count,int64 fan,lp_mask bits,
 }
 static Datum read_claims(FunctionCallInfo fcinfo,bool each)
 {
-    ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX,.bits=UINT64_C(1)};
+    ClaimRead read={.output.fcinfo=fcinfo,.each=each,.limit=UINT64_MAX};
     read.output.output=set_begin(fcinfo,each?"laplace_claims_each":"laplace_claims",&read.output.descriptor);
-    if(PG_ARGISNULL(0))return (Datum)0;
+    if(PG_ARGISNULL(0)||PG_ARGISNULL(2)||PG_ARGISNULL(3))return (Datum)0;
     lp_id *scope_ids=NULL;
     if(PG_NARGS()>8&&!PG_ARGISNULL(8)){
         int nwit=0;scope_ids=ids_of(PG_GETARG_ARRAYTYPE_P(8),&nwit);
@@ -1176,14 +1176,10 @@ static Datum read_claims(FunctionCallInfo fcinfo,bool each)
         if(limit<0)ereport(ERROR,(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),errmsg("Native claim fan must not be negative")));
         read.limit=(uint64)limit;if(!limit){if(scope_ids)pfree(scope_ids);return (Datum)0;}
     }
-    if(!PG_ARGISNULL(2)){
-        lp_mask extra=0;
-        if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&extra)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
-        read.bits|=extra;
-    }
+    if(!read_mask_bits(PG_GETARG_ARRAYTYPE_P(2),&read.bits)){if(scope_ids)pfree(scope_ids);return (Datum)0;}
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
-    read.refuse=PG_ARGISNULL(3)?NULL:ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
-    if(!count){pfree(ids);if(read.refuse)pfree(read.refuse);if(scope_ids)pfree(scope_ids);return (Datum)0;}
+    read.refuse=ids_of(PG_GETARG_ARRAYTYPE_P(3),&read.nrefuse);
+    if(!count){pfree(ids);pfree(read.refuse);if(scope_ids)pfree(scope_ids);return (Datum)0;}
     if(PG_NARGS()>5 && !PG_ARGISNULL(5)){
         read.include=ids_of(PG_GETARG_ARRAYTYPE_P(5),&read.ninclude);
         if(!read.ninclude){pfree(ids);if(read.refuse)pfree(read.refuse);pfree(read.include);if(scope_ids)pfree(scope_ids);return (Datum)0;}
@@ -1202,6 +1198,140 @@ PG_FUNCTION_INFO_V1(laplace_claims);
 Datum laplace_claims(PG_FUNCTION_ARGS){return read_claims(fcinfo,false);}
 PG_FUNCTION_INFO_V1(laplace_claims_each);
 Datum laplace_claims_each(PG_FUNCTION_ARGS){return read_claims(fcinfo,true);}
+
+void lp_pg_scan_claims_by_mask(lp_mask bits, lp_pg_path_visit visit, void *context)
+{
+    if (!bits || !visit) return;
+    if (GinFuzzySearchLimit)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+            errmsg("Native containment requires exact GIN search (gin_fuzzy_search_limit=0)")));
+
+    Datum mask_values[64];
+    int nbits = 0;
+    for (int bit = 0; bit < 64; bit++) {
+        if (bits & (UINT64_C(1) << bit)) mask_values[nbits++] = Int16GetDatum((int16)bit);
+    }
+    ArrayType *mask_keys = construct_array(mask_values, nbits, INT2OID, 2, true, TYPALIGN_SHORT);
+
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions("physicality", &parts, NULL, NULL, NULL);
+    Snapshot snapshot = GetActiveSnapshot();
+    MemoryContext scratch = AllocSetContextCreate(CurrentMemoryContext, "Native mask scan tuple", ALLOCSET_SMALL_SIZES);
+    Size bm_mem = Max((Size)work_mem * 1024, (Size)64 * 1024 * 1024);
+
+    PG_TRY();
+    {
+        for (int p_idx = 0; p_idx < nparts; p_idx++) {
+            CHECK_FOR_INTERRUPTS();
+            Relation table = table_open(parts[p_idx], AccessShareLock);
+            if (table->rd_rel->relkind == RELKIND_PARTITIONED_TABLE) {
+                table_close(table, NoLock);
+                continue;
+            }
+            AttrNumber a_ent = get_attnum(parts[p_idx], "entity");
+            AttrNumber a_path = get_attnum(parts[p_idx], "path");
+            AttrNumber a_mask = get_attnum(parts[p_idx], "mask");
+
+            Relation idx = NULL;
+            int mask_col = 0;
+            Oid mask_op = InvalidOid;
+            List *indexes = RelationGetIndexList(table);
+            ListCell *lc;
+            Oid mask_type = get_atttype(parts[p_idx], a_mask);
+            foreach(lc, indexes) {
+                Oid index_id = lfirst_oid(lc);
+                Relation cand = index_open(index_id, AccessShareLock);
+                if (cand->rd_rel->relam == GIN_AM_OID && cand->rd_index &&
+                    cand->rd_index->indisvalid && cand->rd_index->indisready && cand->rd_index->indislive &&
+                    (!cand->rd_index->indcheckxmin ||
+                     TransactionIdPrecedes(HeapTupleHeaderGetXmin(cand->rd_indextuple->t_data), TransactionXmin)) &&
+                    heap_attisnull(cand->rd_indextuple, Anum_pg_index_indpred, NULL)) {
+                    for (int i = 0; i < cand->rd_index->indnkeyatts; i++) {
+                        if (cand->rd_index->indkey.values[i] == a_mask) {
+                            Oid op = get_opfamily_member(cand->rd_opfamily[i], mask_type, INT2ARRAYOID, 2);
+                            if (OidIsValid(op)) {
+                                mask_col = i + 1;
+                                mask_op = get_opcode(op);
+                                idx = cand;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (idx) break;
+                index_close(cand, NoLock);
+            }
+            list_free(indexes);
+
+            if (idx) {
+                ScanKeyData key;
+                ScanKeyEntryInitialize(&key, 0, mask_col, 2, INT2ARRAYOID,
+                    idx->rd_indcollation[mask_col - 1], mask_op, PointerGetDatum(mask_keys));
+                TIDBitmap *bitmap = tbm_create(bm_mem, NULL);
+                IndexScanDesc scan = index_beginscan_bitmap(idx, snapshot, NULL, 1);
+                index_rescan(scan, &key, 1, NULL, 0);
+                index_getbitmap(scan, bitmap);
+                if (!tbm_is_empty(bitmap)) {
+                    TableScanDesc heap = table_beginscan_bm(table, snapshot, 0, NULL);
+                    heap->st.rs_tbmiterator = tbm_begin_iterate(bitmap, NULL, InvalidDsaPointer);
+                    TupleTableSlot *slot = table_slot_create(table, NULL);
+                    bool recheck;
+                    uint64 lossy = 0, exact = 0;
+                    while (table_scan_bitmap_next_tuple(heap, slot, &recheck, &lossy, &exact)) {
+                        CHECK_FOR_INTERRUPTS();
+                        MemoryContext previous = MemoryContextSwitchTo(scratch);
+                        bool m_null = true;
+                        Datum d_mask = slot_getattr(slot, a_mask, &m_null);
+                        if (!m_null && (lp_pg_mask_native(d_mask) & bits) == bits) {
+                            bool e_null = true, p_null = true;
+                            Datum d_ent = slot_getattr(slot, a_ent, &e_null);
+                            Datum d_path = slot_getattr(slot, a_path, &p_null);
+                            if (!e_null && !p_null)
+                                visit((const lp_id *)DatumGetPointer(d_ent), d_path, d_mask, context);
+                        }
+                        MemoryContextSwitchTo(previous);
+                        MemoryContextReset(scratch);
+                        ExecClearTuple(slot);
+                    }
+                    ExecDropSingleTupleTableSlot(slot);
+                    tbm_end_iterate(&heap->st.rs_tbmiterator);
+                    table_endscan(heap);
+                }
+                tbm_free(bitmap);
+                index_endscan(scan);
+                index_close(idx, NoLock);
+            } else {
+                TableScanDesc scan = table_beginscan(table, snapshot, 0, NULL);
+                TupleTableSlot *slot = table_slot_create(table, NULL);
+                while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+                    CHECK_FOR_INTERRUPTS();
+                    MemoryContext previous = MemoryContextSwitchTo(scratch);
+                    bool m_null = true;
+                    Datum d_mask = slot_getattr(slot, a_mask, &m_null);
+                    if (!m_null && (lp_pg_mask_native(d_mask) & bits) == bits) {
+                        bool e_null = true, p_null = true;
+                        Datum d_ent = slot_getattr(slot, a_ent, &e_null);
+                        Datum d_path = slot_getattr(slot, a_path, &p_null);
+                        if (!e_null && !p_null)
+                            visit((const lp_id *)DatumGetPointer(d_ent), d_path, d_mask, context);
+                    }
+                    MemoryContextSwitchTo(previous);
+                    MemoryContextReset(scratch);
+                    ExecClearTuple(slot);
+                }
+                ExecDropSingleTupleTableSlot(slot);
+                table_endscan(scan);
+            }
+            table_close(table, NoLock);
+        }
+    }
+    PG_FINALLY();
+    {
+        MemoryContextDelete(scratch);
+        pfree(mask_keys);
+    }
+    PG_END_TRY();
+}
 
 /* laplace_held_files(keys, trunk, cap, max_nodes): up the container index from keys to the files that hold them, in
  * one call. A node holds the keys below it (bit k: keys[k], k < 64), propagated up as they arrive, through every path
