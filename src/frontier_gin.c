@@ -752,7 +752,7 @@ Datum laplace_holder_counts(PG_FUNCTION_ARGS)
 
 typedef struct {
     PgHolderHit hit;
-    bytea *mask_copy;
+    Datum mask;
     bytea *path_copy;
     bool known;
     double rating,deviation,volatility;
@@ -775,11 +775,7 @@ static void collect_holder_row(const PgHolderHit *hit,Datum mask,void *ctx)
         Size ps=VARSIZE_ANY(p);
         r.path_copy=palloc(ps);memcpy(r.path_copy,p,ps);
         r.hit.path=PointerGetDatum(r.path_copy);
-        if(mask){
-            bytea *m=(bytea *)PG_DETOAST_DATUM(mask);
-            Size ms=VARSIZE_ANY(m);
-            r.mask_copy=palloc(ms);memcpy(r.mask_copy,m,ms);
-        }
+        r.mask=mask;
     }
     lp_push(&c->rows,r);
     MemoryContextSwitchTo(old);
@@ -903,7 +899,7 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
                     r->hit.hub?(Datum)0:id_datum(&r->hit.entity),
                     r->hit.path,
                     Int16GetDatum(r->hit.tier),
-                    PointerGetDatum(r->mask_copy),
+                    r->mask,
                     Int16GetDatum(r->hit.kind),
                     BoolGetDatum(r->hit.hub),
                     Float8GetDatum(r->rating),
@@ -912,7 +908,7 @@ Datum laplace_holders_with_standings(PG_FUNCTION_ARGS)
                     Int64GetDatum(r->matches)
                 };
                 bool nl[11]={
-                    false,r->hit.hub,r->hit.hub,r->hit.hub,r->hit.hub||!r->mask_copy,false,false,
+                    false,r->hit.hub,r->hit.hub,r->hit.hub,r->hit.hub,false,false,
                     !r->known,!r->known,!r->known,!r->known
                 };
                 set_put(fcinfo,out,td,v,nl);

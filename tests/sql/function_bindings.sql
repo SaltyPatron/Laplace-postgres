@@ -34,7 +34,7 @@ DO $$ BEGIN
   -- Remove per-call scope from both a frozen-bank primitive and an already
   -- parsed SQL adapter. Native SPI readers bind installed objects explicitly.
   -- These settings exist only inside this rolled-back transaction.
-  ALTER FUNCTION public.laplace_mask_has_value(bit,text,text) SET search_path=public,pg_temp;
+  ALTER FUNCTION public.laplace_mask_has_value(bigint,text,text) SET search_path=public,pg_temp;
   ALTER FUNCTION public.laplace_coord(text) SET search_path=public,pg_temp;
   PERFORM public.laplace_restore_function_bindings();
   IF EXISTS (

@@ -1103,7 +1103,7 @@ static bool lib_page_next(LibPagePartScan *sc, lp_mask file_mask, MemoryContext 
             memcpy(sc->cur_id.b, DatumGetPointer(de), sizeof(lp_id));
             sc->cur_tier = dt;
             sc->cur_path = PointerGetDatum(PG_DETOAST_DATUM_COPY(dp));
-            sc->cur_mask = PointerGetDatum(PG_DETOAST_DATUM_COPY(dm));
+            sc->cur_mask = dm;
             MemoryContextSwitchTo(old);
             ExecClearTuple(sc->slot);
             sc->active = true;
@@ -1192,7 +1192,6 @@ Datum laplace_library_page(PG_FUNCTION_ARGS)
                 set_put(fcinfo, ts, td, v, nl);
                 pfree(DatumGetPointer(d_ent));
                 pfree(DatumGetPointer(sc->cur_path));
-                pfree(DatumGetPointer(sc->cur_mask));
                 emitted++;
                 if (emitted < page_limit)
                     (void)lib_page_next(sc, file_mask, row_ctx);
