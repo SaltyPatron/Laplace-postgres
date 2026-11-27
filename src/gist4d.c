@@ -100,13 +100,20 @@ Datum laplace_direction4d_ewkb(PG_FUNCTION_ARGS){
 }
 
 /* ---------------------------------------------------------------- box arithmetic */
+static inline bool box_is_nan(const Box4 *b){ return isnan(b->lo[0]) || isnan(b->hi[0]); }
 static inline void box_of_point(Box4 *b, const double p[4]){ for (int d = 0; d < 4; d++) b->lo[d] = b->hi[d] = p[d]; }
 static inline void box_join(Box4 *a, const Box4 *b){
+    if (box_is_nan(b)) return;
+    if (box_is_nan(a)) { *a = *b; return; }
     for (int d = 0; d < 4; d++) { if (b->lo[d] < a->lo[d]) a->lo[d] = b->lo[d]; if (b->hi[d] > a->hi[d]) a->hi[d] = b->hi[d]; }
 }
-static inline double box_edges(const Box4 *b){ return ((b->hi[0] - b->lo[0]) + (b->hi[1] - b->lo[1])) + (b->hi[2] - b->lo[2]) + (b->hi[3] - b->lo[3]); }
+static inline double box_edges(const Box4 *b){
+    if (box_is_nan(b)) return 0.0;
+    return ((b->hi[0] - b->lo[0]) + (b->hi[1] - b->lo[1])) + (b->hi[2] - b->lo[2]) + (b->hi[3] - b->lo[3]);
+}
 /* The query's distance to the box, in lp_distance4's order of operations (header). */
 static inline double box4_distance(const Box4 *b, const double q[4]){
+    if (box_is_nan(b)) return NAN;
     double g[4];
     for (int d = 0; d < 4; d++) g[d] = q[d] < b->lo[d] ? b->lo[d] - q[d] : q[d] > b->hi[d] ? q[d] - b->hi[d] : 0.0;
     return sqrt(((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3]);
@@ -196,7 +203,13 @@ Datum laplace_point4d_gist_penalty(PG_FUNCTION_ARGS){
 typedef struct { double c; OffsetNumber i; } Centre;
 static int centre_cmp(const void *a, const void *b){
     const Centre *x = a, *y = b;
-    return x->c < y->c ? -1 : x->c > y->c ? 1 : (int)x->i - (int)y->i;
+    bool xn = isnan(x->c), yn = isnan(y->c);
+    if (xn != yn) return xn ? 1 : -1;
+    if (!xn) {
+        if (x->c < y->c) return -1;
+        if (x->c > y->c) return 1;
+    }
+    return (int)x->i - (int)y->i;
 }
 static Datum keys_split(GistEntryVector *v, GIST_SPLITVEC *s, size_t keysize){
     OffsetNumber last = (OffsetNumber)(v->n - 1);

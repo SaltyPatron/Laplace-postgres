@@ -655,7 +655,7 @@ static void run_holders_query(HolderRead *read,const lp_id *ids,int count,const 
                 int64 at=lp_idmap_find(read->wanted,ids+i);
                 const HolderKey *key=lp_idmap_at(read->wanted,(size_t)at);
                 Datum idd=id_datum(ids+i);
-                Datum v[4]={Int64GetDatum((int64)i+1),idd,Int64GetDatum((int64)key->held[0]),Int64GetDatum((int64)key->held[1])};
+                Datum v[4]={Int64GetDatum((int64)i+1),idd,Int64GetDatum((int64)key->held[1]),Int64GetDatum((int64)key->held[0])};
                 bool n[4]={false,false,false,false};
                 set_put(read->output.fcinfo,read->output.output,read->output.descriptor,v,n);
                 pfree(DatumGetPointer(idd));
@@ -967,7 +967,7 @@ static bool claim_nominate(TupleTableSlot *slot,void *context)
     }
     if(lp_path_middle_any(path.p,read->refuse,(size_t)read->nrefuse))return true;
     if(read->include && !lp_path_middle_any(path.p,read->include,(size_t)read->ninclude))return true;
-    uint64 nom_cap=read->limit<UINT64_MAX?Max(read->limit,UINT64_C(64)):UINT64_MAX;
+    uint64 nom_cap=read->limit<UINT64_MAX?(read->has_scope?Max(read->limit*UINT64_C(32),UINT64_C(4096)):Max(read->limit,UINT64_C(64))):UINT64_MAX;
     size_t target_dirs=lp_idmap_count(read->wanted)*(read->endpoint==3?2:1);
     if(read->each){
         bool eligible=false;
@@ -1083,7 +1083,7 @@ static void run_claims_query(ClaimRead *read,const lp_id *ids,int count,const lp
         const char *path_columns[]={"entity","path","tier","mask"};target=lp_pg_relation("physicality");
         Relation paths=lp_pg_read_parent(target,&column,path_columns,lengthof(path_columns));
         read->id=get_attnum(target,"entity");read->path=get_attnum(target,"path");read->tier=get_attnum(target,"tier");read->mask=get_attnum(target,"mask");
-        uint64 nom_cap=(read->each && read->limit<UINT64_MAX)?Max(read->limit,UINT64_C(64)):0;
+        uint64 nom_cap=(read->each && read->limit<UINT64_MAX)?(read->has_scope?Max(read->limit*UINT64_C(32),UINT64_C(4096)):Max(read->limit,UINT64_C(64))):0;
         scan_container_rows(paths,column,read->wanted,read->each?3:7,read->required,true,read->endpoint,read->opposite,read->bits,false,nom_cap,gin_min_floor,claim_nominate,read);
         table_close(paths,NoLock);
         n=lp_idmap_count(read->parents);keys=palloc_extended((n?n:1)*sizeof(*keys),MCXT_ALLOC_HUGE);
@@ -1989,24 +1989,37 @@ static void sal_t1_path_visit(const lp_id *id, Datum path, Datum mask, void *con
     size_t tot_cp = 0;
     for (size_t i = 0; i < nv; i++) tot_cp += verts[i].run ? (size_t)verts[i].run : 1;
     if (tot_cp > 0 && tot_cp <= 256) {
-        lp_id lc_stack[64];
-        lp_id *lc = tot_cp <= 64 ? lc_stack : palloc(sizeof(lp_id) * tot_cp);
+        uint8_t utf8_buf[256 * 4];
+        size_t utf8_len = 0;
         bool all_t0 = true, changed = false;
-        size_t pos = 0;
         for (size_t i = 0; i < nv && all_t0; i++) {
             int64_t cp = lp_tier0_codepoint(ctx->t0, &verts[i].id);
             if (cp < 0) { all_t0 = false; break; }
             uint32 lcp = sal_simple_lower((uint32)cp);
             if (lcp != (uint32)cp) changed = true;
-            const lp_tier0_record *lr = lp_tier0_at(ctx->t0, lcp);
-            if (!lr) { all_t0 = false; break; }
+            if (!lp_tier0_at(ctx->t0, lcp)) { all_t0 = false; break; }
             size_t run = verts[i].run ? (size_t)verts[i].run : 1;
-            for (size_t r = 0; r < run; r++) lc[pos++] = lr->id;
+            for (size_t r = 0; r < run; r++) {
+                if (lcp < 0x80u) {
+                    utf8_buf[utf8_len++] = (uint8_t)lcp;
+                } else if (lcp < 0x800u) {
+                    utf8_buf[utf8_len++] = (uint8_t)(0xC0u | (lcp >> 6));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | (lcp & 0x3Fu));
+                } else if (lcp < 0x10000u) {
+                    utf8_buf[utf8_len++] = (uint8_t)(0xE0u | (lcp >> 12));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | ((lcp >> 6) & 0x3Fu));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | (lcp & 0x3Fu));
+                } else {
+                    utf8_buf[utf8_len++] = (uint8_t)(0xF0u | (lcp >> 18));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | ((lcp >> 12) & 0x3Fu));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | ((lcp >> 6) & 0x3Fu));
+                    utf8_buf[utf8_len++] = (uint8_t)(0x80u | (lcp & 0x3Fu));
+                }
+            }
         }
-        if (all_t0 && changed && pos > 0) {
-            lp_id lid;
-            if (pos == 1) lid = lc[0];
-            else lp_id_compose(lc, pos, &lid);
+        if (all_t0 && changed && utf8_len > 0) {
+            lp_ref lref = lp_text_decompose(lp_pg_text_context(), utf8_buf, utf8_len, NULL, NULL);
+            lp_id lid = lref.id;
             if (!lp_id_eq(&lid, &ctx->u_ids[u])) {
                 bool fresh = false;
                 size_t l_at = lp_idmap_put(ctx->lmap, &lid, &fresh);
@@ -2018,7 +2031,6 @@ static void sal_t1_path_visit(const lp_id *id, Datum path, Datum mask, void *con
                 ctx->u_to_l[u] = *lslot;
             }
         }
-        if (lc != lc_stack) pfree(lc);
     }
 
     if (verts != stack_v) pfree(verts);

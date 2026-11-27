@@ -488,6 +488,8 @@ static void init_cwl_scankeys(ScanKeyData sk[3], Relation idx, Oid native_id,
     }
 }
 
+#define PG_WRITER_BATCH 512
+
 typedef struct {
     Relation rel;
     TupleDesc td;
@@ -495,10 +497,50 @@ typedef struct {
     ResultRelInfo *rri;
     TupleTableSlot *old_slot;
     TupleTableSlot *new_slot;
+    TupleTableSlot **batch_slots;
+    int batch_n;
+    BulkInsertState bistate;
+    bool did_bulk;
     ExprState **def_states;
     CommandId cid;
     Snapshot snap;
 } PgRelWriter;
+
+static void pg_writer_flush_inserts(PgRelWriter *w)
+{
+    if (w->batch_n <= 0) return;
+    table_multi_insert(w->rel, w->batch_slots, w->batch_n, w->cid, 0, w->bistate);
+    if (w->rri->ri_NumIndices > 0) {
+        for (int i = 0; i < w->batch_n; i++) {
+            List *recheck = ExecInsertIndexTuples(w->rri, w->batch_slots[i], w->estate, false, false, NULL, NIL, false);
+            list_free(recheck);
+        }
+    }
+    for (int i = 0; i < w->batch_n; i++) ExecClearTuple(w->batch_slots[i]);
+    w->batch_n = 0;
+    w->did_bulk = true;
+}
+
+static TupleTableSlot *pg_writer_acquire_insert_slot(PgRelWriter *w)
+{
+    if (!w->batch_slots) {
+        w->batch_slots = palloc(sizeof(TupleTableSlot *) * PG_WRITER_BATCH);
+        for (int i = 0; i < PG_WRITER_BATCH; i++)
+            w->batch_slots[i] = table_slot_create(w->rel, NULL);
+        w->bistate = GetBulkInsertState();
+    }
+    if (w->batch_n >= PG_WRITER_BATCH) pg_writer_flush_inserts(w);
+    return w->batch_slots[w->batch_n];
+}
+
+static void pg_writer_commit_insert_slot(PgRelWriter *w)
+{
+    TupleTableSlot *slot = w->batch_slots[w->batch_n];
+    if (w->rel->rd_att->constr) ExecConstraints(w->rri, slot, w->estate);
+    if (w->def_states) ExecMaterializeSlot(slot);
+    w->batch_n++;
+    if (w->batch_n >= PG_WRITER_BATCH) pg_writer_flush_inserts(w);
+}
 
 static void pg_writer_open(PgRelWriter *w, Oid relid, bool prepare_defaults)
 {
@@ -530,6 +572,14 @@ static void pg_writer_open(PgRelWriter *w, Oid relid, bool prepare_defaults)
 
 static void pg_writer_close(PgRelWriter *w)
 {
+    pg_writer_flush_inserts(w);
+    if (w->did_bulk && w->rel) { table_finish_bulk_insert(w->rel, 0); w->did_bulk = false; }
+    if (w->batch_slots) {
+        for (int i = 0; i < PG_WRITER_BATCH; i++) ExecDropSingleTupleTableSlot(w->batch_slots[i]);
+        pfree(w->batch_slots);
+        w->batch_slots = NULL;
+    }
+    if (w->bistate) { FreeBulkInsertState(w->bistate); w->bistate = NULL; }
     if (w->def_states) { pfree(w->def_states); w->def_states = NULL; }
     if (w->new_slot) { ExecDropSingleTupleTableSlot(w->new_slot); w->new_slot = NULL; }
     if (w->old_slot) { ExecDropSingleTupleTableSlot(w->old_slot); w->old_slot = NULL; }
@@ -538,7 +588,7 @@ static void pg_writer_close(PgRelWriter *w)
     if (w->rel) { table_close(w->rel, NoLock); w->rel = NULL; }
 }
 
-static void pg_writer_fill_unset(PgRelWriter *w, const bool *assigned)
+static void pg_writer_fill_unset_slot(PgRelWriter *w, TupleTableSlot *slot, const bool *assigned)
 {
     ExprContext *econtext = GetPerTupleExprContext(w->estate);
     ResetExprContext(econtext);
@@ -547,13 +597,18 @@ static void pg_writer_fill_unset(PgRelWriter *w, const bool *assigned)
         Form_pg_attribute a = TupleDescAttr(w->td, c);
         if (!a->attisdropped && w->def_states && w->def_states[c]) {
             bool isnull = false;
-            w->new_slot->tts_values[c] = ExecEvalExprSwitchContext(w->def_states[c], econtext, &isnull);
-            w->new_slot->tts_isnull[c] = isnull;
+            slot->tts_values[c] = ExecEvalExprSwitchContext(w->def_states[c], econtext, &isnull);
+            slot->tts_isnull[c] = isnull;
         } else {
-            w->new_slot->tts_values[c] = (Datum)0;
-            w->new_slot->tts_isnull[c] = true;
+            slot->tts_values[c] = (Datum)0;
+            slot->tts_isnull[c] = true;
         }
     }
+}
+
+static void pg_writer_fill_unset(PgRelWriter *w, const bool *assigned)
+{
+    pg_writer_fill_unset_slot(w, w->new_slot, assigned);
 }
 
 static void pg_writer_insert_new_slot(PgRelWriter *w)
@@ -623,7 +678,7 @@ retry:
     return res == TM_Ok;
 }
 
-static void collect_stage_claims(Oid relid, Oid native_id, lp_idmap *claims, uint16_t *buckets_out)
+static void collect_stage_claims_masked(Oid relid, Oid native_id, uint16_t bucket_mask, lp_idmap *claims, uint16_t *buckets_out)
 {
     Relation rel = table_open(relid, AccessShareLock);
     AttrNumber ac = require_attnum(relid, "claim", native_id, NULL);
@@ -637,13 +692,20 @@ static void collect_stage_claims(Oid relid, Oid native_id, lp_idmap *claims, uin
         if (missing) pg_series_invalid();
         lp_id claim;
         memcpy(claim.b, DatumGetPointer(val), sizeof(lp_id));
+        uint16_t bit = (uint16_t)(1u << (claim.b[0] >> 4));
+        if (!(bucket_mask & bit)) { ExecClearTuple(slot); continue; }
         lp_idmap_put(claims, &claim, NULL);
-        if (buckets_out) *buckets_out |= (uint16_t)(1u << (claim.b[0] >> 4));
+        if (buckets_out) *buckets_out |= bit;
         ExecClearTuple(slot);
     }
     ExecDropSingleTupleTableSlot(slot);
     table_endscan(scan);
     table_close(rel, NoLock);
+}
+
+static void collect_stage_claims(Oid relid, Oid native_id, lp_idmap *claims, uint16_t *buckets_out)
+{
+    collect_stage_claims_masked(relid, native_id, 0xFFFFu, claims, buckets_out);
 }
 
 static void scan_pending_for_claims(Oid pending_oid, Oid native_id, PgSeriesBatch *batch)
@@ -789,10 +851,9 @@ static void eval_series_for_claims(Oid pending_oid, Oid native_id, lp_idmap *cla
 
     for (size_t i = 0; i < batch->historical.n; i++) {
         const PgAttrRow *r = batch->historical.v + i;
-        uint8_t key[32];
-        memcpy(key, r->claim.b, 16);
-        memcpy(key + 16, r->trunk.b, 16);
-        if (lp_strmap_find(batch->pairs, key, sizeof key) >= 0 || r->games <= 0) continue;
+        uint8_t key[49];
+        cwl_key_pack(key, &r->claim, &r->trunk, r->has_dependence, &r->dependence);
+        if (lp_strmap_find(batch->pending, key, sizeof key) >= 0 || r->games <= 0) continue;
         PgSeriesWitness *w = lp_idmap_lookup(batch->witnesses, &r->trunk);
         if (!w || r->games > 9007199254740992.0 || !isfinite(r->games)) pg_series_invalid();
         PgSeriesObservation o = {
@@ -1027,11 +1088,13 @@ static int64 write_consensus_items(ConsensusWriteItem *items, size_t count, Oid 
                         affected++;
                 }
             } else if (items[begin + k].present) {
-                fill_consensus_slot(NULL, w.new_slot, &fctx);
-                pg_writer_insert_new_slot(&w);
+                TupleTableSlot *ins_slot = pg_writer_acquire_insert_slot(&w);
+                fill_consensus_slot(NULL, ins_slot, &fctx);
+                pg_writer_commit_insert_slot(&w);
                 affected++;
             }
         }
+        pg_writer_flush_inserts(&w);
         pfree(existing_tids);
         pfree(matched);
         pg_writer_close(&w);
@@ -1287,22 +1350,61 @@ static int64 accumulate_series_core(Oid pending_oid, Oid delta_oid, Oid affected
     if (!OidIsValid(idxOid))
         ereport(ERROR, (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                         errmsg("there is no unique or exclusion constraint matching the ON CONFLICT specification")));
-    Relation idx = index_open(idxOid, AccessShareLock);
-    IndexScanDesc iscan = index_beginscan(w.rel, idx, w.snap, NULL, 3, 0);
-    for (size_t i = 0; i < incoming.n; i++) {
-        if (!(i & 255)) CHECK_FOR_INTERRUPTS();
-        AccDeltaRow *d = &incoming.v[i];
-        ScanKeyData sk[3];
-        init_cwl_scankeys(sk, idx, native_id, &d->claim, &d->witness, d->has_lin, &d->lineage);
-        index_rescan(iscan, sk, 3, NULL, 0);
-        if (index_getnext_slot(iscan, ForwardScanDirection, w.old_slot)) {
-            d->tid = w.old_slot->tts_tid;
-            d->found = true;
-            ExecClearTuple(w.old_slot);
+    {
+        lp_strmap *inc_map = lp_strmap_sized(sizeof(size_t));
+        lp_idmap *probe_claims = lp_idmap_new();
+        for (size_t i = 0; i < incoming.n; i++) {
+            const AccDeltaRow *d = &incoming.v[i];
+            uint8_t key[49];
+            cwl_key_pack(key, &d->claim, &d->witness, d->has_lin, &d->lineage);
+            size_t *slot_idx = lp_strmap_get(inc_map, key, sizeof key, NULL);
+            *slot_idx = i;
+            lp_idmap_put(probe_claims, &d->claim, NULL);
         }
+        size_t nprobe = lp_idmap_count(probe_claims);
+        lp_id *pkeys = palloc(sizeof(lp_id) * nprobe);
+        memcpy(pkeys, lp_idmap_keys(probe_claims), sizeof(lp_id) * nprobe);
+        lp_idmap_free(probe_claims);
+        lp_sort(pkeys, nprobe, sizeof(lp_id), lp_id_cmp);
+
+        Relation idx = index_open(idxOid, AccessShareLock);
+        Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
+        RegProcedure eq_proc = get_opcode(eq_op);
+        IndexScanDesc iscan = index_beginscan(w.rel, idx, w.snap, NULL, 1, 0);
+        size_t array_ids = (MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(lp_id);
+        for (size_t off = 0; off < nprobe; off += array_ids) {
+            CHECK_FOR_INTERRUPTS();
+            size_t chunk = Min(array_ids, nprobe - off);
+            ArrayType *wanted = id_array_of(native_id, pkeys + off, (int)chunk);
+            ScanKeyData sk;
+            ScanKeyEntryInitialize(&sk, SK_SEARCHARRAY, 1, BTEqualStrategyNumber, native_id,
+                                   idx->rd_indcollation[0], eq_proc, PointerGetDatum(wanted));
+            index_rescan(iscan, &sk, 1, NULL, 0);
+            while (index_getnext_slot(iscan, ForwardScanDirection, w.old_slot)) {
+                CHECK_FOR_INTERRUPTS();
+                bool mc = false, mw = false, ml = false;
+                Datum vc = slot_getattr(w.old_slot, ac, &mc);
+                Datum vw = slot_getattr(w.old_slot, aw, &mw);
+                Datum vl = slot_getattr(w.old_slot, al, &ml);
+                if (!mc && !mw) {
+                    uint8_t key[49];
+                    cwl_key_pack(key, (const lp_id *)DatumGetPointer(vc), (const lp_id *)DatumGetPointer(vw),
+                                 !ml, ml ? NULL : (const lp_id *)DatumGetPointer(vl));
+                    size_t *match = lp_strmap_lookup(inc_map, key, sizeof key);
+                    if (match) {
+                        incoming.v[*match].tid = w.old_slot->tts_tid;
+                        incoming.v[*match].found = true;
+                    }
+                }
+                ExecClearTuple(w.old_slot);
+            }
+            pfree(wanted);
+        }
+        index_endscan(iscan);
+        index_close(idx, NoLock);
+        pfree(pkeys);
+        lp_strmap_free(inc_map);
     }
-    index_endscan(iscan);
-    index_close(idx, NoLock);
 
     bool *assigned = palloc0(sizeof(bool) * (size_t)w.td->natts);
     assigned[ac - 1] = assigned[aw - 1] = assigned[al - 1] = assigned[ag - 1] = true;
@@ -1323,24 +1425,26 @@ static int64 accumulate_series_core(Oid pending_oid, Oid delta_oid, Oid affected
             if (pg_writer_update_tid(&w, &incoming.v[i].tid, write_acc_update, &ctx, true))
                 affected++;
         } else {
-            ExecClearTuple(w.new_slot);
-            pg_writer_fill_unset(&w, assigned);
-            w.new_slot->tts_values[ac - 1] = PointerGetDatum(&d->claim); w.new_slot->tts_isnull[ac - 1] = false;
-            w.new_slot->tts_values[aw - 1] = PointerGetDatum(&d->witness); w.new_slot->tts_isnull[aw - 1] = false;
-            w.new_slot->tts_values[al - 1] = d->has_lin ? PointerGetDatum(&d->lineage) : (Datum)0;
-            w.new_slot->tts_isnull[al - 1] = !d->has_lin;
-            w.new_slot->tts_values[ag - 1] = Int64GetDatum(d->games); w.new_slot->tts_isnull[ag - 1] = false;
-            w.new_slot->tts_values[atok - 1] = Int64GetDatum(d->tokens); w.new_slot->tts_isnull[atok - 1] = false;
-            w.new_slot->tts_values[awins - 1] = Float8GetDatum(d->wins); w.new_slot->tts_isnull[awins - 1] = false;
-            w.new_slot->tts_values[ascore - 1] = Float8GetDatum(d->wins / (double)d->games); w.new_slot->tts_isnull[ascore - 1] = false;
-            w.new_slot->tts_values[apos - 1] = d->has_pos ? Int32GetDatum(d->pos) : (Datum)0;
-            w.new_slot->tts_isnull[apos - 1] = !d->has_pos;
-            w.new_slot->tts_values[atrust - 1] = Float8GetDatum(d->trust); w.new_slot->tts_isnull[atrust - 1] = false;
-            ExecStoreVirtualTuple(w.new_slot);
-            pg_writer_insert_new_slot(&w);
+            TupleTableSlot *ins_slot = pg_writer_acquire_insert_slot(&w);
+            ExecClearTuple(ins_slot);
+            pg_writer_fill_unset_slot(&w, ins_slot, assigned);
+            ins_slot->tts_values[ac - 1] = PointerGetDatum(&d->claim); ins_slot->tts_isnull[ac - 1] = false;
+            ins_slot->tts_values[aw - 1] = PointerGetDatum(&d->witness); ins_slot->tts_isnull[aw - 1] = false;
+            ins_slot->tts_values[al - 1] = d->has_lin ? PointerGetDatum(&d->lineage) : (Datum)0;
+            ins_slot->tts_isnull[al - 1] = !d->has_lin;
+            ins_slot->tts_values[ag - 1] = Int64GetDatum(d->games); ins_slot->tts_isnull[ag - 1] = false;
+            ins_slot->tts_values[atok - 1] = Int64GetDatum(d->tokens); ins_slot->tts_isnull[atok - 1] = false;
+            ins_slot->tts_values[awins - 1] = Float8GetDatum(d->wins); ins_slot->tts_isnull[awins - 1] = false;
+            ins_slot->tts_values[ascore - 1] = Float8GetDatum(d->wins / (double)d->games); ins_slot->tts_isnull[ascore - 1] = false;
+            ins_slot->tts_values[apos - 1] = d->has_pos ? Int32GetDatum(d->pos) : (Datum)0;
+            ins_slot->tts_isnull[apos - 1] = !d->has_pos;
+            ins_slot->tts_values[atrust - 1] = Float8GetDatum(d->trust); ins_slot->tts_isnull[atrust - 1] = false;
+            ExecStoreVirtualTuple(ins_slot);
+            pg_writer_commit_insert_slot(&w);
             affected++;
         }
     }
+    pg_writer_flush_inserts(&w);
     pfree(assigned);
     pg_writer_close(&w);
 
@@ -1407,13 +1511,15 @@ static int64 accumulate_series_core(Oid pending_oid, Oid delta_oid, Oid affected
             if (present_aff[i]) continue;
             CHECK_FOR_INTERRUPTS();
             const lp_id *cid = lp_idmap_key(uniq_claims, i);
-            ExecClearTuple(aw_rel.new_slot);
-            pg_writer_fill_unset(&aw_rel, aff_assigned);
-            aw_rel.new_slot->tts_values[ac_aff - 1] = PointerGetDatum(cid);
-            aw_rel.new_slot->tts_isnull[ac_aff - 1] = false;
-            ExecStoreVirtualTuple(aw_rel.new_slot);
-            pg_writer_insert_new_slot(&aw_rel);
+            TupleTableSlot *ins_slot = pg_writer_acquire_insert_slot(&aw_rel);
+            ExecClearTuple(ins_slot);
+            pg_writer_fill_unset_slot(&aw_rel, ins_slot, aff_assigned);
+            ins_slot->tts_values[ac_aff - 1] = PointerGetDatum(cid);
+            ins_slot->tts_isnull[ac_aff - 1] = false;
+            ExecStoreVirtualTuple(ins_slot);
+            pg_writer_commit_insert_slot(&aw_rel);
         }
+        pg_writer_flush_inserts(&aw_rel);
         pfree(aff_assigned);
         pg_writer_close(&aw_rel);
         pfree(present_aff);
@@ -1772,14 +1878,22 @@ Datum laplace_measure_witness(PG_FUNCTION_ARGS)
     if (!items.n) { lp_vec_free(&items); PG_RETURN_INT64(0); }
 
     lp_sort(items.v, items.n, sizeof(*items.v), measure_attest_cmp);
-    /* Collapse any duplicate resolved (claim, witness, lineage) if dependence equals source default */
+    /* Merge any duplicate resolved (claim, witness, lineage) rows by summing games/tokens and weighting score. */
     size_t keep = 0;
     for (size_t i = 0; i < items.n; i++) {
         if (keep > 0 && items.v[keep - 1].partition == items.v[i].partition
             && lp_id_eq(&items.v[keep - 1].claim, &items.v[i].claim)
             && items.v[keep - 1].has_lin == items.v[i].has_lin
             && (!items.v[i].has_lin || lp_id_eq(&items.v[keep - 1].lineage, &items.v[i].lineage))) {
-            items.v[keep - 1] = items.v[i];
+            MeasureAttestItem *dst = &items.v[keep - 1];
+            const MeasureAttestItem *src = &items.v[i];
+            int64 total_games = dst->games + src->games;
+            double total_wins = dst->score * (double)dst->games + src->score * (double)src->games;
+            dst->games = total_games;
+            dst->tokens += src->tokens;
+            dst->score = total_games > 0 ? fmin(1.0, fmax(0.0, total_wins / (double)total_games)) : 0.0;
+            if (src->has_pos && (!dst->has_pos || src->pos < dst->pos)) { dst->pos = src->pos; dst->has_pos = true; }
+            dst->trust = fmax(dst->trust, src->trust);
         } else {
             items.v[keep++] = items.v[i];
         }
@@ -3094,47 +3208,127 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
     PartitionKey pkey = RelationGetPartitionKey(att_parent);
     PartitionDesc pdesc = pkey ? RelationGetPartitionDesc(att_parent, true) : NULL;
 
+    uint16_t bucket_mask = 0xFFFFu;
+    if (PG_NARGS() > 3 && !PG_ARGISNULL(3)) {
+        int32 raw_mask = PG_GETARG_INT32(3);
+        if (raw_mask < 0 || raw_mask > 0xFFFF)
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                            errmsg("laplace_stage_publish_attestations: bucket_mask must be in 0..65535")));
+        bucket_mask = (uint16_t)raw_mask;
+    }
+
     lp_vec(MeasureAttestItem) items = {0};
     Snapshot snap = GetActiveSnapshot();
-    TableScanDesc pscan = table_beginscan(pending_rel, snap, 0, NULL);
-    TupleTableSlot *pslot = table_slot_create(pending_rel, NULL);
-    while (table_scan_getnextslot(pscan, ForwardScanDirection, pslot)) {
-        CHECK_FOR_INTERRUPTS();
-        bool nc = false, nw = false, nl = false, ng = false, nt = false, ns = false, np = false, ntr = false;
-        MeasureAttestItem m = {0};
-        Datum v = slot_getattr(pslot, pc, &nc);
-        if (nc) pg_series_invalid();
-        memcpy(m.claim.b, DatumGetPointer(v), sizeof(lp_id));
-        v = slot_getattr(pslot, pw, &nw);
-        if (nw) pg_series_invalid();
-        memcpy(m.witness.b, DatumGetPointer(v), sizeof(lp_id));
-        v = slot_getattr(pslot, pl, &nl);
-        m.has_lin = !nl;
-        if (!nl) memcpy(m.lineage.b, DatumGetPointer(v), sizeof(lp_id));
-        m.games = read_int64_slot(pslot, pg_col, tg, &ng);
-        if (ng || m.games <= 0) pg_series_invalid();
-        m.tokens = read_int64_slot(pslot, ptok, ttok, &nt);
-        if (nt) pg_series_invalid();
-        m.tokens = Max(m.tokens, m.games);
-        m.score = read_float8_slot(pslot, pscore, tscore, &ns);
-        if (ns) pg_series_invalid();
-        v = slot_getattr(pslot, ppos, &np);
-        m.has_pos = !np;
-        if (!np) m.pos = DatumGetInt32(v);
-        m.trust = read_float8_slot(pslot, ptrust, ttrust, &ntr);
-        if (ntr) pg_series_invalid();
-        m.partition = lp_pg_enrichment_partition(att_oid, pkey, pdesc, PointerGetDatum(&m.claim));
-        lp_push(&items, m);
-        ExecClearTuple(pslot);
+    if (bucket_mask != 0) {
+        TableScanDesc pscan = table_beginscan(pending_rel, snap, 0, NULL);
+        TupleTableSlot *pslot = table_slot_create(pending_rel, NULL);
+        while (table_scan_getnextslot(pscan, ForwardScanDirection, pslot)) {
+            CHECK_FOR_INTERRUPTS();
+            bool nc = false, nw = false, nl = false, ng = false, nt = false, ns = false, np = false, ntr = false;
+            MeasureAttestItem m = {0};
+            Datum v = slot_getattr(pslot, pc, &nc);
+            if (nc) pg_series_invalid();
+            memcpy(m.claim.b, DatumGetPointer(v), sizeof(lp_id));
+            if (!((bucket_mask >> (m.claim.b[0] >> 4)) & 1u)) { ExecClearTuple(pslot); continue; }
+            v = slot_getattr(pslot, pw, &nw);
+            if (nw) pg_series_invalid();
+            memcpy(m.witness.b, DatumGetPointer(v), sizeof(lp_id));
+            v = slot_getattr(pslot, pl, &nl);
+            m.has_lin = !nl;
+            if (!nl) memcpy(m.lineage.b, DatumGetPointer(v), sizeof(lp_id));
+            m.games = read_int64_slot(pslot, pg_col, tg, &ng);
+            if (ng || m.games <= 0) pg_series_invalid();
+            m.tokens = read_int64_slot(pslot, ptok, ttok, &nt);
+            if (nt) pg_series_invalid();
+            m.tokens = Max(m.tokens, m.games);
+            m.score = read_float8_slot(pslot, pscore, tscore, &ns);
+            if (ns) pg_series_invalid();
+            v = slot_getattr(pslot, ppos, &np);
+            m.has_pos = !np;
+            if (!np) m.pos = DatumGetInt32(v);
+            m.trust = read_float8_slot(pslot, ptrust, ttrust, &ntr);
+            if (ntr) pg_series_invalid();
+            m.partition = lp_pg_enrichment_partition(att_oid, pkey, pdesc, PointerGetDatum(&m.claim));
+            lp_push(&items, m);
+            ExecClearTuple(pslot);
+        }
+        ExecDropSingleTupleTableSlot(pslot);
+        table_endscan(pscan);
     }
-    ExecDropSingleTupleTableSlot(pslot);
-    table_endscan(pscan);
     table_close(pending_rel, NoLock);
     table_close(att_parent, NoLock);
 
     const Oid *parts = NULL, *pks = NULL, *aux = NULL;
     int nparts = lp_pg_canonical_partitions("attestation", &parts, &pks, &aux, NULL);
 
+    /* Identify truly brand-new witnesses (zero pre-existing rows in our selected
+     * attestation partitions) via single-tuple probes on (witness, lineage) index. */
+    lp_idmap *new_wmap = NULL;
+    lp_idmap *fresh_wmap = NULL;
+    bool *part_active = palloc0((size_t)Max(nparts, 1));
+    if (bucket_mask == 0xFFFFu) {
+        for (int p = 0; p < nparts; p++) part_active[p] = true;
+    } else {
+        for (size_t i = 0; i < items.n; i++) {
+            for (int p = 0; p < nparts; p++)
+                if (parts[p] == items.v[i].partition) { part_active[p] = true; break; }
+        }
+    }
+    if (PG_NARGS() > 2 && !PG_ARGISNULL(2)) {
+        int nw = 0;
+        lp_id *wids = ids_of(PG_GETARG_ARRAYTYPE_P(2), &nw);
+        if (nw > 0) {
+            new_wmap = lp_idmap_new();
+            fresh_wmap = lp_idmap_new();
+            for (int i = 0; i < nw; i++) {
+                lp_idmap_put(new_wmap, &wids[i], NULL);
+                lp_idmap_put(fresh_wmap, &wids[i], NULL);
+            }
+            size_t nuw = lp_idmap_count(new_wmap);
+            const lp_id *uw = lp_idmap_keys(new_wmap);
+            bool *has_existing = palloc0(nuw);
+            for (int p = 0; p < nparts; p++) {
+                CHECK_FOR_INTERRUPTS();
+                if (!part_active[p]) continue;
+                bool any_left = false;
+                for (size_t i = 0; i < nuw; i++) if (!has_existing[i]) { any_left = true; break; }
+                if (!any_left) break;
+                if (!OidIsValid(aux[p])) {
+                    for (size_t i = 0; i < nuw; i++) has_existing[i] = true;
+                    break;
+                }
+                Relation part = table_open(parts[p], AccessShareLock);
+                Relation idx = index_open(aux[p], AccessShareLock);
+                Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
+                RegProcedure eq_proc = get_opcode(eq_op);
+                TupleTableSlot *slot = table_slot_create(part, NULL);
+                IndexScanDesc iscan = index_beginscan(part, idx, snap, NULL, 1, 0);
+                for (size_t i = 0; i < nuw; i++) {
+                    if (has_existing[i]) continue;
+                    ScanKeyData sk;
+                    ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, native_id,
+                                           idx->rd_indcollation[0], eq_proc, PointerGetDatum(&uw[i]));
+                    index_rescan(iscan, &sk, 1, NULL, 0);
+                    if (index_getnext_slot(iscan, ForwardScanDirection, slot)) {
+                        has_existing[i] = true;
+                        ExecClearTuple(slot);
+                    }
+                }
+                index_endscan(iscan);
+                ExecDropSingleTupleTableSlot(slot);
+                index_close(idx, NoLock);
+                table_close(part, NoLock);
+            }
+            lp_idmap_free(fresh_wmap);
+            fresh_wmap = lp_idmap_new();
+            for (size_t i = 0; i < nuw; i++)
+                if (!has_existing[i]) lp_idmap_put(fresh_wmap, &uw[i], NULL);
+            pfree(has_existing);
+        }
+        pfree(wids);
+    }
+
+    int64 admitted = 0;
     if (items.n > 0) {
         lp_sort(items.v, items.n, sizeof(*items.v), publish_attest_cmp);
         size_t keep = 0;
@@ -3144,13 +3338,33 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
                 && lp_id_eq(&items.v[keep - 1].witness, &items.v[i].witness)
                 && items.v[keep - 1].has_lin == items.v[i].has_lin
                 && (!items.v[i].has_lin || lp_id_eq(&items.v[keep - 1].lineage, &items.v[i].lineage))) {
-                items.v[keep - 1] = items.v[i];
+                MeasureAttestItem *dst = &items.v[keep - 1];
+                const MeasureAttestItem *src = &items.v[i];
+                int64 total_games = dst->games + src->games;
+                double total_wins = dst->score * (double)dst->games + src->score * (double)src->games;
+                dst->games = total_games;
+                dst->tokens += src->tokens;
+                dst->score = total_games > 0 ? fmin(1.0, fmax(0.0, total_wins / (double)total_games)) : 0.0;
+                if (src->has_pos && (!dst->has_pos || src->pos < dst->pos)) { dst->pos = src->pos; dst->has_pos = true; }
+                dst->trust = fmax(dst->trust, src->trust);
             } else {
                 items.v[keep++] = items.v[i];
             }
         }
         items.n = keep;
 
+        /* Count distinct (witness, claim) for brand-new witnesses directly from sorted items. */
+        if (fresh_wmap && lp_idmap_count(fresh_wmap) > 0) {
+            for (size_t i = 0; i < items.n; i++) {
+                if (lp_idmap_find(fresh_wmap, &items.v[i].witness) < 0) continue;
+                if (i == 0
+                    || !lp_id_eq(&items.v[i - 1].claim, &items.v[i].claim)
+                    || !lp_id_eq(&items.v[i - 1].witness, &items.v[i].witness))
+                    admitted++;
+            }
+        }
+
+        size_t array_ids = (MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(lp_id);
         for (size_t begin = 0; begin < items.n;) {
             CHECK_FOR_INTERRUPTS();
             size_t end = begin + 1;
@@ -3163,7 +3377,6 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
             for (int p = 0; p < nparts; p++) if (parts[p] == partOid) { pkOid = pks[p]; break; }
             if (!OidIsValid(pkOid)) pkOid = RelationGetPrimaryKeyIndex(w.rel, false);
             if (!OidIsValid(pkOid)) ereport(ERROR, (errmsg("Native attestation: partition has no primary index")));
-            Relation idx = index_open(pkOid, AccessShareLock);
 
             AttrNumber ac = get_attnum(partOid, "claim");
             AttrNumber aw = get_attnum(partOid, "witness");
@@ -3174,21 +3387,55 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
             AttrNumber apos = get_attnum(partOid, "position");
             AttrNumber atrust = get_attnum(partOid, "trust");
 
-            IndexScanDesc iscan = index_beginscan(w.rel, idx, w.snap, NULL, 3, 0);
+            /* Collect distinct claims for items whose witness is not proven fresh. */
+            lp_vec(lp_id) probe_claims = {0};
             for (size_t i = begin; i < end; i++) {
-                if (!((i - begin) & 255)) CHECK_FOR_INTERRUPTS();
-                MeasureAttestItem *m = &items.v[i];
-                ScanKeyData sk[3];
-                init_cwl_scankeys(sk, idx, native_id, &m->claim, &m->witness, m->has_lin, &m->lineage);
-                index_rescan(iscan, sk, 3, NULL, 0);
-                if (index_getnext_slot(iscan, ForwardScanDirection, w.old_slot)) {
-                    m->tid = w.old_slot->tts_tid;
-                    m->found = true;
-                    ExecClearTuple(w.old_slot);
-                }
+                if (fresh_wmap && lp_idmap_find(fresh_wmap, &items.v[i].witness) >= 0) continue;
+                if (!probe_claims.n || !lp_id_eq(&probe_claims.v[probe_claims.n - 1], &items.v[i].claim))
+                    lp_push(&probe_claims, items.v[i].claim);
             }
-            index_endscan(iscan);
-            index_close(idx, NoLock);
+            if (probe_claims.n > 0) {
+                Relation idx = index_open(pkOid, AccessShareLock);
+                Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
+                RegProcedure eq_proc = get_opcode(eq_op);
+                IndexScanDesc iscan = index_beginscan(w.rel, idx, w.snap, NULL, 1, 0);
+                for (size_t off = 0; off < probe_claims.n; off += array_ids) {
+                    CHECK_FOR_INTERRUPTS();
+                    size_t chunk = Min(array_ids, probe_claims.n - off);
+                    ArrayType *wanted = id_array_of(native_id, probe_claims.v + off, (int)chunk);
+                    ScanKeyData sk;
+                    ScanKeyEntryInitialize(&sk, SK_SEARCHARRAY, 1, BTEqualStrategyNumber, native_id,
+                                           idx->rd_indcollation[0], eq_proc, PointerGetDatum(wanted));
+                    index_rescan(iscan, &sk, 1, NULL, 0);
+                    while (index_getnext_slot(iscan, ForwardScanDirection, w.old_slot)) {
+                        CHECK_FOR_INTERRUPTS();
+                        bool mc = false, mw = false, ml = false;
+                        Datum vc = slot_getattr(w.old_slot, ac, &mc);
+                        Datum vw = slot_getattr(w.old_slot, aw, &mw);
+                        Datum vl = slot_getattr(w.old_slot, al, &ml);
+                        if (!mc && !mw) {
+                            MeasureAttestItem key_item = {
+                                .partition = partOid,
+                                .claim = *(const lp_id *)DatumGetPointer(vc),
+                                .witness = *(const lp_id *)DatumGetPointer(vw),
+                                .has_lin = !ml
+                            };
+                            if (!ml) key_item.lineage = *(const lp_id *)DatumGetPointer(vl);
+                            MeasureAttestItem *hit = bsearch(&key_item, items.v + begin, end - begin,
+                                                             sizeof(*items.v), publish_attest_cmp);
+                            if (hit) {
+                                hit->tid = w.old_slot->tts_tid;
+                                hit->found = true;
+                            }
+                        }
+                        ExecClearTuple(w.old_slot);
+                    }
+                    pfree(wanted);
+                }
+                index_endscan(iscan);
+                index_close(idx, NoLock);
+            }
+            lp_vec_free(&probe_claims);
 
             MeasureFillCtx fctx = { NULL, ac, aw, al, ag, atok, ascore, apos, atrust, false };
             for (size_t i = begin; i < end; i++) {
@@ -3197,10 +3444,12 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
                 if (items.v[i].found) {
                     pg_writer_update_tid(&w, &items.v[i].tid, fill_attestation_slot, &fctx, false);
                 } else {
-                    fill_attestation_slot(NULL, w.new_slot, &fctx);
-                    pg_writer_insert_new_slot(&w);
+                    TupleTableSlot *ins_slot = pg_writer_acquire_insert_slot(&w);
+                    fill_attestation_slot(NULL, ins_slot, &fctx);
+                    pg_writer_commit_insert_slot(&w);
                 }
             }
+            pg_writer_flush_inserts(&w);
             pg_writer_close(&w);
             begin = end;
         }
@@ -3208,21 +3457,23 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
     }
     lp_vec_free(&items);
 
-    int64 admitted = 0;
-    if (PG_NARGS() > 2 && !PG_ARGISNULL(2)) {
-        int nw = 0;
-        lp_id *wids = ids_of(PG_GETARG_ARRAYTYPE_P(2), &nw);
-        if (nw > 0) {
-            lp_idmap *wmap = lp_idmap_new();
-            for (int i = 0; i < nw; i++) lp_idmap_put(wmap, &wids[i], NULL);
-            size_t nuw = lp_idmap_count(wmap);
-            const lp_id *uw = lp_idmap_keys(wmap);
+    /* Only scan attestation for any witness in new_wmap that was NOT proven fresh before insert. */
+    if (new_wmap) {
+        lp_idmap *non_fresh = lp_idmap_new();
+        size_t nuw = lp_idmap_count(new_wmap);
+        const lp_id *uw = lp_idmap_keys(new_wmap);
+        for (size_t i = 0; i < nuw; i++)
+            if (!fresh_wmap || lp_idmap_find(fresh_wmap, &uw[i]) < 0)
+                lp_idmap_put(non_fresh, &uw[i], NULL);
+        size_t nnf = lp_idmap_count(non_fresh);
+        if (nnf > 0) {
+            const lp_id *nfw = lp_idmap_keys(non_fresh);
             lp_strmap *seen_wc = lp_strmap_sized(1);
-
             PushActiveSnapshot(GetTransactionSnapshot());
             Snapshot rsnap = GetActiveSnapshot();
             for (int p = 0; p < nparts; p++) {
                 CHECK_FOR_INTERRUPTS();
+                if (!part_active[p]) continue;
                 Relation part = table_open(parts[p], AccessShareLock);
                 AttrNumber ac = get_attnum(parts[p], "claim");
                 AttrNumber aw = get_attnum(parts[p], "witness");
@@ -3232,20 +3483,23 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
                     Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
                     RegProcedure eq_proc = get_opcode(eq_op);
                     IndexScanDesc iscan = index_beginscan(part, idx, rsnap, NULL, 1, 0);
-                    for (size_t i = 0; i < nuw; i++) {
+                    for (size_t i = 0; i < nnf; i++) {
                         CHECK_FOR_INTERRUPTS();
                         ScanKeyData sk;
                         ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, native_id,
-                                               idx->rd_indcollation[0], eq_proc, PointerGetDatum(&uw[i]));
+                                               idx->rd_indcollation[0], eq_proc, PointerGetDatum(&nfw[i]));
                         index_rescan(iscan, &sk, 1, NULL, 0);
                         while (index_getnext_slot(iscan, ForwardScanDirection, slot)) {
                             bool nc = false;
                             Datum dc = slot_getattr(slot, ac, &nc);
                             if (!nc) {
-                                uint8_t wc[32];
-                                memcpy(wc, uw[i].b, 16);
-                                memcpy(wc + 16, DatumGetPointer(dc), 16);
-                                lp_strmap_put(seen_wc, wc, sizeof wc, NULL);
+                                const uint8_t *cb = (const uint8_t *)DatumGetPointer(dc);
+                                if ((bucket_mask >> (cb[0] >> 4)) & 1u) {
+                                    uint8_t wc[32];
+                                    memcpy(wc, nfw[i].b, 16);
+                                    memcpy(wc + 16, cb, 16);
+                                    lp_strmap_put(seen_wc, wc, sizeof wc, NULL);
+                                }
                             }
                             ExecClearTuple(slot);
                         }
@@ -3257,13 +3511,16 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
                     while (table_scan_getnextslot(s, ForwardScanDirection, slot)) {
                         bool nc = false, nw_col = false;
                         Datum dw = slot_getattr(slot, aw, &nw_col);
-                        if (!nw_col && lp_idmap_find(wmap, (const lp_id *)DatumGetPointer(dw)) >= 0) {
+                        if (!nw_col && lp_idmap_find(non_fresh, (const lp_id *)DatumGetPointer(dw)) >= 0) {
                             Datum dc = slot_getattr(slot, ac, &nc);
                             if (!nc) {
-                                uint8_t wc[32];
-                                memcpy(wc, DatumGetPointer(dw), 16);
-                                memcpy(wc + 16, DatumGetPointer(dc), 16);
-                                lp_strmap_put(seen_wc, wc, sizeof wc, NULL);
+                                const uint8_t *cb = (const uint8_t *)DatumGetPointer(dc);
+                                if ((bucket_mask >> (cb[0] >> 4)) & 1u) {
+                                    uint8_t wc[32];
+                                    memcpy(wc, DatumGetPointer(dw), 16);
+                                    memcpy(wc + 16, cb, 16);
+                                    lp_strmap_put(seen_wc, wc, sizeof wc, NULL);
+                                }
                             }
                         }
                         ExecClearTuple(slot);
@@ -3274,20 +3531,22 @@ Datum laplace_stage_publish_attestations(PG_FUNCTION_ARGS)
                 table_close(part, NoLock);
             }
             PopActiveSnapshot();
-            admitted = (int64)lp_strmap_count(seen_wc);
+            admitted += (int64)lp_strmap_count(seen_wc);
             lp_strmap_free(seen_wc);
-            lp_idmap_free(wmap);
         }
-        pfree(wids);
+        lp_idmap_free(non_fresh);
+        lp_idmap_free(new_wmap);
+        if (fresh_wmap) lp_idmap_free(fresh_wmap);
     }
+    pfree(part_active);
 
     int64 consensus_rows = 0;
-    if (OidIsValid(affected_oid)) {
+    if (OidIsValid(affected_oid) && bucket_mask != 0) {
         lp_idmap *claims = lp_idmap_new();
         uint16_t buckets = 0;
-        collect_stage_claims(affected_oid, native_id, claims, &buckets);
+        collect_stage_claims_masked(affected_oid, native_id, bucket_mask, claims, &buckets);
         if (lp_idmap_count(claims) > 0)
-            consensus_rows = attest_stage_core(pending_oid, native_id, claims, buckets);
+            consensus_rows = attest_stage_core(InvalidOid, native_id, claims, buckets);
         lp_idmap_free(claims);
     }
 

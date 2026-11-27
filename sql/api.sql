@@ -231,6 +231,11 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_publish_attestations(pendin
     LANGUAGE c VOLATILE
     AS 'MODULE_PATHNAME', 'laplace_stage_publish_attestations';
 
+CREATE OR REPLACE FUNCTION @extschema@.laplace_stage_publish_attestations(pending regclass, affected regclass, witness_ids @extschema@.blake3[], bucket_mask integer,
+    OUT admitted bigint, OUT consensus_rows bigint) RETURNS record
+    LANGUAGE c VOLATILE
+    AS 'MODULE_PATHNAME', 'laplace_stage_publish_attestations';
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_present_mask(ids @extschema@.blake3[]) RETURNS boolean[]
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_present_mask';
@@ -340,7 +345,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_forward_suffix(ids @extschema@.bl
     AS 'MODULE_PATHNAME', 'laplace_forward_suffix';
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_salience(occ @extschema@.blake3[],
-    scope @extschema@.blake3[] DEFAULT '{}'::@extschema@.blake3[],
+    scope @extschema@.blake3[] DEFAULT NULL,
     OUT ord integer, OUT id @extschema@.blake3, OUT tier smallint,
     OUT df bigint, OUT total bigint,
     OUT info_bits double precision, OUT span_lift double precision,

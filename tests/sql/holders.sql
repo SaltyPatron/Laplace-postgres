@@ -51,6 +51,10 @@ BEGIN
  OR (SELECT count(*) FROM laplace_holders(ARRAY[b,b],ARRAY[c],true))<>2 THEN
   RAISE EXCEPTION 'Native empty or required-key selection changed';
  END IF;
+ -- laplace_holder_counts must return claims (kind=1) in claims and observations (kind=0) in observations.
+ IF EXISTS(SELECT FROM laplace_holder_counts(ARRAY[a,c]) WHERE (id=a AND (claims<>2 OR observations<>1)) OR (id=c AND (claims<>2 OR observations<>0))) THEN
+  RAISE EXCEPTION 'Native holder_counts swapped or miscounted claims vs observations';
+ END IF;
  IF (SELECT array_agg(ordinal ORDER BY ordinal) FROM laplace_standings(
     ARRAY[ab,'00000000000000000000000000000000'::blake3,ab])) IS DISTINCT FROM ARRAY[1,3]::bigint[]
  OR EXISTS(SELECT FROM laplace_standings(ARRAY[ab]) WHERE rating<>1550 OR deviation<>60 OR volatility<>0.06 OR matches<>7) THEN

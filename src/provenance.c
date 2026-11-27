@@ -921,7 +921,7 @@ static void audit_visit_claim_path(const lp_id *claim, Datum path, Datum mask, v
     int64 cord = lp_idmap_find(ac->attested_claims, claim);
     if (cord < 0) return; /* unattested claim: skip before detoasting path */
     Geo g = geo_of(path);
-    size_t n = lp_path_len(g.p);
+    size_t n = g.p.n;
     for (size_t i = 0; i < n; i++) {
         lp_id vid = lp_path_id(g.p, i);
         if (!lp_highway_contains(ac->hw, &vid)) continue;

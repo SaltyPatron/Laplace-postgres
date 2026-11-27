@@ -1231,10 +1231,13 @@ static bool stage_load_and_validate(Relation stage_e, Relation stage_p, Oid ent_
     return use_pres;
 }
 
+#define MERGE_MULTI_BATCH 512
+
 static uint64 merge_insert_table(Relation parent, const char *relname, bool is_paths, Oid idtype,
                                  int nparts, const Oid *parts, const Oid *pks,
                                  MergeRow *rows, size_t nrows,
-                                 MergeRowVec *concurrent_landed, HTAB *touched_parts)
+                                 MergeRowVec *concurrent_landed, HTAB *touched_parts,
+                                 bool fast_multi)
 {
     PartitionKey pkey = RelationGetPartitionKey(parent);
     PartitionDesc pdesc = pkey ? RelationGetPartitionDesc(parent, true) : NULL;
@@ -1261,68 +1264,121 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
         EState *estate = CreateExecutorState();
         ResultRelInfo *rri = makeNode(ResultRelInfo);
         InitResultRelInfo(rri, part, 0, NULL, 0);
-        ExecOpenIndices(rri, true /* speculative */);
+        ExecOpenIndices(rri, !fast_multi /* speculative */);
 
         AttrNumber a_id = get_attnum(partOid, is_paths ? "entity" : "id");
         AttrNumber a_tier = get_attnum(partOid, "tier");
         AttrNumber a_carrier = get_attnum(partOid, is_paths ? "path" : "coord");
         AttrNumber a_hilb = get_attnum(partOid, "hilbert");
         AttrNumber a_mask = get_attnum(partOid, "mask");
-        TupleTableSlot *slot = table_slot_create(part, NULL);
         BulkInsertState bistate = GetBulkInsertState();
         bool part_inserted = false;
 
-        PG_TRY(); {
-            for (size_t i = begin; i < end; i++) {
-                CHECK_FOR_INTERRUPTS();
-                MergeRow *r = &ins.v[i];
-                ExecClearTuple(slot);
-                memset(slot->tts_isnull, 0, (size_t)RelationGetDescr(part)->natts * sizeof(bool));
-                slot->tts_values[a_id - 1] = PointerGetDatum(&r->id);
-                slot->tts_values[a_tier - 1] = Int16GetDatum(r->tier);
-                slot->tts_values[a_carrier - 1] = r->carrier;
-                slot->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
-                void *mask_val = lp_pg_mask_sql(r->mask);
-                slot->tts_values[a_mask - 1] = PointerGetDatum(mask_val);
-                ExecStoreVirtualTuple(slot);
+        if (fast_multi) {
+            int natts = RelationGetDescr(part)->natts;
+            int nslots = (int)Min((size_t)MERGE_MULTI_BATCH, end - begin);
+            TupleTableSlot **slots = palloc(sizeof(TupleTableSlot *) * (size_t)nslots);
+            void **masks = palloc0(sizeof(void *) * (size_t)nslots);
+            for (int k = 0; k < nslots; k++) slots[k] = table_slot_create(part, NULL);
 
-                ItemPointerData conflictTid;
-                for (;;) {
-                    if (!ExecCheckIndexConstraints(rri, slot, estate, &conflictTid, NULL, arbiter)) {
-                        if (IsolationUsesXactSnapshot())
-                            ereport(ERROR, (errcode(ERRCODE_UNIQUE_VIOLATION),
-                                            errmsg("duplicate key value violates unique constraint")));
-                        lp_push(concurrent_landed, *r);
-                        break;
+            PG_TRY(); {
+                for (size_t off = begin; off < end;) {
+                    CHECK_FOR_INTERRUPTS();
+                    int nbatch = (int)Min((size_t)nslots, end - off);
+                    for (int k = 0; k < nbatch; k++) {
+                        MergeRow *r = &ins.v[off + (size_t)k];
+                        TupleTableSlot *s = slots[k];
+                        ExecClearTuple(s);
+                        memset(s->tts_isnull, 0, (size_t)natts * sizeof(bool));
+                        s->tts_values[a_id - 1] = PointerGetDatum(&r->id);
+                        s->tts_values[a_tier - 1] = Int16GetDatum(r->tier);
+                        s->tts_values[a_carrier - 1] = r->carrier;
+                        s->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
+                        masks[k] = lp_pg_mask_sql(r->mask);
+                        s->tts_values[a_mask - 1] = PointerGetDatum(masks[k]);
+                        ExecStoreVirtualTuple(s);
                     }
-                    uint32 specToken = SpeculativeInsertionLockAcquire(GetTopTransactionId());
-                    table_tuple_insert_speculative(part, slot, cid, 0, bistate, specToken);
-                    bool specConflict = false;
-                    List *recheck = ExecInsertIndexTuples(rri, slot, estate, false, true, &specConflict, arbiter, false);
-                    list_free(recheck);
-                    if (specConflict) {
-                        table_tuple_complete_speculative(part, slot, specToken, false);
-                        SpeculativeInsertionLockRelease(GetTopTransactionId());
-                    } else {
-                        table_tuple_complete_speculative(part, slot, specToken, true);
-                        SpeculativeInsertionLockRelease(GetTopTransactionId());
-                        inserted++;
-                        part_inserted = true;
-                        break;
+                    table_multi_insert(part, slots, nbatch, cid, 0, bistate);
+                    for (int k = 0; k < nbatch; k++) {
+                        List *recheck = ExecInsertIndexTuples(rri, slots[k], estate, false, false, NULL, NIL, false);
+                        list_free(recheck);
+                        ExecClearTuple(slots[k]);
+                        pfree(masks[k]);
+                        masks[k] = NULL;
                     }
+                    inserted += (uint64)nbatch;
+                    part_inserted = true;
+                    off += (size_t)nbatch;
                 }
-                ExecClearTuple(slot);
-                pfree(mask_val);
-            }
-            if (part_inserted) table_finish_bulk_insert(part, 0);
-        } PG_FINALLY(); {
-            FreeBulkInsertState(bistate);
-            ExecDropSingleTupleTableSlot(slot);
-            ExecCloseIndices(rri);
-            FreeExecutorState(estate);
-            list_free(arbiter);
-            table_close(part, NoLock);
-        } PG_END_TRY();
+                if (part_inserted) table_finish_bulk_insert(part, 0);
+            } PG_FINALLY(); {
+                for (int k = 0; k < nslots; k++) {
+                    if (masks[k]) pfree(masks[k]);
+                    ExecDropSingleTupleTableSlot(slots[k]);
+                }
+                pfree(masks);
+                pfree(slots);
+                FreeBulkInsertState(bistate);
+                ExecCloseIndices(rri);
+                FreeExecutorState(estate);
+                list_free(arbiter);
+                table_close(part, NoLock);
+            } PG_END_TRY();
+        } else {
+            TupleTableSlot *slot = table_slot_create(part, NULL);
+
+            PG_TRY(); {
+                for (size_t i = begin; i < end; i++) {
+                    CHECK_FOR_INTERRUPTS();
+                    MergeRow *r = &ins.v[i];
+                    ExecClearTuple(slot);
+                    memset(slot->tts_isnull, 0, (size_t)RelationGetDescr(part)->natts * sizeof(bool));
+                    slot->tts_values[a_id - 1] = PointerGetDatum(&r->id);
+                    slot->tts_values[a_tier - 1] = Int16GetDatum(r->tier);
+                    slot->tts_values[a_carrier - 1] = r->carrier;
+                    slot->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
+                    void *mask_val = lp_pg_mask_sql(r->mask);
+                    slot->tts_values[a_mask - 1] = PointerGetDatum(mask_val);
+                    ExecStoreVirtualTuple(slot);
+
+                    ItemPointerData conflictTid;
+                    for (;;) {
+                        if (!ExecCheckIndexConstraints(rri, slot, estate, &conflictTid, NULL, arbiter)) {
+                            if (IsolationUsesXactSnapshot())
+                                ereport(ERROR, (errcode(ERRCODE_UNIQUE_VIOLATION),
+                                                errmsg("duplicate key value violates unique constraint")));
+                            lp_push(concurrent_landed, *r);
+                            break;
+                        }
+                        uint32 specToken = SpeculativeInsertionLockAcquire(GetTopTransactionId());
+                        table_tuple_insert_speculative(part, slot, cid, 0, bistate, specToken);
+                        bool specConflict = false;
+                        List *recheck = ExecInsertIndexTuples(rri, slot, estate, false, true, &specConflict, arbiter, false);
+                        list_free(recheck);
+                        if (specConflict) {
+                            table_tuple_complete_speculative(part, slot, specToken, false);
+                            SpeculativeInsertionLockRelease(GetTopTransactionId());
+                        } else {
+                            table_tuple_complete_speculative(part, slot, specToken, true);
+                            SpeculativeInsertionLockRelease(GetTopTransactionId());
+                            inserted++;
+                            part_inserted = true;
+                            break;
+                        }
+                    }
+                    ExecClearTuple(slot);
+                    pfree(mask_val);
+                }
+                if (part_inserted) table_finish_bulk_insert(part, 0);
+            } PG_FINALLY(); {
+                FreeBulkInsertState(bistate);
+                ExecDropSingleTupleTableSlot(slot);
+                ExecCloseIndices(rri);
+                FreeExecutorState(estate);
+                list_free(arbiter);
+                table_close(part, NoLock);
+            } PG_END_TRY();
+        }
         if (part_inserted && touched_parts) hash_search(touched_parts, &partOid, HASH_ENTER, NULL);
         begin = end;
     }
@@ -1437,10 +1493,28 @@ Datum laplace_merge_stage(PG_FUNCTION_ARGS)
     int neparts = lp_pg_canonical_partitions("entity", &eparts, &epks, NULL, NULL);
     int npparts = lp_pg_canonical_partitions("physicality", &pparts, &ppks, NULL, NULL);
 
-    /* Probe unproven rows once against canonical entity via lp_pg_present,
-     * mirroring 1:1 pairing with physicality while honoring positive proof. */
+    /* Try non-blocking per-prefix advisory locks before presence probing.
+     * Parallel ingest lanes own disjoint id.b[0] prefixes and succeed without
+     * contention, enabling batched table_multi_insert without speculative
+     * double-pinning. Overlapping concurrent writers fall back immediately to
+     * speculative insertion and preserve Lock|transactionid waiting semantics. */
+    bool exclusive_buckets = !IsolationUsesXactSnapshot();
     size_t n = erows.n;
     if (n > 0) {
+        if (exclusive_buckets) {
+            uint8_t b0_seen[256] = {0};
+            for (size_t i = 0; i < n; i++)
+                if (!erows.v[i].present || !prows.v[i].present)
+                    b0_seen[erows.v[i].id.b[0]] = 1;
+            for (int b = 0; b < 256; b++) {
+                if (!b0_seen[b]) continue;
+                if (!DatumGetBool(DirectFunctionCall2(pg_try_advisory_xact_lock_int4,
+                                                      Int32GetDatum(1279348804), Int32GetDatum(b)))) {
+                    exclusive_buckets = false;
+                    break;
+                }
+            }
+        }
         lp_id *probe_ids = palloc(n * sizeof(lp_id));
         size_t *probe_idx = palloc(n * sizeof(size_t));
         bool *probe_res = palloc0(n * sizeof(bool));
@@ -1472,8 +1546,8 @@ Datum laplace_merge_stage(PG_FUNCTION_ARGS)
     uint64 updated_rows = merge_enrich_subset(ent_parent, false, e_idtype, neparts, eparts, epks, e_exist.v, e_exist.n, snap, NULL);
     updated_rows += merge_enrich_subset(path_parent, true, p_idtype, npparts, pparts, ppks, p_exist.v, p_exist.n, snap, touched_parts);
 
-    uint64 entity_rows = merge_insert_table(ent_parent, "entity", false, e_idtype, neparts, eparts, epks, erows.v, erows.n, &e_conc, NULL);
-    uint64 physicality_rows = merge_insert_table(path_parent, "physicality", true, p_idtype, npparts, pparts, ppks, prows.v, prows.n, &p_conc, touched_parts);
+    uint64 entity_rows = merge_insert_table(ent_parent, "entity", false, e_idtype, neparts, eparts, epks, erows.v, erows.n, &e_conc, NULL, exclusive_buckets);
+    uint64 physicality_rows = merge_insert_table(path_parent, "physicality", true, p_idtype, npparts, pparts, ppks, prows.v, prows.n, &p_conc, touched_parts, exclusive_buckets);
 
     if (e_conc.n > 0 || p_conc.n > 0) {
         Snapshot latest = RegisterSnapshot(GetLatestSnapshot());

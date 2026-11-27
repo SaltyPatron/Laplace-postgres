@@ -225,6 +225,16 @@ BEGIN
     RAISE EXCEPTION 'empty witness scope leaked loss_contrast=%', lc_iso;
   END IF;
 
+  -- Default 1-arg call (scope DEFAULT NULL) must compute unscoped loss_contrast; explicit '{}' must stay fail-closed (0.0).
+  SELECT loss_contrast INTO lc_good FROM laplace_salience(ARRAY[w_fn_y, w_bad, w_good]) WHERE id = w_good;
+  IF lc_good >= -0.5 THEN
+    RAISE EXCEPTION 'default unscoped laplace_salience dropped loss_contrast (good=%)', lc_good;
+  END IF;
+  SELECT loss_contrast INTO lc_iso FROM laplace_salience(ARRAY[w_fn_y, w_bad, w_good], '{}'::blake3[]) WHERE id = w_good;
+  IF lc_iso <> 0.0 THEN
+    RAISE EXCEPTION 'explicit empty scope leaked loss_contrast=%', lc_iso;
+  END IF;
+
   -- Salience-weighted centroid in laplace_couple GiST k=1 (using target_t3 placed at salience centroid without changing df)
   t_b := pg_temp.make_word(repeat(chr(9889), 12) || 'asllight' || repeat(chr(9889), 12));
   t_a := pg_temp.put_node(

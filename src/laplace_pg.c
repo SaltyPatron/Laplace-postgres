@@ -1143,11 +1143,13 @@ Datum laplace_entity_tier_sample(PG_FUNCTION_ARGS)
         }
     }
 
-    int step = (nparts == 256 && est_total >= 100000.0) ? 64 : 1;
+    int step = (nparts >= 8 && est_total >= 100000.0) ? Max(1, nparts / 4) : 1;
     int64 counts[256] = {0};
+    int sampled = 0;
     Snapshot snap = GetActiveSnapshot();
     for (int p = 0; p < nparts; p += step) {
         CHECK_FOR_INTERRUPTS();
+        sampled++;
         Relation part = table_open(parts[p], AccessShareLock);
         TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
         TupleTableSlot *slot = table_slot_create(part, NULL);
@@ -1166,9 +1168,10 @@ Datum laplace_entity_tier_sample(PG_FUNCTION_ARGS)
         table_close(part, NoLock);
     }
 
+    double scale = sampled > 0 ? ((double)nparts / (double)sampled) : 1.0;
     for (int t = 0; t <= 255; t++) {
         if (!counts[t]) continue;
-        Datum v[2] = { Int16GetDatum((int16)t), Int64GetDatum(counts[t] * (int64)step) };
+        Datum v[2] = { Int16GetDatum((int16)t), Int64GetDatum((int64)llround((double)counts[t] * scale)) };
         bool nl[2] = { false, false };
         set_put(fcinfo, ts, td, v, nl);
     }
