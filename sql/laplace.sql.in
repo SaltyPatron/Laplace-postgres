@@ -1020,10 +1020,10 @@ CREATE TABLE @extschema@.consensus (
 PARTITION BY RANGE (claim);
 
 ALTER TABLE @extschema@.entity
-    ADD CONSTRAINT entity_pkey PRIMARY KEY (tier, id);
+    ADD CONSTRAINT entity_pkey PRIMARY KEY (id, tier);
 
 ALTER TABLE @extschema@.physicality
-    ADD CONSTRAINT physicality_pkey PRIMARY KEY (tier, entity);
+    ADD CONSTRAINT physicality_pkey PRIMARY KEY (entity, tier);
 
 ALTER TABLE @extschema@.attestation
     ADD CONSTRAINT attestation_pkey UNIQUE NULLS NOT DISTINCT (claim, witness, lineage);
@@ -1039,9 +1039,7 @@ BEGIN
   lo:=CASE WHEN i=0 THEN 'MINVALUE' ELSE i::text END;
   hi:=CASE WHEN i=8 THEN 'MAXVALUE' ELSE (i+1)::text END;
   EXECUTE pg_catalog.format('CREATE TABLE @extschema@.entity_%s PARTITION OF @extschema@.entity FOR VALUES FROM (%s) TO (%s)',suffix,lo,hi);
-  EXECUTE pg_catalog.format('CREATE UNIQUE INDEX entity_%s_id_key ON @extschema@.entity_%s (id)',suffix,suffix);
   EXECUTE pg_catalog.format('CREATE TABLE @extschema@.physicality_%s PARTITION OF @extschema@.physicality FOR VALUES FROM (%s) TO (%s) WITH (parallel_workers=0)',suffix,lo,hi);
-  EXECUTE pg_catalog.format('CREATE UNIQUE INDEX physicality_%s_entity_key ON @extschema@.physicality_%s (entity)',suffix,suffix);
  END LOOP;
  FOR i IN 0..15 LOOP
   suffix:=pg_catalog.to_hex(i);
@@ -1052,7 +1050,7 @@ BEGIN
  END LOOP;
 END $partitions$;
 ALTER TABLE @extschema@.physicality ALTER COLUMN path SET STATISTICS 0;
-ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(tier, entity) REFERENCES @extschema@.entity(tier, id) ON UPDATE CASCADE;
+ALTER TABLE @extschema@.physicality ADD CONSTRAINT physicality_entity_fkey FOREIGN KEY(entity, tier) REFERENCES @extschema@.entity(id, tier) ON UPDATE CASCADE;
 DO $dump_content$
 DECLARE item record;
 BEGIN

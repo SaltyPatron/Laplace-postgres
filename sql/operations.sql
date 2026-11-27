@@ -204,7 +204,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_schema_indexes() RETURNS void
 BEGIN
   -- Distinct metrics retain their own exact access paths. Tier is a key prefix,
   -- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
-  CREATE INDEX IF NOT EXISTS entity_hilbert ON @extschema@.entity (hilbert);
+  DROP INDEX IF EXISTS @extschema@.entity_hilbert;
   CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity (tier, hilbert, id);
   CREATE INDEX IF NOT EXISTS entity_coord ON @extschema@.entity USING gist (coord @extschema@.laplace_point4d_ops);
   CREATE INDEX IF NOT EXISTS entity_angular ON @extschema@.entity USING gist (coord @extschema@.laplace_angular4d_ops);

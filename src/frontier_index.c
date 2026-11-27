@@ -56,11 +56,13 @@ static Oid find_unique_col_btree(Relation part, AttrNumber target_col)
         Relation idx = index_open(ioid, AccessShareLock);
         if (idx->rd_rel->relam == BTREE_AM_OID && idx->rd_index &&
             idx->rd_index->indisvalid && idx->rd_index->indisready && idx->rd_index->indislive &&
-            idx->rd_index->indisunique && idx->rd_index->indnkeyatts == 1 &&
+            idx->rd_index->indisunique && idx->rd_index->indnkeyatts >= 1 &&
             idx->rd_index->indkey.values[0] == target_col) {
             found = ioid;
+            bool is_pk = idx->rd_index->indisprimary;
             index_close(idx, NoLock);
-            break;
+            if (is_pk) break;
+            continue;
         }
         index_close(idx, NoLock);
     }
