@@ -300,8 +300,13 @@ static void require_enrichment_acls(Oid target, bool paths, bool check_compat)
 {
     if (check_enable_rls(target, InvalidOid, false) == RLS_ENABLED)
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("laplace_enrich_stage does not support RLS on canonical tables")));
-    const char *base_sel[5] = {paths ? "entity" : "id", "tier", "mask", paths ? "path" : "coord", "hilbert"};
-    require_table_or_col_acl(target, ACL_SELECT, base_sel, check_compat ? 5 : 3);
+    if (paths) {
+        const char *base_sel[4] = {"entity", "tier", "mask", "path"};
+        require_table_or_col_acl(target, ACL_SELECT, base_sel, check_compat ? 4 : 3);
+    } else {
+        const char *base_sel[5] = {"id", "tier", "mask", "coord", "hilbert"};
+        require_table_or_col_acl(target, ACL_SELECT, base_sel, check_compat ? 5 : 3);
+    }
     const char *upd_cols[2] = {"tier", "mask"};
     require_table_or_col_acl(target, ACL_UPDATE, upd_cols, 2);
 }
@@ -360,7 +365,7 @@ static uint64 enrich_partition_rows(Oid partOid, Oid pkOid, Oid idtype, bool pat
     AttrNumber a_id = get_attnum(partOid, paths ? "entity" : "id");
     AttrNumber a_tier = get_attnum(partOid, "tier");
     AttrNumber a_mask = get_attnum(partOid, "mask");
-    AttrNumber a_hilbert = get_attnum(partOid, "hilbert");
+    AttrNumber a_hilbert = paths ? InvalidAttrNumber : get_attnum(partOid, "hilbert");
     AttrNumber a_carrier = get_attnum(partOid, paths ? "path" : "coord");
 
     Datum *vals = palloc((Size)n * sizeof(Datum));
@@ -402,18 +407,18 @@ static uint64 enrich_partition_rows(Oid partOid, Oid pkOid, Oid idtype, bool pat
             const StageEnrichRow *s = &rows[at];
             retry_lock:
             slot_getallattrs(old_slot);
-            bool d_null_t = false, d_null_m = false, d_null_c = false, d_null_h = false;
+            bool d_null_t = false, d_null_m = false, d_null_c = false, d_null_h = true;
             Datum d_tier_d = slot_getattr(old_slot, a_tier, &d_null_t);
             Datum d_mask_d = slot_getattr(old_slot, a_mask, &d_null_m);
             Datum d_carrier_d = slot_getattr(old_slot, a_carrier, &d_null_c);
-            Datum d_hilb_d = slot_getattr(old_slot, a_hilbert, &d_null_h);
+            Datum d_hilb_d = (a_hilbert != InvalidAttrNumber) ? slot_getattr(old_slot, a_hilbert, &d_null_h) : (Datum)0;
             int16 d_tier = DatumGetInt16(d_tier_d);
             lp_mask d_mask = lp_pg_mask_native(d_mask_d);
             int64 d_hilbert = d_null_h ? 0 : DatumGetInt64(d_hilb_d);
 
             if (check_compat)
                 check_carrier_compatible(paths, did, &s->id, d_carrier_d, s->carrier, s->carrier_null,
-                                         d_hilbert, d_null_h, s->hilbert, s->hilbert_null);
+                                         d_hilbert, d_null_h, s->hilbert, paths || s->hilbert_null);
 
             int16 new_tier = Min(d_tier, s->tier);
             if (new_tier != d_tier) {
@@ -467,8 +472,7 @@ static uint64 enrich_partition_rows(Oid partOid, Oid pkOid, Oid idtype, bool pat
             }
             new_slot->tts_values[a_tier - 1] = Int16GetDatum(new_tier);
             new_slot->tts_isnull[a_tier - 1] = false;
-            void *mask_val = lp_pg_mask_sql(merged_mask);
-            new_slot->tts_values[a_mask - 1] = PointerGetDatum(mask_val);
+            new_slot->tts_values[a_mask - 1] = lp_pg_mask_sql(merged_mask);
             new_slot->tts_isnull[a_mask - 1] = false;
             if (path_changed) {
                 new_slot->tts_values[a_carrier - 1] = new_path;
@@ -483,7 +487,6 @@ static uint64 enrich_partition_rows(Oid partOid, Oid pkOid, Oid idtype, bool pat
                                                true, &tmfd, &lockmode, &update_indexes);
             if (res == TM_Updated) {
                 ExecClearTuple(new_slot);
-                pfree(mask_val);
                 if (IsolationUsesXactSnapshot())
                     ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                                     errmsg("could not serialize access due to concurrent update")));
@@ -503,7 +506,6 @@ static uint64 enrich_partition_rows(Oid partOid, Oid pkOid, Oid idtype, bool pat
                 }
             }
             ExecClearTuple(new_slot);
-            pfree(mask_val);
         }
         ExecClearTuple(old_slot);
     }
@@ -619,7 +621,7 @@ Datum laplace_enrich_stage(PG_FUNCTION_ARGS)
 
     AttrNumber a_tier = get_attnum(input, "tier");
     AttrNumber a_mask = get_attnum(input, "mask");
-    AttrNumber a_hilbert = get_attnum(input, "hilbert");
+    AttrNumber a_hilbert = paths ? InvalidAttrNumber : get_attnum(input, "hilbert");
     AttrNumber a_carrier = get_attnum(input, paths ? "path" : "coord");
     if (a_tier == InvalidAttrNumber || a_mask == InvalidAttrNumber)
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace_enrich_stage: stage table missing tier/mask")));
@@ -1124,8 +1126,7 @@ static bool stage_load_and_validate(Relation stage_e, Relation stage_p, Oid ent_
                ea_coord = get_attnum(e_oid, "coord"), ea_hilb = get_attnum(e_oid, "hilbert"),
                ea_mask = get_attnum(e_oid, "mask");
     AttrNumber pa_id = get_attnum(p_oid, "entity"), pa_tier = get_attnum(p_oid, "tier"),
-               pa_path = get_attnum(p_oid, "path"), pa_hilb = get_attnum(p_oid, "hilbert"),
-               pa_mask = get_attnum(p_oid, "mask");
+               pa_path = get_attnum(p_oid, "path"), pa_mask = get_attnum(p_oid, "mask");
     const lp_highway *hw = lp_pg_highway();
     Snapshot snap = GetActiveSnapshot();
     lp_idmap *pairs = lp_idmap_sized(sizeof(MergePair));
@@ -1181,11 +1182,10 @@ static bool stage_load_and_validate(Relation stage_e, Relation stage_p, Oid ent_
         TupleTableSlot *pslot = table_slot_create(stage_p, NULL);
         while (!invalid && table_scan_getnextslot(ps, ForwardScanDirection, pslot)) {
             CHECK_FOR_INTERRUPTS();
-            bool ni = false, nt = false, nc = false, nh = false, nm = false, np = false;
+            bool ni = false, nt = false, nc = false, nm = false, np = false;
             Datum di = slot_getattr(pslot, pa_id, &ni);
             Datum dt = slot_getattr(pslot, pa_tier, &nt);
             Datum dc = slot_getattr(pslot, pa_path, &nc);
-            Datum dh = slot_getattr(pslot, pa_hilb, &nh);
             Datum dm = slot_getattr(pslot, pa_mask, &nm);
             bool pres = false;
             if (use_pres) {
@@ -1195,12 +1195,12 @@ static bool stage_load_and_validate(Relation stage_e, Relation stage_p, Oid ent_
             int16 tier = nt ? -1 : DatumGetInt16(dt);
             lp_mask mask = nm ? 0 : lp_pg_mask_native(dm), dummy;
             if (ni || nt || nm || tier < 1 || tier > 255 || !lp_mask_merge(hw, mask, 0, &dummy) ||
-                (!pres && (nc || nh))) {
+                (!pres && nc)) {
                 invalid = true; ExecClearTuple(pslot); break;
             }
             MergeRow row = {
-                .tier = tier, .mask = mask, .hilbert = nh ? 0 : DatumGetInt64(dh),
-                .hilbert_null = nh, .carrier_null = nc, .present = pres
+                .tier = tier, .mask = mask, .hilbert = 0,
+                .hilbert_null = true, .carrier_null = nc, .present = pres
             };
             memcpy(row.id.b, DatumGetPointer(di), sizeof(lp_id));
             if (!nc) {
@@ -1214,6 +1214,7 @@ static bool stage_load_and_validate(Relation stage_e, Relation stage_p, Oid ent_
             if (found < 0) { invalid = true; ExecClearTuple(pslot); break; }
             MergePair *pair = lp_idmap_at(pairs, (size_t)found);
             if (pair->p_idx >= 0) { invalid = true; ExecClearTuple(pslot); break; }
+            row.hilbert = erows->v[pair->e_idx].hilbert;
             pair->p_idx = (int)prows->n;
             lp_push(prows, row);
             ExecClearTuple(pslot);
@@ -1269,7 +1270,7 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
         AttrNumber a_id = get_attnum(partOid, is_paths ? "entity" : "id");
         AttrNumber a_tier = get_attnum(partOid, "tier");
         AttrNumber a_carrier = get_attnum(partOid, is_paths ? "path" : "coord");
-        AttrNumber a_hilb = get_attnum(partOid, "hilbert");
+        AttrNumber a_hilb = is_paths ? InvalidAttrNumber : get_attnum(partOid, "hilbert");
         AttrNumber a_mask = get_attnum(partOid, "mask");
         BulkInsertState bistate = GetBulkInsertState();
         bool part_inserted = false;
@@ -1278,7 +1279,6 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
             int natts = RelationGetDescr(part)->natts;
             int nslots = (int)Min((size_t)MERGE_MULTI_BATCH, end - begin);
             TupleTableSlot **slots = palloc(sizeof(TupleTableSlot *) * (size_t)nslots);
-            void **masks = palloc0(sizeof(void *) * (size_t)nslots);
             for (int k = 0; k < nslots; k++) slots[k] = table_slot_create(part, NULL);
 
             PG_TRY(); {
@@ -1293,9 +1293,8 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
                         s->tts_values[a_id - 1] = PointerGetDatum(&r->id);
                         s->tts_values[a_tier - 1] = Int16GetDatum(r->tier);
                         s->tts_values[a_carrier - 1] = r->carrier;
-                        s->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
-                        masks[k] = lp_pg_mask_sql(r->mask);
-                        s->tts_values[a_mask - 1] = PointerGetDatum(masks[k]);
+                        if (!is_paths) s->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
+                        s->tts_values[a_mask - 1] = lp_pg_mask_sql(r->mask);
                         ExecStoreVirtualTuple(s);
                     }
                     table_multi_insert(part, slots, nbatch, cid, 0, bistate);
@@ -1303,8 +1302,6 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
                         List *recheck = ExecInsertIndexTuples(rri, slots[k], estate, false, false, NULL, NIL, false);
                         list_free(recheck);
                         ExecClearTuple(slots[k]);
-                        pfree(masks[k]);
-                        masks[k] = NULL;
                     }
                     inserted += (uint64)nbatch;
                     part_inserted = true;
@@ -1312,11 +1309,7 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
                 }
                 if (part_inserted) table_finish_bulk_insert(part, 0);
             } PG_FINALLY(); {
-                for (int k = 0; k < nslots; k++) {
-                    if (masks[k]) pfree(masks[k]);
-                    ExecDropSingleTupleTableSlot(slots[k]);
-                }
-                pfree(masks);
+                for (int k = 0; k < nslots; k++) ExecDropSingleTupleTableSlot(slots[k]);
                 pfree(slots);
                 FreeBulkInsertState(bistate);
                 ExecCloseIndices(rri);
@@ -1336,9 +1329,8 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
                     slot->tts_values[a_id - 1] = PointerGetDatum(&r->id);
                     slot->tts_values[a_tier - 1] = Int16GetDatum(r->tier);
                     slot->tts_values[a_carrier - 1] = r->carrier;
-                    slot->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
-                    void *mask_val = lp_pg_mask_sql(r->mask);
-                    slot->tts_values[a_mask - 1] = PointerGetDatum(mask_val);
+                    if (!is_paths) slot->tts_values[a_hilb - 1] = Int64GetDatum(r->hilbert);
+                    slot->tts_values[a_mask - 1] = lp_pg_mask_sql(r->mask);
                     ExecStoreVirtualTuple(slot);
 
                     ItemPointerData conflictTid;
@@ -1367,7 +1359,6 @@ static uint64 merge_insert_table(Relation parent, const char *relname, bool is_p
                         }
                     }
                     ExecClearTuple(slot);
-                    pfree(mask_val);
                 }
                 if (part_inserted) table_finish_bulk_insert(part, 0);
             } PG_FINALLY(); {
@@ -1469,12 +1460,12 @@ Datum laplace_merge_stage(PG_FUNCTION_ARGS)
     Relation ent_parent = table_open(ent_oid, AccessShareLock);
     Relation path_parent = table_open(path_oid, AccessShareLock);
     const char *e_req_sel[] = {"id", "tier", "mask", "coord", "hilbert"};
-    const char *p_req_sel[] = {"entity", "tier", "mask", "path", "hilbert"};
+    const char *p_req_sel[] = {"entity", "tier", "mask", "path"};
     require_table_or_col_acl(ent_oid, ACL_SELECT, e_req_sel, 5);
     require_table_or_col_acl(ent_oid, ACL_INSERT, e_req_sel, 5);
     require_table_or_col_acl(ent_oid, ACL_UPDATE, (const char *[]){"tier", "mask"}, 2);
-    require_table_or_col_acl(path_oid, ACL_SELECT, p_req_sel, 5);
-    require_table_or_col_acl(path_oid, ACL_INSERT, p_req_sel, 5);
+    require_table_or_col_acl(path_oid, ACL_SELECT, p_req_sel, 4);
+    require_table_or_col_acl(path_oid, ACL_INSERT, p_req_sel, 4);
     require_table_or_col_acl(path_oid, ACL_UPDATE, (const char *[]){"tier", "mask", "path"}, 3);
 
     MemoryContext merge_ctx = AllocSetContextCreate(CurrentMemoryContext, "Native merge payload", ALLOCSET_DEFAULT_SIZES);
@@ -1683,14 +1674,13 @@ static void diag_entity_rec_cb(int64 ordinal, const lp_id *id, int16 tier, Datum
 
 static void diag_path_rec_cb(TupleTableSlot *slot, const PresenceKey *key, void *context)
 {
-    typedef struct { MemoryContext ctx; AttrNumber a_path, a_hilbert; lp_idmap *map; } Ctx;
+    typedef struct { MemoryContext ctx; AttrNumber a_path; lp_idmap *map; } Ctx;
     Ctx *c = context;
     int64 at = lp_idmap_find(c->map, &key->id);
     if (at < 0) return;
-    bool np = false, nh = false;
+    bool np = false;
     Datum dp = slot_getattr(slot, c->a_path, &np);
-    Datum dh = slot_getattr(slot, c->a_hilbert, &nh);
-    if (np || nh) ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace_merge_diagnostics: null canonical path carrier")));
+    if (np) ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace_merge_diagnostics: null canonical path carrier")));
     DiagRecEntry *e = lp_idmap_at(c->map, (size_t)at);
     MemoryContext old = MemoryContextSwitchTo(c->ctx);
     bytea *raw = (bytea *)PG_DETOAST_DATUM(dp);
@@ -1699,7 +1689,6 @@ static void diag_path_rec_cb(TupleTableSlot *slot, const PresenceKey *key, void 
     memcpy(cp, raw, sz);
     e->carrier = PointerGetDatum(cp);
     e->ewkb = lp_pg_path_ewkb(dp);
-    e->hilbert = DatumGetInt64(dh);
     e->found = true;
     MemoryContextSwitchTo(old);
 }
@@ -1725,11 +1714,11 @@ static void diag_scan_stage_rows(Relation rel, bool is_paths, MemoryContext ctx,
     AttrNumber a_id = get_attnum(relid, is_paths ? "entity" : "id");
     AttrNumber a_tier = get_attnum(relid, "tier");
     AttrNumber a_carrier = get_attnum(relid, is_paths ? "path" : "coord");
-    AttrNumber a_hilb = get_attnum(relid, "hilbert");
+    AttrNumber a_hilb = is_paths ? InvalidAttrNumber : get_attnum(relid, "hilbert");
     AttrNumber a_mask = get_attnum(relid, "mask");
     AttrNumber a_pres = get_attnum(relid, "present");
     if (a_id == InvalidAttrNumber || a_tier == InvalidAttrNumber ||
-        a_carrier == InvalidAttrNumber || a_hilb == InvalidAttrNumber || a_mask == InvalidAttrNumber)
+        a_carrier == InvalidAttrNumber || (!is_paths && a_hilb == InvalidAttrNumber) || a_mask == InvalidAttrNumber)
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_COLUMN), errmsg("laplace_merge_diagnostics: missing required stage column")));
     bool use_pres = (a_pres != InvalidAttrNumber && get_atttype(relid, a_pres) == BOOLOID);
 
@@ -1738,12 +1727,12 @@ static void diag_scan_stage_rows(Relation rel, bool is_paths, MemoryContext ctx,
     TupleTableSlot *slot = table_slot_create(rel, NULL);
     while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
         CHECK_FOR_INTERRUPTS();
-        bool ni = false, nt = false, nc = false, nh = false, nm = false, np = false;
+        bool ni = false, nt = false, nc = false, nh = true, nm = false, np = false;
         Datum di = slot_getattr(slot, a_id, &ni);
         if (ni) { ExecClearTuple(slot); continue; }
         Datum dt = slot_getattr(slot, a_tier, &nt);
         Datum dc = slot_getattr(slot, a_carrier, &nc);
-        Datum dh = slot_getattr(slot, a_hilb, &nh);
+        Datum dh = (!is_paths && a_hilb != InvalidAttrNumber) ? slot_getattr(slot, a_hilb, &nh) : (Datum)0;
         Datum dm = slot_getattr(slot, a_mask, &nm);
         bool pres = false;
         if (use_pres) {
@@ -1760,13 +1749,6 @@ static void diag_scan_stage_rows(Relation rel, bool is_paths, MemoryContext ctx,
             .carrier_null = nc, .present = pres
         };
         memcpy(row.id.b, DatumGetPointer(di), sizeof(lp_id));
-        if (!nm) {
-            bytea *mr = (bytea *)PG_DETOAST_DATUM(dm);
-            Size msz = VARSIZE_ANY(mr);
-            bytea *mcp = palloc(msz);
-            memcpy(mcp, mr, msz);
-            row.mask_datum = PointerGetDatum(mcp);
-        }
         if (!nc) {
             bytea *raw = (bytea *)PG_DETOAST_DATUM(dc);
             Size sz = VARSIZE_ANY(raw);
@@ -1811,14 +1793,14 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
                         errmsg("laplace_merge_diagnostics requires distinct UNLOGGED stage input tables")));
     }
     require_table_or_col_acl(e_oid, ACL_SELECT, (const char *[]){"id", "tier", "coord", "hilbert", "mask"}, 5);
-    require_table_or_col_acl(p_oid, ACL_SELECT, (const char *[]){"entity", "tier", "path", "hilbert", "mask"}, 5);
+    require_table_or_col_acl(p_oid, ACL_SELECT, (const char *[]){"entity", "tier", "path", "mask"}, 4);
 
     Oid ent_oid = lp_pg_relation("entity"), path_oid = lp_pg_relation("physicality");
     const char *e_cols[] = {"id", "tier", "coord", "hilbert"};
-    const char *p_cols[] = {"entity", "path", "hilbert"};
+    const char *p_cols[] = {"entity", "path"};
     const char *e_pk_col = NULL, *p_pk_col = NULL;
     Relation ent_parent = lp_pg_read_parent(ent_oid, &e_pk_col, e_cols, 4);
-    Relation path_parent = lp_pg_read_parent(path_oid, &p_pk_col, p_cols, 3);
+    Relation path_parent = lp_pg_read_parent(path_oid, &p_pk_col, p_cols, 2);
 
     MemoryContext diag_ctx = AllocSetContextCreate(CurrentMemoryContext, "Native merge diagnostics", ALLOCSET_DEFAULT_SIZES);
     DiagStageRowVec erows = {0}, prows = {0};
@@ -1854,7 +1836,7 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
             const DiagStageRow *r = &erows.v[i];
             lp_mask dummy = 0;
             if (r->tier_null || r->mask_null || r->tier < 1 || r->tier > 255 || !lp_mask_merge(hw, r->mask, 0, &dummy)) {
-                char *ms = r->mask_null ? "NULL" : DatumGetCString(DirectFunctionCall1(bit_out, r->mask_datum));
+                char *ms = r->mask_null ? "NULL" : psprintf("0x%016llx", (unsigned long long)r->mask);
                 char *ts = r->tier_null ? "NULL" : psprintf("%d", (int)r->tier);
                 lp_push(&hits, ((DiagHit){.reason = "invalid entity carrier/tier", .id = r->id, .detail = psprintf("tier=%s mask=%s", ts, ms)}));
             }
@@ -1864,7 +1846,7 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
             const DiagStageRow *r = &prows.v[i];
             lp_mask dummy = 0;
             if (r->tier_null || r->mask_null || r->tier < 1 || r->tier > 255 || !lp_mask_merge(hw, r->mask, 0, &dummy)) {
-                char *ms = r->mask_null ? "NULL" : DatumGetCString(DirectFunctionCall1(bit_out, r->mask_datum));
+                char *ms = r->mask_null ? "NULL" : psprintf("0x%016llx", (unsigned long long)r->mask);
                 char *ts = r->tier_null ? "NULL" : psprintf("%d", (int)r->tier);
                 lp_push(&hits, ((DiagHit){.reason = "invalid path carrier/tier", .id = r->id, .detail = psprintf("tier=%s mask=%s", ts, ms)}));
             }
@@ -1919,7 +1901,7 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
 
         /* Collect canonical physicality lookup IDs for checks 6 & 7 */
         for (size_t i = 0; i < prows.n; i++) {
-            if (!prows.v[i].carrier_null || !prows.v[i].hilbert_null) {
+            if (!prows.v[i].carrier_null) {
                 bool fresh = false;
                 size_t at = lp_idmap_put(prec_map, &prows.v[i].id, &fresh);
                 if (fresh) { ((DiagRecEntry *)lp_idmap_at(prec_map, at))->id = prows.v[i].id; }
@@ -1939,8 +1921,8 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
                 const DiagRecEntry *re = lp_idmap_at(prec_map, i);
                 pkeys[i] = (PresenceKey){.id = re->id, .ordinal = (int64)i + 1};
             }
-            struct { MemoryContext ctx; AttrNumber a_path, a_hilbert; lp_idmap *map; } pctx = {
-                diag_ctx, get_attnum(path_oid, "path"), get_attnum(path_oid, "hilbert"), prec_map
+            struct { MemoryContext ctx; AttrNumber a_path; lp_idmap *map; } pctx = {
+                diag_ctx, get_attnum(path_oid, "path"), prec_map
             };
             lp_pg_indexed_keys(path_parent, p_pk_col, pkeys, np_probe, diag_path_rec_cb, &pctx);
             pfree(pkeys);
@@ -1949,39 +1931,29 @@ Datum laplace_merge_diagnostics(PG_FUNCTION_ARGS)
         /* 6. path identity conflict */
         for (size_t i = 0; i < prows.n; i++) {
             const DiagStageRow *s = &prows.v[i];
-            if (s->carrier_null && s->hilbert_null) continue;
+            if (s->carrier_null) continue;
             int64 at = lp_idmap_find(prec_map, &s->id);
             if (at < 0) continue;
             const DiagRecEntry *d = lp_idmap_at(prec_map, (size_t)at);
             if (!d->found) continue;
             bool ewkb_eq = false, enriched = false;
-            bytea *sewkb = NULL;
-            if (!s->carrier_null) {
-                sewkb = lp_pg_path_ewkb(s->carrier);
-                ewkb_eq = (VARSIZE_ANY_EXHDR(sewkb) == VARSIZE_ANY_EXHDR(d->ewkb) &&
-                           memcmp(VARDATA_ANY(sewkb), VARDATA_ANY(d->ewkb), (size_t)VARSIZE_ANY_EXHDR(sewkb)) == 0);
-                if (!ewkb_eq) enriched = (lp_pg_path_enrich_datum(d->carrier, s->carrier) != (Datum)0);
-            }
-            bool hilb_eq = (!s->hilbert_null && s->hilbert == d->hilbert);
-            bool conflict = (!s->carrier_null && !ewkb_eq && !enriched) || (!s->hilbert_null && !hilb_eq);
+            bytea *sewkb = lp_pg_path_ewkb(s->carrier);
+            ewkb_eq = (VARSIZE_ANY_EXHDR(sewkb) == VARSIZE_ANY_EXHDR(d->ewkb) &&
+                       memcmp(VARDATA_ANY(sewkb), VARDATA_ANY(d->ewkb), (size_t)VARSIZE_ANY_EXHDR(sewkb)) == 0);
+            if (!ewkb_eq) enriched = (lp_pg_path_enrich_datum(d->carrier, s->carrier) != (Datum)0);
+            bool conflict = !ewkb_eq && !enriched;
             if (conflict) {
                 int snv = 0, rnv = 0;
-                bool ids_eq = false;
-                if (sewkb) {
-                    lp_id *sk = lp_pg_path_keys(sewkb, &snv);
-                    lp_id *rk = lp_pg_path_keys(d->ewkb, &rnv);
-                    ids_eq = (snv == rnv && memcmp(sk, rk, (size_t)snv * sizeof(lp_id)) == 0);
-                } else {
-                    (void)lp_pg_path_keys(d->ewkb, &rnv);
-                }
-                const char *ie_str = s->carrier_null ? "null" : (ids_eq ? "t" : "f");
-                const char *he_str = s->hilbert_null ? "null" : (hilb_eq ? "t" : "f");
-                char *sprefix = sewkb ? diag_hex_prefix(sewkb, 160) : "NULL";
+                lp_id *sk = lp_pg_path_keys(sewkb, &snv);
+                lp_id *rk = lp_pg_path_keys(d->ewkb, &rnv);
+                bool ids_eq = (snv == rnv && memcmp(sk, rk, (size_t)snv * sizeof(lp_id)) == 0);
+                const char *ie_str = ids_eq ? "t" : "f";
+                char *sprefix = diag_hex_prefix(sewkb, 160);
                 char *rprefix = diag_hex_prefix(d->ewkb, 160);
                 lp_push(&hits, ((DiagHit){
                     .reason = "path identity conflict", .id = s->id,
-                    .detail = psprintf("ids_equal=%s hilbert_equal=%s staged_vertices=%d recorded_vertices=%d staged_prefix=%s recorded_prefix=%s",
-                                       ie_str, he_str, snv, rnv, sprefix, rprefix)
+                    .detail = psprintf("ids_equal=%s staged_vertices=%d recorded_vertices=%d staged_prefix=%s recorded_prefix=%s",
+                                       ie_str, snv, rnv, sprefix, rprefix)
                 }));
             }
         }

@@ -16,8 +16,8 @@ CROSS JOIN LATERAL (SELECT array_agg(pg_temp.leaf(cp) ORDER BY ordinal) ids
  FROM unnest(codepoints) WITH ORDINALITY u(cp,ordinal)) p;
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT id,laplace_tier(label),laplace_coord(label),laplace_hilbert(label) FROM selected_claim_fixture;
-INSERT INTO physicality(entity,tier,hilbert,path,mask)
-SELECT f.id,e.tier,e.hilbert,laplace_path(ids),laplace_mask_slot('kind','claim')
+INSERT INTO physicality(entity,tier,path,mask)
+SELECT f.id,e.tier,laplace_path(ids),laplace_mask_slot('kind','claim')
 FROM selected_claim_fixture f JOIN entity e ON e.id=f.id;
 -- An unscored claim exists but cannot consume a scored responder's place.
 INSERT INTO consensus SELECT id,1550,60,0.06,5000000001 FROM selected_claim_fixture WHERE label<>'af';

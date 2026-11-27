@@ -15,8 +15,8 @@ CREATE FUNCTION pg_temp.place(ids blake3[], t smallint) RETURNS void LANGUAGE sq
 $$;
 CREATE FUNCTION pg_temp.hold(id blake3, parts blake3[], t smallint, claim boolean DEFAULT false) RETURNS void LANGUAGE sql AS $$
  SELECT pg_temp.place(ARRAY[id],t);
- INSERT INTO physicality(entity,tier,hilbert,path,mask)
- SELECT id,t,e.hilbert,laplace_path(parts),CASE WHEN claim THEN laplace_mask_slot('kind','claim') ELSE B'0'::bit(64) END
+ INSERT INTO physicality(entity,tier,path,mask)
+ SELECT id,t,laplace_path(parts),CASE WHEN claim THEN laplace_mask_slot('kind','claim') ELSE 0::bigint END
  FROM entity e WHERE e.id=hold.id
 $$;
 

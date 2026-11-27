@@ -13,21 +13,21 @@ RETURN pg_catalog.md5('Laplace check regression schema leaf '||n)::public.blake3
 INSERT INTO public.entity(id,tier,coord,hilbert)
 SELECT public.laplace_id('lpcheckschema'),public.laplace_tier('lpcheckschema'),
        public.laplace_coord('lpcheckschema'),public.laplace_hilbert('lpcheckschema');
-INSERT INTO public.physicality(entity,tier,hilbert,path)
-SELECT id,tier,hilbert,public.laplace_path(ARRAY(
+INSERT INTO public.physicality(entity,tier,path)
+SELECT id,tier,public.laplace_path(ARRAY(
   SELECT public.laplace_cp_id(ascii(c)) FROM regexp_split_to_table('lpcheckschema','') c))
 FROM public.entity WHERE id=public.laplace_id('lpcheckschema');
 INSERT INTO public.entity(id,tier,coord,hilbert)
 SELECT public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)]),1,
        public.laplace_coord('ab'),public.laplace_hilbert('ab');
-INSERT INTO public.physicality(entity,tier,hilbert,path)
-SELECT id,tier,hilbert,public.laplace_path(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)])
+INSERT INTO public.physicality(entity,tier,path)
+SELECT id,tier,public.laplace_path(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)])
 FROM public.entity WHERE id=public.laplace_compose(ARRAY[pg_temp.leaf(1),pg_temp.leaf(2)]);
 INSERT INTO public.entity(id,tier,coord,hilbert)
 SELECT public.laplace_compose(ARRAY[e.id,public.laplace_cp_id(98)]),e.tier+1,e.coord,e.hilbert
 FROM public.entity e WHERE e.id=public.laplace_id('lpcheckschema');
-INSERT INTO public.physicality(entity,tier,hilbert,path)
-SELECT public.laplace_compose(ARRAY[e.id,public.laplace_cp_id(98)]),e.tier+1,e.hilbert,
+INSERT INTO public.physicality(entity,tier,path)
+SELECT public.laplace_compose(ARRAY[e.id,public.laplace_cp_id(98)]),e.tier+1,
        public.laplace_path(ARRAY[e.id,public.laplace_cp_id(98)])
 FROM public.entity e WHERE e.id=public.laplace_id('lpcheckschema');
 SET LOCAL search_path=pg_catalog,pg_temp;

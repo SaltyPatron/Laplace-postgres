@@ -17,13 +17,13 @@ WITH RECURSIVE chain(depth,id,coord,path) AS (
   pg_temp.pair_coord(coord,ST_GeomFromEWKB(laplace_cp_coord_ewkb(66))),
   laplace_path(ARRAY[id,laplace_cp_id(66)]) FROM chain WHERE depth<4096
 )
-SELECT *,laplace_hilbert4(coord) # '-9223372036854775808'::bigint hilbert FROM chain WHERE depth>0;
+SELECT *,laplace_hilbert4(coord) hilbert FROM chain WHERE depth>0;
 -- The database is shared and the transaction is rolled back. The first
 -- link, AB, is canonical content a source may already hold: a stored row with
 -- the same identity has the same constituents, so it is kept as it is.
 INSERT INTO entity(id,tier,coord,hilbert) SELECT id,depth::smallint,coord,hilbert FROM deep_expected
 ON CONFLICT DO NOTHING;
-INSERT INTO physicality(entity,tier,hilbert,path) SELECT id,depth::smallint,hilbert,path FROM deep_expected
+INSERT INTO physicality(entity,tier,path) SELECT id,depth::smallint,path FROM deep_expected
 ON CONFLICT DO NOTHING;
 SET LOCAL max_stack_depth='100kB';
 DO $$ DECLARE root blake3; expected text:='A'||repeat('B',4096); BEGIN

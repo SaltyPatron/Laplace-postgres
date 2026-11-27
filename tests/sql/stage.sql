@@ -14,8 +14,8 @@ CREATE FUNCTION pg_temp.fill_stage() RETURNS void LANGUAGE SQL AS $$
   INSERT INTO stage.check_merge_entities (id, tier, coord, hilbert)
     SELECT laplace_id(t), laplace_tier(t), laplace_coord(t), laplace_hilbert(t)
     FROM unnest(ARRAY['lpcheckstagedog','lpcheckstagecat','lpcheckstageant']) t;
-  INSERT INTO stage.check_merge_paths (entity, tier, hilbert, path)
-    SELECT laplace_id(t), laplace_tier(t), laplace_hilbert(t),
+  INSERT INTO stage.check_merge_paths (entity, tier, path)
+    SELECT laplace_id(t), laplace_tier(t),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(t, '') c))
     FROM unnest(ARRAY['lpcheckstagedog','lpcheckstagecat','lpcheckstageant']) t;
 $$;
@@ -94,8 +94,8 @@ BEGIN
   INSERT INTO public.entity (id,tier,coord,hilbert)
     SELECT laplace_id(t),laplace_tier(t),laplace_coord(t),laplace_hilbert(t)
     FROM unnest(ARRAY[touched,unrelated]) t;
-  INSERT INTO public.physicality (entity,tier,hilbert,path)
-    SELECT laplace_id(t),laplace_tier(t),laplace_hilbert(t),
+  INSERT INTO public.physicality (entity,tier,path)
+    SELECT laplace_id(t),laplace_tier(t),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(t,'') c))
     FROM unnest(ARRAY[touched,unrelated]) t;
   IF (SELECT tableoid FROM public.physicality WHERE entity=laplace_id(touched))
@@ -197,10 +197,10 @@ END $$;
 -- Existing content needs no coordinate/Hilbert retransmission. A metadata-only
 -- update keeps the recorded path while adding a genuinely new carrier role.
 ALTER TABLE stage.check_merge_entities ALTER coord DROP NOT NULL,ALTER hilbert DROP NOT NULL;
-ALTER TABLE stage.check_merge_paths ALTER path DROP NOT NULL,ALTER hilbert DROP NOT NULL;
+ALTER TABLE stage.check_merge_paths ALTER path DROP NOT NULL;
 DO $$ BEGIN PERFORM pg_temp.fill_stage(); END $$;
 UPDATE stage.check_merge_entities SET coord=NULL,hilbert=NULL;
-UPDATE stage.check_merge_paths SET path=NULL,hilbert=NULL,mask=laplace_mask_slot('kind','record');
+UPDATE stage.check_merge_paths SET path=NULL,mask=laplace_mask_slot('kind','record');
 DO $$ DECLARE result record; BEGIN
   SELECT * INTO result FROM laplace_merge_stage('stage.check_merge_entities','stage.check_merge_paths');
   IF result.entity_rows<>0 OR result.physicality_rows<>0 OR result.updated_rows<>3

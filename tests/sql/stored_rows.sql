@@ -12,8 +12,8 @@ RETURN md5('Laplace check regression stored_rows leaf '||n)::blake3;
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT laplace_compose(ARRAY[pg_temp.leaf(97),pg_temp.leaf(98),pg_temp.leaf(98)]),laplace_tier('abb'),
        laplace_coord('abb'),laplace_hilbert('abb');
-INSERT INTO physicality(entity,tier,hilbert,path)
-SELECT id,tier,hilbert,laplace_path(ARRAY[pg_temp.leaf(97),pg_temp.leaf(98),pg_temp.leaf(98)])
+INSERT INTO physicality(entity,tier,path)
+SELECT id,tier,laplace_path(ARRAY[pg_temp.leaf(97),pg_temp.leaf(98),pg_temp.leaf(98)])
 FROM entity WHERE id=laplace_compose(ARRAY[pg_temp.leaf(97),pg_temp.leaf(98),pg_temp.leaf(98)]);
 DO $$
 DECLARE known blake3:=laplace_compose(ARRAY[pg_temp.leaf(97),pg_temp.leaf(98),pg_temp.leaf(98)]);
@@ -34,7 +34,7 @@ BEGIN
            WHERE r.tier<>e.tier OR r.hilbert<>e.hilbert OR r.mask<>e.mask
               OR ST_AsEWKB(r.coord)<>ST_AsEWKB(e.coord))
  OR EXISTS(SELECT FROM laplace_physicalities(requested) r JOIN physicality p ON p.entity=r.entity
-           WHERE r.tier<>p.tier OR r.hilbert<>p.hilbert OR r.mask<>p.mask
+           WHERE r.tier<>p.tier OR r.mask<>p.mask
               OR ST_AsEWKB(r.path)<>ST_AsEWKB(p.path)) THEN
   RAISE EXCEPTION 'stored-row carrier differs from PostgreSQL';
  END IF;
@@ -64,7 +64,7 @@ BEGIN
  EXECUTE format('CREATE ROLE %I',reader);
  EXECUTE format('GRANT USAGE ON SCHEMA public TO %I',reader);
  EXECUTE format('GRANT SELECT(id,tier,coord,hilbert,mask) ON entity TO %I',reader);
- EXECUTE format('GRANT SELECT(entity,tier,hilbert,path,mask) ON physicality TO %I',reader);
+ EXECUTE format('GRANT SELECT(entity,tier,path,mask) ON physicality TO %I',reader);
  EXECUTE format('SET LOCAL ROLE %I',reader);
  IF (SELECT count(*) FROM laplace_entities(ARRAY[known]))<>1
  OR (SELECT count(*) FROM laplace_physicalities(ARRAY[known]))<>1
@@ -106,8 +106,8 @@ FROM wide_container CROSS JOIN LATERAL (
  SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(ST_GeomFromEWKB(laplace_cp_coord_ewkb(i)))) coord
  FROM generate_series(10000,11999) i
 ) c;
-INSERT INTO physicality(entity,tier,hilbert,path)
-SELECT laplace_compose(w.ids),e.tier,e.hilbert,laplace_path(w.ids)
+INSERT INTO physicality(entity,tier,path)
+SELECT laplace_compose(w.ids),e.tier,laplace_path(w.ids)
 FROM wide_container w JOIN entity e ON e.id=laplace_compose(w.ids);
 DO $$ DECLARE ids blake3[]:=(SELECT w.ids FROM wide_container w); BEGIN
  IF (SELECT count(*) FROM laplace_containers(ids,'{}'::smallint[]))<>1

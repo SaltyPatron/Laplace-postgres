@@ -4,7 +4,7 @@
 SET client_min_messages = warning;
 BEGIN;
 
-CREATE FUNCTION pg_temp.put_node(parts blake3[], metadata bigint[] DEFAULT NULL, carrier bit(64) DEFAULT B'0'::bit(64)) RETURNS blake3
+CREATE FUNCTION pg_temp.put_node(parts blake3[], metadata bigint[] DEFAULT NULL, carrier bigint DEFAULT 0) RETURNS blake3
 LANGUAGE plpgsql AS $$
 DECLARE
   composed blake3 := laplace_compose(parts);
@@ -20,7 +20,7 @@ BEGIN
          (max(coalesce(e.tier, 0)) + 1)::smallint
     INTO coord, altitude
     FROM unnest(parts) p LEFT JOIN entity e ON e.id = p;
-  hilbert := laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
+  hilbert := laplace_hilbert4(coord);
   IF metadata IS NOT NULL THEN
     IF cardinality(metadata) <> ST_NPoints(path) THEN
       RAISE EXCEPTION 'metadata length mismatch';
@@ -32,8 +32,8 @@ BEGIN
   END IF;
   INSERT INTO entity (id, tier, coord, hilbert, mask)
     VALUES (composed, altitude, coord, hilbert, carrier) ON CONFLICT DO NOTHING;
-  INSERT INTO physicality (entity, tier, hilbert, path, mask)
-    VALUES (composed, altitude, hilbert, path, carrier) ON CONFLICT DO NOTHING;
+  INSERT INTO physicality (entity, tier, path, mask)
+    VALUES (composed, altitude, path, carrier) ON CONFLICT DO NOTHING;
   RETURN composed;
 END $$;
 
@@ -94,7 +94,7 @@ DECLARE
   lc_good double precision;
   lc_iso double precision;
   claim_id blake3;
-  c_mask bit(64) := laplace_mask_slot('kind', 'claim');
+  c_mask bigint := laplace_mask_slot('kind', 'claim');
   m_loss bigint := (2::bigint << 33) | (2::bigint << 30) | 1;
   t_a blake3;
   t_b blake3;

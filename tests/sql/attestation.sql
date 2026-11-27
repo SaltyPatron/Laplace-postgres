@@ -19,13 +19,13 @@ CREATE UNLOGGED TABLE stage.attestation_test (
 CREATE TEMP TABLE series_words AS SELECT unnest(ARRAY['lpcheckxdog','lpcheckxis','lpcheckxnoun','lpcheckxsource','lpcheckxfile','lpcheckxone','lpcheckxtwo','lpcheckxthree']) AS content;
 INSERT INTO entity (id, tier, coord, hilbert)
   SELECT laplace_id(content), laplace_tier(content), laplace_coord(content), laplace_hilbert(content) FROM series_words;
-INSERT INTO physicality (entity, tier, hilbert, path)
-  SELECT laplace_id(content), laplace_tier(content), laplace_hilbert(content),
+INSERT INTO physicality (entity, tier, path)
+  SELECT laplace_id(content), laplace_tier(content),
     laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(content, '') c)) FROM series_words;
 CREATE FUNCTION pg_temp.series_node(parts blake3[], kind text DEFAULT NULL, metadata bigint[] DEFAULT NULL) RETURNS blake3
 LANGUAGE plpgsql AS $$
 DECLARE composed blake3 := laplace_compose(parts); point geometry; path geometry := laplace_path(parts);
-        coord geometry; altitude smallint; hilbert bigint; carrier bit(64) := B'0'::bit(64); i integer;
+        coord geometry; altitude smallint; hilbert bigint; carrier bigint := 0; i integer;
 BEGIN
   -- A check leaf (pg_temp.leaf) is neither stored nor a codepoint; it takes
   -- a fixed scalar coordinate, as any absent atom must have some placement.
@@ -34,7 +34,7 @@ BEGIN
                     laplace_coord('lpcheckxleaf')))),
          (max(coalesce(e.tier,0)) + 1)::smallint
     INTO coord, altitude FROM unnest(parts) p LEFT JOIN entity e ON e.id = p;
-  hilbert := laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
+  hilbert := laplace_hilbert4(coord);
   IF kind IS NOT NULL THEN carrier := laplace_mask_slot('kind', kind); END IF;
   IF metadata IS NOT NULL THEN
     IF cardinality(metadata) <> ST_NPoints(path) THEN RAISE EXCEPTION 'fixture metadata does not match RLE vertices'; END IF;
@@ -44,7 +44,7 @@ BEGIN
     END LOOP;
   END IF;
   INSERT INTO entity (id, tier, coord, hilbert, mask) VALUES (composed, altitude, coord, hilbert, carrier) ON CONFLICT DO NOTHING;
-  INSERT INTO physicality (entity, tier, hilbert, path, mask) VALUES (composed, altitude, hilbert, path, carrier) ON CONFLICT DO NOTHING;
+  INSERT INTO physicality (entity, tier, path, mask) VALUES (composed, altitude, path, carrier) ON CONFLICT DO NOTHING;
   RETURN composed;
 END $$;
 SAVEPOINT native_batch_realization;
@@ -697,8 +697,8 @@ BEGIN
   INSERT INTO entity (id,tier,coord,hilbert) VALUES
     (cls,laplace_tier('DerivedCalculation'),laplace_coord('DerivedCalculation'),laplace_hilbert('DerivedCalculation'))
     ON CONFLICT DO NOTHING; -- the registry class may already be stored by real sources
-  INSERT INTO physicality (entity,tier,hilbert,path) VALUES
-    (cls,laplace_tier('DerivedCalculation'),laplace_hilbert('DerivedCalculation'),
+  INSERT INTO physicality (entity,tier,path) VALUES
+    (cls,laplace_tier('DerivedCalculation'),
      laplace_path(ARRAY(SELECT laplace_cp_id(ascii(ch)) FROM regexp_split_to_table('DerivedCalculation','') ch)))
     ON CONFLICT DO NOTHING;
   c := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')],'claim');
@@ -977,12 +977,12 @@ BEGIN
     (cl_w2, 2::smallint, 'scopedcltwo')
   ) v(id, t, lbl);
 
-  INSERT INTO physicality(entity,tier,hilbert,path,mask)
-  SELECT e.id, e.tier, e.hilbert, p.path, p.mask
+  INSERT INTO physicality(entity,tier,path,mask)
+  SELECT e.id, e.tier, p.path, p.mask
   FROM (VALUES
-    (obs_w1, laplace_path(ARRAY[w_prefix, w_shared, w_next1]), B'0'::bit(64)),
-    (obs_w2, laplace_path(ARRAY[w_prefix, w_shared, w_next2]), B'0'::bit(64)),
-    (doc_w1, laplace_path(ARRAY[obs_w1, w_extra]), B'0'::bit(64)),
+    (obs_w1, laplace_path(ARRAY[w_prefix, w_shared, w_next1]), 0::bigint),
+    (obs_w2, laplace_path(ARRAY[w_prefix, w_shared, w_next2]), 0::bigint),
+    (doc_w1, laplace_path(ARRAY[obs_w1, w_extra]), 0::bigint),
     (cl_both, laplace_path(ARRAY[w_shared, rel, w_next1]), laplace_mask_slot('kind','claim')),
     (cl_w2, laplace_path(ARRAY[w_shared, rel, w_next2]), laplace_mask_slot('kind','claim'))
   ) p(id, path, mask)

@@ -6,16 +6,16 @@ BEGIN;
 
 DO $$
 DECLARE
-  noun bit(64) := laplace_mask_slot('upos', 'NOUN');
-  number bit(64) := laplace_mask_slot('upos', 'NUM');
-  animal bit(64) := laplace_mask_slot('lexfile', 'noun.animal');
-  subject bit(64) := laplace_mask_slot('deprel', 'nsubj');
-  agent bit(64) := laplace_mask_slot('vnrole', 'Agent');
-  claim bit(64) := laplace_mask_slot('kind', 'claim');
-  record bit(64) := laplace_mask_slot('kind', 'record');
-  combined bit(64);
+  noun bigint := laplace_mask_slot('upos', 'NOUN');
+  number bigint := laplace_mask_slot('upos', 'NUM');
+  animal bigint := laplace_mask_slot('lexfile', 'noun.animal');
+  subject bigint := laplace_mask_slot('deprel', 'nsubj');
+  agent bigint := laplace_mask_slot('vnrole', 'Agent');
+  claim bigint := laplace_mask_slot('kind', 'claim');
+  record bigint := laplace_mask_slot('kind', 'record');
+  combined bigint;
 BEGIN
-  IF bit_length(noun) <> 64 OR octet_length(noun) <> 8 THEN RAISE EXCEPTION 'not a 64-bit carrier'; END IF;
+  IF pg_column_size(noun) <> 8 THEN RAISE EXCEPTION 'not a fixed 8-byte carrier'; END IF;
   combined := laplace_mask_merge(laplace_mask_merge(noun, animal), laplace_mask_merge(subject, agent));
   combined := laplace_mask_merge(combined, claim);
   IF NOT laplace_mask_valid(combined)
@@ -47,23 +47,18 @@ BEGIN
     RAISE EXCEPTION 'field filtering or compatible OR merge failed';
   END IF;
   IF laplace_mask_slot('upos', 'not_a_part_of_speech') IS NOT NULL
-     OR laplace_mask_value(B'0'::bit(64), 'upos') <> -1
-     OR NOT laplace_mask_has_all(B'0'::bit(64), '{}'::smallint[])
-     OR laplace_mask_has_any(B'0'::bit(64), '{}'::smallint[])
+     OR laplace_mask_value(0::bigint, 'upos') <> -1
+     OR NOT laplace_mask_has_all(0::bigint, '{}'::smallint[])
+     OR laplace_mask_has_any(0::bigint, '{}'::smallint[])
      OR laplace_mask_has(claim, (-1)::smallint)
      OR laplace_mask_has(claim, 64::smallint)
-     OR NOT laplace_mask_has(set_bit(B'0'::bit(64), 63, 1), 63::smallint) THEN
+     OR NOT laplace_mask_has('-9223372036854775808'::bigint, 63::smallint) THEN
     RAISE EXCEPTION 'missing values, empty queries, or bit 63 failed';
   END IF;
   BEGIN
     PERFORM laplace_mask_merge(noun, number);
     RAISE EXCEPTION 'a conflicting enum was silently ORed into a third value';
   EXCEPTION WHEN data_exception THEN NULL;
-  END;
-  BEGIN
-    PERFORM laplace_mask_has(B'1', 0::smallint);
-    RAISE EXCEPTION 'a non-64-bit carrier was accepted';
-  EXCEPTION WHEN invalid_parameter_value THEN NULL;
   END;
   BEGIN
     PERFORM laplace_mask_has_all(claim, ARRAY[NULL]::smallint[]);
@@ -83,16 +78,16 @@ CREATE UNLOGGED TABLE stage.check_mask_physicality (LIKE public.physicality INCL
 DO $$ BEGIN
   INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
   VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('upos', 'NOUN'));
-  INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
-  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
+  INSERT INTO stage.check_mask_physicality (entity, tier, path, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'),
           laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_mask_slot('kind', 'claim'));
   PERFORM laplace_merge_stage('stage.check_mask_entity', 'stage.check_mask_physicality');
 
   TRUNCATE stage.check_mask_entity, stage.check_mask_physicality;
   INSERT INTO stage.check_mask_entity (id, tier, coord, hilbert, mask)
   VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_coord('ab'), laplace_hilbert('ab'), laplace_mask_slot('lexfile', 'noun.animal'));
-  INSERT INTO stage.check_mask_physicality (entity, tier, hilbert, path, mask)
-  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'), laplace_hilbert('ab'),
+  INSERT INTO stage.check_mask_physicality (entity, tier, path, mask)
+  VALUES (laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]), laplace_tier('ab'),
           laplace_path(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]),
           laplace_mask_slot('kind', 'record') | laplace_mask_slot('deprel', 'nsubj'));
   PERFORM laplace_merge_stage('stage.check_mask_entity', 'stage.check_mask_physicality');

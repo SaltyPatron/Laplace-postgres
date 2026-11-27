@@ -6,7 +6,6 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/array.h"
-#include "utils/varbit.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "executor/tuptable.h"
@@ -25,9 +24,9 @@ const lp_layout *lp_pg_flags(void);
 const lp_highway *lp_pg_highway(void);
 /* The chess perf-cache laplace.chess names; required: an error rather than NULL when none is configured or there. */
 const lp_perfcache *lp_pg_chess(bool required);
-lp_mask lp_pg_mask_native(Datum mask);
+static inline lp_mask lp_pg_mask_native(Datum mask){ return (lp_mask)DatumGetInt64(mask); }
 lp_mask lp_pg_kind_mask(const char *role);
-VarBit *lp_pg_mask_sql(lp_mask value);
+static inline Datum lp_pg_mask_sql(lp_mask value){ return Int64GetDatum((int64)value); }
 bytea *lp_pg_path_export(Datum geometry);
 bytea *lp_pg_path_ewkb(Datum geometry);
 Datum lp_pg_geom_from_ewkb(const uint8 *ewkb, size_t len, int32 srid);

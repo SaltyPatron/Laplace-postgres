@@ -158,7 +158,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_holder_counts(ids @extschema@.bla
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_holders_with_standings(parts @extschema@.blake3[], required @extschema@.blake3[] DEFAULT '{}', per_part boolean DEFAULT false,
     floor smallint DEFAULT -1, cap bigint DEFAULT -1, kinds smallint DEFAULT 3, bits smallint[] DEFAULT NULL, endpoint smallint DEFAULT 0,
-    OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean,
+    OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bigint, OUT kind smallint, OUT hub boolean,
     OUT rating double precision, OUT deviation double precision, OUT volatility double precision, OUT matches bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_holders_with_standings';
@@ -180,7 +180,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_present_trunks(ids @extschema@.bl
     AS 'MODULE_PATHNAME', 'laplace_present_trunks';
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_library_page(after_id @extschema@.blake3 DEFAULT NULL, page_limit integer DEFAULT 64,
-    OUT entity @extschema@.blake3, OUT tier smallint, OUT path @extschema:postgis@.geometry, OUT mask bit) RETURNS SETOF record
+    OUT entity @extschema@.blake3, OUT tier smallint, OUT path @extschema:postgis@.geometry, OUT mask bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_library_page';
 
@@ -314,7 +314,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_holders_with_standings(parts @ext
     required @extschema@.blake3[], per_part boolean, floor smallint, cap bigint, kinds smallint,
     bits smallint[], endpoint smallint, witnesses @extschema@.blake3[],
     OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
-    OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean,
+    OUT tier smallint, OUT mask bigint, OUT kind smallint, OUT hub boolean,
     OUT rating double precision, OUT deviation double precision, OUT volatility double precision,
     OUT matches bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE

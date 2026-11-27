@@ -10,9 +10,9 @@ BEGIN
           ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(p)))))),
         (max(coalesce(e.tier,0))+1)::smallint INTO point,altitude
  FROM unnest(parts) p LEFT JOIN entity e ON e.id=p;
- h:=laplace_hilbert4(point) # '-9223372036854775808'::bigint;
+ h:=laplace_hilbert4(point);
  INSERT INTO entity(id,tier,coord,hilbert) VALUES(id,altitude,point,h) ON CONFLICT DO NOTHING;
- INSERT INTO physicality(entity,tier,hilbert,path) VALUES(id,altitude,h,laplace_path(parts)) ON CONFLICT DO NOTHING;
+ INSERT INTO physicality(entity,tier,path) VALUES(id,altitude,laplace_path(parts)) ON CONFLICT DO NOTHING;
  RETURN id;
 END $$;
 DO $$ DECLARE

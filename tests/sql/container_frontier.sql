@@ -25,12 +25,12 @@ WITH padding AS MATERIALIZED (
   ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(ST_GeomFromEWKB(laplace_cp_coord_ewkb(x))) FROM unnest(cps) x)) coord
  FROM parts
 )
-SELECT i,id,coord,laplace_hilbert4(coord) # '-9223372036854775808'::bigint AS hilbert,
+SELECT i,id,coord,laplace_hilbert4(coord) AS hilbert,
  ST_SetPoint(path,0,ST_MakePoint(ST_X(ST_PointN(path,1)),ST_Y(ST_PointN(path,1)),ST_Z(ST_PointN(path,1)),ST_M(ST_PointN(path,1))+1073741824)) path
 FROM composed;
 INSERT INTO public.entity(id,tier,coord,hilbert) SELECT id,1,coord,hilbert FROM dense_expected;
-INSERT INTO public.physicality(entity,tier,hilbert,path)
- SELECT id,1,hilbert,path FROM dense_expected ORDER BY i;
+INSERT INTO public.physicality(entity,tier,path)
+ SELECT id,1,path FROM dense_expected ORDER BY i;
 SET LOCAL work_mem='64kB';
 DO $$ DECLARE found bigint; expected bigint; BEGIN
  SELECT count(*) INTO expected FROM dense_expected WHERE i%2=0;
@@ -103,9 +103,9 @@ WITH children AS (
  ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(ST_GeomFromEWKB(laplace_cp_coord_ewkb(x))) FROM unnest(cps) x)) coord
  FROM children
 )
-SELECT *,laplace_hilbert4(coord) # '-9223372036854775808'::bigint AS hilbert FROM paths;
+SELECT *,laplace_hilbert4(coord) AS hilbert FROM paths;
 INSERT INTO public.entity(id,tier,coord,hilbert) SELECT id,1,coord,hilbert FROM sparse_expected;
-INSERT INTO public.physicality(entity,tier,hilbert,path) SELECT id,1,hilbert,path FROM sparse_expected;
+INSERT INTO public.physicality(entity,tier,path) SELECT id,1,path FROM sparse_expected;
 DO $$ DECLARE before_scans bigint; after_scans bigint; found bigint; selected oid[]; BEGIN
  SELECT array_agg(h.inhrelid) INTO selected FROM pg_inherits h
  WHERE h.inhparent='public.physicality'::regclass AND pg_relation_size(h.inhrelid)>0;

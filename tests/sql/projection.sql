@@ -13,7 +13,7 @@ SELECT laplace_id(word) AS id, laplace_tier(word) AS tier,
 FROM unnest(ARRAY['dog','cat','ant']) word;
 INSERT INTO projection_expected
 SELECT laplace_compose(parts),greatest(laplace_tier('dog'),laplace_tier('cat'))+1,point,
-  laplace_hilbert4(point) # '-9223372036854775808'::bigint,laplace_path(parts)
+  laplace_hilbert4(point),laplace_path(parts)
 FROM (SELECT ARRAY[laplace_id('dog'),laplace_id('dog'),laplace_id('cat')] AS parts,
   ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(p) FROM unnest(ARRAY[
     laplace_coord('dog'),laplace_coord('dog'),laplace_coord('cat')]) p)) AS point) composed;
@@ -67,7 +67,7 @@ END $$;
 -- Canonical atoms project from the floor, whatever coordinate a stored row
 -- supplies; a self-path that is not exactly the atom is rejected.
 CREATE TEMP TABLE projection_floor AS
-SELECT id,coord,laplace_hilbert4(coord) # '-9223372036854775808'::bigint AS hilbert
+SELECT id,coord,laplace_hilbert4(coord) AS hilbert
 FROM (SELECT laplace_cp_id(cp) AS id,ST_GeomFromEWKB(laplace_cp_coord_ewkb(cp)) AS coord
       FROM unnest(ARRAY[100,55295,55296,57343,57344,1114111]) cp) codepoints;
 DO $$ DECLARE f record; projected record; BEGIN

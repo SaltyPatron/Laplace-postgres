@@ -71,7 +71,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[
     required @extschema@.blake3[] DEFAULT '{}', per_part boolean DEFAULT false,
     floor smallint DEFAULT -1, cap bigint DEFAULT -1, kinds smallint DEFAULT 3,
     OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
-    OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean) RETURNS SETOF record
+    OUT tier smallint, OUT mask bigint, OUT kind smallint, OUT hub boolean) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_holders';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[],
@@ -79,7 +79,7 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_holders(parts @extschema@.blake3[
     floor smallint, cap bigint, kinds smallint,
     bits smallint[], endpoint smallint DEFAULT 0,
     OUT ordinal bigint, OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry,
-    OUT tier smallint, OUT mask bit, OUT kind smallint, OUT hub boolean) RETURNS SETOF record
+    OUT tier smallint, OUT mask bigint, OUT kind smallint, OUT hub boolean) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_holders';
 COMMENT ON FUNCTION @extschema@.laplace_holders(@extschema@.blake3[],@extschema@.blake3[],boolean,smallint,bigint,smallint)
@@ -100,12 +100,12 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_standings(ids @extschema@.blake3[
 
 CREATE OR REPLACE FUNCTION @extschema@.laplace_entities(ids @extschema@.blake3[],
     OUT ordinal bigint, OUT id @extschema@.blake3, OUT tier smallint,
-    OUT coord @extschema:postgis@.geometry, OUT hilbert bigint, OUT mask bit) RETURNS SETOF record
+    OUT coord @extschema:postgis@.geometry, OUT hilbert bigint, OUT mask bigint) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_entities';
 CREATE OR REPLACE FUNCTION @extschema@.laplace_physicalities(ids @extschema@.blake3[],
     OUT ordinal bigint, OUT entity @extschema@.blake3, OUT tier smallint,
-    OUT hilbert bigint, OUT path @extschema:postgis@.geometry, OUT mask bit) RETURNS SETOF record
+    OUT path @extschema:postgis@.geometry, OUT mask bigint) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_physicalities';
 
@@ -205,9 +205,9 @@ BEGIN
   -- Distinct metrics retain their own exact access paths. Tier is a key prefix,
   -- so a sparse high-tier Hilbert search cannot walk the Unicode floor first.
   DROP INDEX IF EXISTS @extschema@.entity_hilbert;
+  DROP INDEX IF EXISTS @extschema@.entity_angular;
   CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity (tier, hilbert, id);
   CREATE INDEX IF NOT EXISTS entity_coord ON @extschema@.entity USING gist (coord @extschema@.laplace_point4d_ops);
-  CREATE INDEX IF NOT EXISTS entity_angular ON @extschema@.entity USING gist (coord @extschema@.laplace_angular4d_ops);
   -- 32 MB a partition: a search scans the pending list, so it spills around a batch instead of holding a source.
   -- 4 MB spilled every few thousand paths (full-page images). 256 MB held the list until the source ended.
   CREATE INDEX IF NOT EXISTS physicality_paths ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops, mask @extschema@.laplace_mask_ops) WITH (gin_pending_list_limit = 32768);

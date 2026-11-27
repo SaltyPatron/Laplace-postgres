@@ -17,8 +17,8 @@ FROM (SELECT i,'lpcheckfrontier' || chr(97 + i % 26) || chr(97 + (i / 26) % 26) 
       FROM generate_series(0,16999) i) w;
 INSERT INTO public.entity(id,tier,coord,hilbert)
 SELECT id,1,laplace_coord(content),laplace_hilbert(content) FROM frontier_words;
-INSERT INTO public.physicality(entity,tier,hilbert,path)
-SELECT id,1,laplace_hilbert(content),path FROM frontier_words;
+INSERT INTO public.physicality(entity,tier,path)
+SELECT id,1,path FROM frontier_words;
 SET LOCAL work_mem='16MB';
 DO $$
 DECLARE found bigint;
@@ -54,8 +54,8 @@ BEGIN
  SELECT * INTO projection FROM laplace_project_path(parent,path,ids,coords);
  INSERT INTO public.entity(id,tier,coord,hilbert)
  VALUES(parent,child_tier+1,ST_GeomFromEWKB(projection.coord_ewkb),projection.hilbert);
- INSERT INTO public.physicality(entity,tier,hilbert,path,mask)
- VALUES(parent,child_tier+1,projection.hilbert,path,laplace_mask_slot('kind','claim'));
+ INSERT INTO public.physicality(entity,tier,path,mask)
+ VALUES(parent,child_tier+1,path,laplace_mask_slot('kind','claim'));
  INSERT INTO public.consensus
  SELECT parent,s.rating,s.deviation,s.volatility,s.matches FROM laplace_series(
    ARRAY[laplace_cp_id(102)],ARRAY[1::bigint],ARRAY[1::float8],ARRAY[1::float8]) s;

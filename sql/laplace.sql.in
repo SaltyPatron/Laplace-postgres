@@ -52,10 +52,10 @@ CREATE FUNCTION @extschema@.laplace_box4d_out(@extschema@.laplace_box4d) RETURNS
     AS 'MODULE_PATHNAME', 'laplace_box4d_out';
 
 CREATE TYPE @extschema@.laplace_box4d (
-    INTERNALLENGTH = 64,
+    INTERNALLENGTH = 32,
     INPUT = @extschema@.laplace_box4d_in,
     OUTPUT = @extschema@.laplace_box4d_out,
-    ALIGNMENT = double,
+    ALIGNMENT = int4,
     STORAGE = plain
 );
 
@@ -70,10 +70,10 @@ CREATE FUNCTION @extschema@.laplace_path4d_key_out(@extschema@.laplace_path4d_ke
     AS 'MODULE_PATHNAME', 'laplace_path4d_key_out';
 
 CREATE TYPE @extschema@.laplace_path4d_key (
-    INTERNALLENGTH = 128,
+    INTERNALLENGTH = 64,
     INPUT = @extschema@.laplace_path4d_key_in,
     OUTPUT = @extschema@.laplace_path4d_key_out,
-    ALIGNMENT = double,
+    ALIGNMENT = int4,
     STORAGE = plain
 );
 
@@ -203,11 +203,11 @@ CREATE FUNCTION @extschema@.laplace_chess_next(positions @extschema@.blake3[], m
     LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_chess_next';
 
-CREATE FUNCTION @extschema@.laplace_chess_records_ewkb(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord bytea, OUT hilbert bigint) RETURNS SETOF record
+CREATE FUNCTION @extschema@.laplace_chess_records_ewkb(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier smallint, OUT coord bytea, OUT hilbert bigint) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_chess_records_ewkb';
 
-CREATE FUNCTION @extschema@.laplace_chess_records(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier integer, OUT coord @extschema:postgis@.geometry, OUT hilbert bigint) RETURNS SETOF record
+CREATE FUNCTION @extschema@.laplace_chess_records(ids @extschema@.blake3[], OUT ordinal integer, OUT section text, OUT slot integer, OUT tier smallint, OUT coord @extschema:postgis@.geometry, OUT hilbert bigint) RETURNS SETOF record
     LANGUAGE sql STABLE STRICT ROWS 64 PARALLEL SAFE
     BEGIN ATOMIC
  SELECT r.ordinal, r.section, r.slot, r.tier, @extschema:postgis@.st_geomfromewkb(r.coord) AS coord, r.hilbert
@@ -241,7 +241,7 @@ CREATE FUNCTION @extschema@.laplace_contained_series(trunks @extschema@.blake3[]
 
     AS 'MODULE_PATHNAME', 'laplace_contained_series';
 
-CREATE FUNCTION @extschema@.laplace_containers(parts @extschema@.blake3[], bits smallint[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bit) RETURNS SETOF record
+CREATE FUNCTION @extschema@.laplace_containers(parts @extschema@.blake3[], bits smallint[], OUT entity @extschema@.blake3, OUT path @extschema:postgis@.geometry, OUT tier smallint, OUT mask bigint) RETURNS SETOF record
     LANGUAGE c STABLE STRICT ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
 
     AS 'MODULE_PATHNAME', 'laplace_containers';
@@ -420,35 +420,35 @@ CREATE FUNCTION @extschema@.laplace_mask_extract_query(internal, internal, small
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_extract_query';
 
-CREATE FUNCTION @extschema@.laplace_mask_extract_value(bit, internal, internal) RETURNS internal
+CREATE FUNCTION @extschema@.laplace_mask_extract_value(bigint, internal, internal) RETURNS internal
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_extract_value';
 
-CREATE FUNCTION @extschema@.laplace_mask_field(bank text) RETURNS bit
+CREATE FUNCTION @extschema@.laplace_mask_field(bank text) RETURNS bigint
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_field';
 
-CREATE FUNCTION @extschema@.laplace_mask_has(bit, smallint) RETURNS boolean
+CREATE FUNCTION @extschema@.laplace_mask_has(bigint, smallint) RETURNS boolean
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_has';
 
-CREATE FUNCTION @extschema@.laplace_mask_has_all(bit, smallint[]) RETURNS boolean
+CREATE FUNCTION @extschema@.laplace_mask_has_all(bigint, smallint[]) RETURNS boolean
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_has_all';
 
-CREATE FUNCTION @extschema@.laplace_mask_has_any(bit, smallint[]) RETURNS boolean
+CREATE FUNCTION @extschema@.laplace_mask_has_any(bigint, smallint[]) RETURNS boolean
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_has_any';
 
-CREATE FUNCTION @extschema@.laplace_mask_has_value(mask bit, bank text, value text) RETURNS boolean
+CREATE FUNCTION @extschema@.laplace_mask_has_value(mask bigint, bank text, value text) RETURNS boolean
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_has_value';
 
-CREATE FUNCTION @extschema@.laplace_mask_merge(a bit, b bit) RETURNS bit
+CREATE FUNCTION @extschema@.laplace_mask_merge(a bigint, b bigint) RETURNS bigint
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_merge';
 
-CREATE FUNCTION @extschema@.laplace_mask_slot(bank text, value text) RETURNS bit
+CREATE FUNCTION @extschema@.laplace_mask_slot(bank text, value text) RETURNS bigint
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_slot';
 
@@ -456,11 +456,11 @@ CREATE FUNCTION @extschema@.laplace_mask_triconsistent(internal, smallint, inter
     LANGUAGE c IMMUTABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_triconsistent';
 
-CREATE FUNCTION @extschema@.laplace_mask_valid(mask bit) RETURNS boolean
+CREATE FUNCTION @extschema@.laplace_mask_valid(mask bigint) RETURNS boolean
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_valid';
 
-CREATE FUNCTION @extschema@.laplace_mask_value(mask bit, bank text) RETURNS smallint
+CREATE FUNCTION @extschema@.laplace_mask_value(mask bigint, bank text) RETURNS smallint
     LANGUAGE c STABLE STRICT PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_mask_value';
 
@@ -796,7 +796,7 @@ CREATE OPERATOR @extschema@.>= (
 
 CREATE OPERATOR @extschema@.? (
     FUNCTION = @extschema@.laplace_mask_has,
-    LEFTARG = bit,
+    LEFTARG = bigint,
     RIGHTARG = smallint,
     RESTRICT = @extschema@.laplace_mask_sel,
     JOIN = @extschema@.laplace_mask_joinsel
@@ -804,7 +804,7 @@ CREATE OPERATOR @extschema@.? (
 
 CREATE OPERATOR @extschema@.?& (
     FUNCTION = @extschema@.laplace_mask_has_all,
-    LEFTARG = bit,
+    LEFTARG = bigint,
     RIGHTARG = smallint[],
     RESTRICT = @extschema@.laplace_mask_sel,
     JOIN = @extschema@.laplace_mask_joinsel
@@ -812,7 +812,7 @@ CREATE OPERATOR @extschema@.?& (
 
 CREATE OPERATOR @extschema@.?| (
     FUNCTION = @extschema@.laplace_mask_has_any,
-    LEFTARG = bit,
+    LEFTARG = bigint,
     RIGHTARG = smallint[],
     RESTRICT = @extschema@.laplace_mask_sel,
     JOIN = @extschema@.laplace_mask_joinsel
@@ -896,18 +896,18 @@ CREATE OPERATOR CLASS @extschema@.laplace_coord_ops
 
 CREATE OPERATOR FAMILY @extschema@.laplace_mask_ops USING gin;
 ALTER OPERATOR FAMILY @extschema@.laplace_mask_ops USING gin ADD
-    OPERATOR 1 @extschema@.?(bit,smallint) ,
-    OPERATOR 2 @extschema@.?&(bit,smallint[]) ,
-    OPERATOR 3 @extschema@.?|(bit,smallint[]) ,
-    FUNCTION 1 (bit, bit) btint2cmp(smallint,smallint) ,
-    FUNCTION 4 (bit, bit) @extschema@.laplace_mask_consistent(internal,smallint,internal,integer,internal,internal,internal,internal) ,
-    FUNCTION 6 (bit, bit) @extschema@.laplace_mask_triconsistent(internal,smallint,internal,integer,internal,internal,internal);
+    OPERATOR 1 @extschema@.?(bigint,smallint) ,
+    OPERATOR 2 @extschema@.?&(bigint,smallint[]) ,
+    OPERATOR 3 @extschema@.?|(bigint,smallint[]) ,
+    FUNCTION 1 (bigint, bigint) btint2cmp(smallint,smallint) ,
+    FUNCTION 4 (bigint, bigint) @extschema@.laplace_mask_consistent(internal,smallint,internal,integer,internal,internal,internal,internal) ,
+    FUNCTION 6 (bigint, bigint) @extschema@.laplace_mask_triconsistent(internal,smallint,internal,integer,internal,internal,internal);
 
 CREATE OPERATOR CLASS @extschema@.laplace_mask_ops
-    FOR TYPE bit USING gin FAMILY @extschema@.laplace_mask_ops AS
+    FOR TYPE bigint USING gin FAMILY @extschema@.laplace_mask_ops AS
     STORAGE smallint ,
-    FUNCTION 2 (bit, bit) @extschema@.laplace_mask_extract_value(bit,internal,internal) ,
-    FUNCTION 3 (bit, bit) @extschema@.laplace_mask_extract_query(internal,internal,smallint,internal,internal,internal,internal);
+    FUNCTION 2 (bigint, bigint) @extschema@.laplace_mask_extract_value(bigint,internal,internal) ,
+    FUNCTION 3 (bigint, bigint) @extschema@.laplace_mask_extract_query(internal,internal,smallint,internal,internal,internal,internal);
 
 CREATE OPERATOR FAMILY @extschema@.laplace_path4d_ops USING gist;
 ALTER OPERATOR FAMILY @extschema@.laplace_path4d_ops USING gist ADD
@@ -983,7 +983,7 @@ CREATE TABLE @extschema@.entity (
     tier smallint NOT NULL,
     coord @extschema:postgis@.geometry(PointZM) NOT NULL,
     hilbert bigint NOT NULL,
-    mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
+    mask bigint DEFAULT 0 NOT NULL,
     CONSTRAINT entity_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
 )
 PARTITION BY RANGE (tier);
@@ -991,9 +991,8 @@ PARTITION BY RANGE (tier);
 CREATE TABLE @extschema@.physicality (
     entity @extschema@.blake3 NOT NULL,
     tier smallint NOT NULL,
-    hilbert bigint NOT NULL,
     path @extschema:postgis@.geometry NOT NULL,
-    mask bit(64) DEFAULT '0'::bit(64) NOT NULL,
+    mask bigint DEFAULT 0 NOT NULL,
     CONSTRAINT physicality_mask_valid CHECK (@extschema@.laplace_mask_valid(mask))
 )
 PARTITION BY RANGE (tier);
@@ -1085,7 +1084,7 @@ COMMENT ON FUNCTION @extschema@.laplace_ensure_stage() IS 'Prepare three UNLOGGE
 
 COMMENT ON FUNCTION @extschema@.laplace_labels(ids @extschema@.blake3[], OUT i bigint, OUT entity @extschema@.blake3, OUT content text) IS 'Native selected-ID labels in one DAG context: Unicode text and ordered tuple/run structure. Other structural roles and missing realizations retain their canonical identity; package bodies are not reconstructed to label them.';
 
-COMMENT ON FUNCTION @extschema@.laplace_mask_merge(a bit, b bit) IS 'Native checked bitwise OR: combine disjoint fields and row-role flags; reject conflicting enum values.';
+COMMENT ON FUNCTION @extschema@.laplace_mask_merge(a bigint, b bigint) IS 'Native checked bitwise OR: combine disjoint fields and row-role flags; reject conflicting enum values.';
 
 COMMENT ON FUNCTION @extschema@.laplace_mask_slot(bank text, value text) IS '64-bit carrier encoding of a frozen bank slot. For exact enum filtering use (mask & @extschema@.laplace_mask_field(bank)) = @extschema@.laplace_mask_slot(bank, value).';
 

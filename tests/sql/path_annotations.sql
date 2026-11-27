@@ -20,7 +20,7 @@ SELECT laplace_compose(ARRAY[laplace_id('lpcheckannotationzero'),laplace_id('lpc
 FROM value;
 CREATE FUNCTION pg_temp.annotation_batch() RETURNS void LANGUAGE sql AS $$
   INSERT INTO stage.check_annotation_entities(id,tier,coord,hilbert) SELECT id,2,coord,hilbert FROM annotation_fixture;
-  INSERT INTO stage.check_annotation_paths(entity,tier,hilbert,path) SELECT id,2,hilbert,path FROM annotation_fixture;
+  INSERT INTO stage.check_annotation_paths(entity,tier,path) SELECT id,2,path FROM annotation_fixture;
 $$;
 SELECT pg_temp.annotation_batch();
 DO $$

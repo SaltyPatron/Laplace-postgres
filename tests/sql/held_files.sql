@@ -17,8 +17,8 @@ CREATE FUNCTION pg_temp.word(label text) RETURNS blake3 LANGUAGE sql STABLE
 RETURN (SELECT id FROM held_words WHERE content=label);
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT id,1,laplace_coord(content),laplace_hilbert(content) FROM held_words;
-INSERT INTO physicality(entity,tier,hilbert,path)
-SELECT id,1,laplace_hilbert(content),path FROM held_words;
+INSERT INTO physicality(entity,tier,path)
+SELECT id,1,path FROM held_words;
 CREATE FUNCTION pg_temp.held_node(parts blake3[],metadata bigint[] DEFAULT NULL) RETURNS blake3
 LANGUAGE plpgsql AS $$
 DECLARE composed blake3:=laplace_compose(parts); point geometry; path geometry:=laplace_path(parts);
@@ -27,7 +27,7 @@ BEGIN
   SELECT ST_GeomFromEWKB(laplace_centroid4d_ewkb(coalesce(e.coord,ST_GeomFromEWKB(laplace_cp_coord_ewkb(laplace_codepoint(p)))))),
          (max(coalesce(e.tier,0))+1)::smallint
     INTO coord,altitude FROM unnest(parts) p LEFT JOIN entity e ON e.id=p;
-  hilbert:=laplace_hilbert4(coord) # '-9223372036854775808'::bigint;
+  hilbert:=laplace_hilbert4(coord);
   IF metadata IS NOT NULL THEN
     FOR i IN 1..cardinality(metadata) LOOP
       point:=ST_PointN(path,i);
@@ -35,7 +35,7 @@ BEGIN
     END LOOP;
   END IF;
   INSERT INTO entity(id,tier,coord,hilbert) VALUES(composed,altitude,coord,hilbert) ON CONFLICT DO NOTHING;
-  INSERT INTO physicality(entity,tier,hilbert,path) VALUES(composed,altitude,hilbert,path) ON CONFLICT DO NOTHING;
+  INSERT INTO physicality(entity,tier,path) VALUES(composed,altitude,path) ON CONFLICT DO NOTHING;
   RETURN composed;
 END $$;
 DO $$

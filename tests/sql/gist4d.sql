@@ -74,7 +74,7 @@ DO $$ DECLARE q geometry := ST_MakePoint(0.55, 0.55, 0.55, 0.3); r float8 := 0.2
     WHERE laplace_distance4d(p.coord, ST_MakePoint(0,0,1,0)) <= 0.3
       AND NOT EXISTS (
         SELECT 1 FROM laplace_hilbert_ball_ranges(ST_MakePoint(0,0,1,0), 0.3, 64) b
-        WHERE (laplace_hilbert4(p.coord) # '-9223372036854775808'::bigint) BETWEEN b.lo AND b.hi
+        WHERE laplace_hilbert4(p.coord) BETWEEN b.lo AND b.hi
       )
   ) THEN
     RAISE EXCEPTION 'laplace_hilbert_ball_ranges missed an in-radius point';

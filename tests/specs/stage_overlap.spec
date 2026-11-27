@@ -13,8 +13,8 @@ setup
   INSERT INTO stage.check_overlap_a_entities(id,tier,coord,hilbert)
     SELECT laplace_id('lpcheckstageoverlap'),laplace_tier('lpcheckstageoverlap'),
       laplace_coord('lpcheckstageoverlap'),laplace_hilbert('lpcheckstageoverlap');
-  INSERT INTO stage.check_overlap_a_paths(entity,tier,hilbert,path)
-    SELECT laplace_id('lpcheckstageoverlap'),laplace_tier('lpcheckstageoverlap'),laplace_hilbert('lpcheckstageoverlap'),
+  INSERT INTO stage.check_overlap_a_paths(entity,tier,path)
+    SELECT laplace_id('lpcheckstageoverlap'),laplace_tier('lpcheckstageoverlap'),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table('lpcheckstageoverlap','') c));
   INSERT INTO stage.check_overlap_b_entities SELECT * FROM stage.check_overlap_a_entities;
   INSERT INTO stage.check_overlap_b_paths SELECT * FROM stage.check_overlap_a_paths;

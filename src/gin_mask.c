@@ -1,6 +1,5 @@
-/* GIN over the 64-bit carrier mask and highway bank bit/slot bindings.
- * SQL bit position i corresponds to Native's uint64 bit i; the SQL binary
- * representation writes the most significant bit of each byte first. */
+/* GIN over the 64-bit carrier mask (fixed 8-byte bigint) and highway bank bit/slot bindings.
+ * Bit position i (0..63) corresponds directly to Native's uint64 bit i (1ULL << i). */
 #include "pg_core.h"
 #include "access/gin.h"
 #include "access/htup_details.h"
@@ -10,7 +9,6 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
-#include "utils/varbit.h"
 #include <math.h>
 
 #define LP_STRAT_HASBIT  1        /* mask ? int2 */
@@ -22,28 +20,6 @@ static GinTernaryValue tri_any(const GinTernaryValue *check, int32 n){ GinTernar
 static bool bool_all(const bool *check, int32 n){ for (int i = 0; i < n; i++) if (!check[i]) return false; return true; }
 static bool bool_any(const bool *check, int32 n){ for (int i = 0; i < n; i++) if (check[i]) return true; return false; }
 
-static VarBit *carrier64(VarBit *mask){
-    if (VARBITLEN(mask) != LP_MASK_BITS)
-        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: a carrier mask must have exactly 64 bits")));
-    return mask;
-}
-static uint8 reverse_byte(uint8 b){
-    b = (uint8)(((b & 0x55u) << 1) | ((b >> 1) & 0x55u));
-    b = (uint8)(((b & 0x33u) << 2) | ((b >> 2) & 0x33u));
-    return (uint8)((b << 4) | (b >> 4));
-}
-static lp_mask mask_native(VarBit *mask){
-    carrier64(mask); lp_mask value = 0;
-    for (unsigned i = 0; i < 8; i++) value |= (uint64)reverse_byte(VARBITS(mask)[i]) << (8 * i);
-    return value;
-}
-VarBit *lp_pg_mask_sql(lp_mask value){
-    VarBit *mask = palloc0(VARBITTOTALLEN(LP_MASK_BITS));
-    SET_VARSIZE(mask, VARBITTOTALLEN(LP_MASK_BITS)); VARBITLEN(mask) = LP_MASK_BITS;
-    for (unsigned i = 0; i < 8; i++) VARBITS(mask)[i] = reverse_byte((uint8)(value >> (8 * i)));
-    return mask;
-}
-static inline VarBit *mask_sql(lp_mask value){ return lp_pg_mask_sql(value); }
 static const lp_bank *mask_bank(text *name){
     char *bank = text_to_cstring(name); const lp_bank *descriptor = lp_highway_bank(lp_pg_highway(), bank);
     if (!descriptor) ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("laplace: no bank \"%s\" (manifest/banks.tsv)", bank)));
@@ -55,7 +31,6 @@ static int64 mask_slot(const lp_bank *bank, text *value){
     return lp_highway_slot(lp_pg_highway(), bank->list, &ref.id);
 }
 
-lp_mask lp_pg_mask_native(Datum value){return mask_native(DatumGetVarBitP(value));}
 lp_mask lp_pg_kind_mask(const char *role){
     const lp_bank *kind=mask_bank(cstring_to_text("kind"));
     int64 slot=mask_slot(kind,cstring_to_text(role));lp_mask mask=0;
@@ -105,37 +80,41 @@ PG_FUNCTION_INFO_V1(laplace_mask_slot);
 Datum laplace_mask_slot(PG_FUNCTION_ARGS){
     MaskBinding *binding=mask_binding(fcinfo,0,1); lp_mask value = 0;
     if (binding->slot < 0 || !lp_mask_put(&value, binding->bank, (uint32)binding->slot)) PG_RETURN_NULL();
-    PG_RETURN_VARBIT_P(mask_sql(value));
+    PG_RETURN_INT64((int64)value);
 }
 PG_FUNCTION_INFO_V1(laplace_mask_field);
-Datum laplace_mask_field(PG_FUNCTION_ARGS){ PG_RETURN_VARBIT_P(mask_sql(lp_mask_field(mask_binding(fcinfo,0,-1)->bank))); }
+Datum laplace_mask_field(PG_FUNCTION_ARGS){ PG_RETURN_INT64((int64)lp_mask_field(mask_binding(fcinfo,0,-1)->bank)); }
 PG_FUNCTION_INFO_V1(laplace_mask_value);
 Datum laplace_mask_value(PG_FUNCTION_ARGS){
-    PG_RETURN_INT16((int16)lp_mask_get(mask_native(PG_GETARG_VARBIT_P(0)), mask_binding(fcinfo,1,-1)->bank));
+    PG_RETURN_INT16((int16)lp_mask_get((lp_mask)PG_GETARG_INT64(0), mask_binding(fcinfo,1,-1)->bank));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_has_value);
 Datum laplace_mask_has_value(PG_FUNCTION_ARGS){
-    lp_mask value = mask_native(PG_GETARG_VARBIT_P(0));
+    lp_mask value = (lp_mask)PG_GETARG_INT64(0);
     MaskBinding *binding=mask_binding(fcinfo,1,2);
     PG_RETURN_BOOL(binding->slot >= 0 && lp_mask_has(value, binding->bank, (uint32)binding->slot));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_valid);
 Datum laplace_mask_valid(PG_FUNCTION_ARGS){
-    lp_mask value = mask_native(PG_GETARG_VARBIT_P(0)), merged;
+    lp_mask value = (lp_mask)PG_GETARG_INT64(0), merged;
     PG_RETURN_BOOL(lp_mask_merge(lp_pg_highway(), value, 0, &merged));
 }
 PG_FUNCTION_INFO_V1(laplace_mask_merge);
 Datum laplace_mask_merge(PG_FUNCTION_ARGS){
-    lp_mask a = mask_native(PG_GETARG_VARBIT_P(0)), b = mask_native(PG_GETARG_VARBIT_P(1)), merged;
+    lp_mask a = (lp_mask)PG_GETARG_INT64(0), b = (lp_mask)PG_GETARG_INT64(1), merged;
     if (!lp_mask_merge(lp_pg_highway(), a, b, &merged))
         ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("laplace: conflicting enum values or reserved bits in carrier mask merge")));
-    PG_RETURN_VARBIT_P(mask_sql(merged));
+    PG_RETURN_INT64((int64)merged);
 }
 PG_FUNCTION_INFO_V1(laplace_mask_extract_value);
 Datum laplace_mask_extract_value(PG_FUNCTION_ARGS){
-    VarBit *m = carrier64(PG_GETARG_VARBIT_P(0)); int32 *n = (int32 *)PG_GETARG_POINTER(1);
-    int len = VARBITLEN(m); const bits8 *b = VARBITS(m); Datum *k = palloc(sizeof(Datum) * (len ? len : 1)); int c = 0;
-    for (int i = 0; i < len; i++) if (b[i >> 3] & (0x80 >> (i & 7))) k[c++] = Int16GetDatum((int16)i);
+    uint64 m = (uint64)PG_GETARG_INT64(0); int32 *n = (int32 *)PG_GETARG_POINTER(1);
+    Datum *k = palloc(sizeof(Datum) * (m ? LP_MASK_BITS : 1)); int c = 0;
+    while (m) {
+        int bit = __builtin_ctzll(m);
+        k[c++] = Int16GetDatum((int16)bit);
+        m &= m - 1u;
+    }
     *n = c; PG_RETURN_POINTER(k);
 }
 PG_FUNCTION_INFO_V1(laplace_mask_extract_query);
@@ -158,11 +137,10 @@ Datum laplace_mask_triconsistent(PG_FUNCTION_ARGS){
     const GinTernaryValue *check = (const GinTernaryValue *)PG_GETARG_POINTER(0); StrategyNumber st = PG_GETARG_UINT16(1); int32 n = PG_GETARG_INT32(3);
     PG_RETURN_GIN_TERNARY_VALUE(st == LP_STRAT_HASANY ? tri_any(check, n) : tri_all(check, n));
 }
-static bool mask_bit(VarBit *m, int16 i){ carrier64(m); return i >= 0 && i < LP_MASK_BITS && (VARBITS(m)[i >> 3] & (0x80 >> (i & 7))); }
+static inline bool mask_bit(uint64 m, int16 i){ return i >= 0 && i < LP_MASK_BITS && ((m >> i) & 1u) != 0; }
 PG_FUNCTION_INFO_V1(laplace_mask_has);
-Datum laplace_mask_has(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_bit(PG_GETARG_VARBIT_P(0), PG_GETARG_INT16(1))); }
-static bool mask_has_array(VarBit *m, ArrayType *a, bool all){
-    carrier64(m);
+Datum laplace_mask_has(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_bit((uint64)PG_GETARG_INT64(0), PG_GETARG_INT16(1))); }
+static bool mask_has_array(uint64 m, ArrayType *a, bool all){
     Datum *v; bool *nulls; int c; deconstruct_array(a, INT2OID, 2, true, TYPALIGN_SHORT, &v, &nulls, &c);
     for (int i = 0; i < c; i++) if (nulls[i]) ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("laplace: mask bit arrays cannot contain nulls")));
     for (int i = 0; i < c; i++) {
@@ -171,9 +149,9 @@ static bool mask_has_array(VarBit *m, ArrayType *a, bool all){
     return all;
 }
 PG_FUNCTION_INFO_V1(laplace_mask_has_all);
-Datum laplace_mask_has_all(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
+Datum laplace_mask_has_all(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array((uint64)PG_GETARG_INT64(0), PG_GETARG_ARRAYTYPE_P(1), true)); }
 PG_FUNCTION_INFO_V1(laplace_mask_has_any);
-Datum laplace_mask_has_any(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array(PG_GETARG_VARBIT_P(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
+Datum laplace_mask_has_any(PG_FUNCTION_ARGS){ PG_RETURN_BOOL(mask_has_array((uint64)PG_GETARG_INT64(0), PG_GETARG_ARRAYTYPE_P(1), false)); }
 /* Only flag banks have single bits. Enum callers use laplace_mask_slot and compare the entire field. */
 PG_FUNCTION_INFO_V1(laplace_bank_bit);
 Datum laplace_bank_bit(PG_FUNCTION_ARGS){

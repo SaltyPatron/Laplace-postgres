@@ -507,11 +507,11 @@ static void stored_row(TupleTableSlot *slot,const PresenceKey *key,void *context
 static Datum stored_rows(FunctionCallInfo fcinfo,int kind)
 {
     const char *entities[]={"id","tier","coord","hilbert","mask"};
-    const char *physicalities[]={"entity","tier","hilbert","path","mask"};
+    const char *physicalities[]={"entity","tier","path","mask"};
     const char *standings[]={"claim","rating","deviation","volatility","matches"};
     const char *const *selected=kind==2?standings:kind==1?physicalities:entities;
     const char *name=kind==2?"laplace_standings":kind==1?"laplace_physicalities":"laplace_entities";
-    StoredRows out={.columns=5};out.output.fcinfo=fcinfo;
+    StoredRows out={.columns=kind==1?4:5};out.output.fcinfo=fcinfo;
     out.output.output=set_begin(fcinfo,name,&out.output.descriptor);
     int count;lp_id *ids=ids_of(PG_GETARG_ARRAYTYPE_P(0),&count);
     if(!count){pfree(ids);return (Datum)0;}

@@ -17,8 +17,8 @@ CREATE UNLOGGED TABLE stage.check_routing_paths (LIKE stage.physicality INCLUDIN
 CREATE FUNCTION pg_temp.routing_batch() RETURNS void LANGUAGE SQL AS $$
   INSERT INTO stage.check_routing_entities(id,tier,coord,hilbert)
     SELECT laplace_id(content),laplace_tier(content),laplace_coord(content),laplace_hilbert(content) FROM routing_words;
-  INSERT INTO stage.check_routing_paths(entity,tier,hilbert,path)
-    SELECT laplace_id(content),laplace_tier(content),laplace_hilbert(content),
+  INSERT INTO stage.check_routing_paths(entity,tier,path)
+    SELECT laplace_id(content),laplace_tier(content),
       laplace_path(ARRAY(SELECT laplace_cp_id(ascii(c)) FROM regexp_split_to_table(content,'') c)) FROM routing_words;
 $$;
 SELECT pg_temp.routing_batch();
@@ -98,8 +98,8 @@ DO $$ DECLARE result record; BEGIN
     RAISE EXCEPTION 'noncanonical destination accepted';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
-CREATE UNLOGGED TABLE stage.check_routing_wrong_type(id text,tier smallint,mask bit(64));
-CREATE UNLOGGED TABLE stage.check_routing_null_id AS SELECT NULL::blake3 AS id,1::smallint AS tier,B'0'::bit(64) AS mask;
+CREATE UNLOGGED TABLE stage.check_routing_wrong_type(id text,tier smallint,mask bigint);
+CREATE UNLOGGED TABLE stage.check_routing_null_id AS SELECT NULL::blake3 AS id,1::smallint AS tier,0::bigint AS mask;
 DO $$ BEGIN
   BEGIN
     PERFORM laplace_enrich_stage('stage.check_routing_wrong_type','public.entity');

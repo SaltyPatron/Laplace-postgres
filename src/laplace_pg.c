@@ -489,7 +489,7 @@ static lp_coord coord_of(const Geo *g){
 }
 
 PG_FUNCTION_INFO_V1(laplace_hilbert4);
-Datum laplace_hilbert4(PG_FUNCTION_ARGS){ Geo g = geo_of(PG_GETARG_DATUM(0)); lp_coord c = coord_of(&g); PG_RETURN_INT64((int64)lp_hilbert4(&c)); }
+Datum laplace_hilbert4(PG_FUNCTION_ARGS){ Geo g = geo_of(PG_GETARG_DATUM(0)); lp_coord c = coord_of(&g); PG_RETURN_INT64(lp_hilbert_key(lp_hilbert4(&c))); }
 
 PG_FUNCTION_INFO_V1(laplace_inside);
 Datum laplace_inside(PG_FUNCTION_ARGS){ Geo g = geo_of(PG_GETARG_DATUM(0)); lp_coord c = coord_of(&g); PG_RETURN_BOOL(lp_coord_inside(&c)); }
@@ -717,7 +717,7 @@ Datum laplace_chess_records_ewkb(PG_FUNCTION_ARGS){
     for (int i = 0; i < n; i++) {
         const lp_section *s; const lp_tier0_record *r = lp_perfcache_find(c, &ids[i], &s); if (!r) continue;
         lp_coord co; memcpy(co.m, r->m, sizeof co.m);
-        Datum v[6] = { Int32GetDatum(i + 1), PointerGetDatum(cstring_to_text(s->name)), Int32GetDatum((int32)r->rank), Int32GetDatum((int32)r->pad),
+        Datum v[6] = { Int32GetDatum(i + 1), PointerGetDatum(cstring_to_text(s->name)), Int32GetDatum((int32)r->rank), Int16GetDatum((int16)r->pad),
                        PointerGetDatum(coord_ewkb(&co)), Int64GetDatum(lp_hilbert_key(r->hilbert)) };
         bool nl[6] = { 0 }; set_put(fcinfo, ts, td, v, nl);
     }

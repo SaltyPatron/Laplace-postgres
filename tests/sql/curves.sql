@@ -13,12 +13,12 @@ SELECT laplace_id(word) AS id, laplace_tier(word) AS tier, laplace_coord(word) A
 FROM unnest(ARRAY['dog','cat','act','tac','caaat']) word;
 INSERT INTO curve_fixture
 SELECT laplace_compose(parts),greatest(laplace_tier('dog'),laplace_tier('cat'))+1,point,
-  laplace_hilbert4(point) # '-9223372036854775808'::bigint,laplace_path(parts)
+  laplace_hilbert4(point),laplace_path(parts)
 FROM (SELECT ARRAY[laplace_id('dog'),laplace_id('dog'),laplace_id('cat')] AS parts,
   ST_GeomFromEWKB((SELECT laplace_centroid4d_ewkb(p) FROM unnest(ARRAY[
     laplace_coord('dog'),laplace_coord('dog'),laplace_coord('cat')]) p)) AS point) composed;
 INSERT INTO entity(id,tier,coord,hilbert) SELECT id,tier,coord,hilbert FROM curve_fixture ON CONFLICT DO NOTHING;
-INSERT INTO physicality(entity,tier,hilbert,path) SELECT id,tier,hilbert,path FROM curve_fixture ON CONFLICT DO NOTHING;
+INSERT INTO physicality(entity,tier,path) SELECT id,tier,path FROM curve_fixture ON CONFLICT DO NOTHING;
 CREATE FUNCTION pg_temp.cp_point(cp integer) RETURNS geometry LANGUAGE SQL IMMUTABLE
 BEGIN ATOMIC SELECT ST_GeomFromEWKB(laplace_cp_coord_ewkb(cp)); END;
 DO $$ DECLARE

@@ -40,7 +40,18 @@
 #include "laplace/laplace.h"
 #include <math.h>
 
-typedef struct { double lo[4], hi[4]; } Box4;
+typedef struct { float lo[4], hi[4]; } Box4;
+
+static inline float f32_lo(double v){
+    if (isnan(v)) return NAN;
+    float f = (float)v;
+    return (double)f > v ? nextafterf(f, -INFINITY) : f;
+}
+static inline float f32_hi(double v){
+    if (isnan(v)) return NAN;
+    float f = (float)v;
+    return (double)f < v ? nextafterf(f, INFINITY) : f;
+}
 
 #define LAPLACE_KNN 15             /* ORDER BY geometry <~>, <=> or <%> geometry: each class's own distance */
 #define LAPLACE_KNN_HAUSDORFF 16   /* ORDER BY geometry <%%> geometry (laplace_path4d_ops) */
@@ -54,18 +65,20 @@ static const double *point_of(Datum d){
 
 PG_FUNCTION_INFO_V1(laplace_box4d_in);
 Datum laplace_box4d_in(PG_FUNCTION_ARGS){
-    const char *s = PG_GETARG_CSTRING(0); Box4 *b = palloc(sizeof *b); int used = 0;
-    if (sscanf(s, " BOX4D ( %lf %lf %lf %lf , %lf %lf %lf %lf ) %n", &b->lo[0], &b->lo[1], &b->lo[2], &b->lo[3],
-               &b->hi[0], &b->hi[1], &b->hi[2], &b->hi[3], &used) != 8 || s[used] != '\0')
+    const char *s = PG_GETARG_CSTRING(0); Box4 *b = palloc(sizeof *b); double lo[4], hi[4]; int used = 0;
+    if (sscanf(s, " BOX4D ( %lf %lf %lf %lf , %lf %lf %lf %lf ) %n", &lo[0], &lo[1], &lo[2], &lo[3],
+               &hi[0], &hi[1], &hi[2], &hi[3], &used) != 8 || s[used] != '\0')
         ereport(ERROR, (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION), errmsg("laplace_box4d: expected BOX4D(x y z m, x y z m), got \"%s\"", s)));
+    for (int d = 0; d < 4; d++) { b->lo[d] = f32_lo(lo[d]); b->hi[d] = f32_hi(hi[d]); }
     PG_RETURN_POINTER(b);
 }
 
 PG_FUNCTION_INFO_V1(laplace_box4d_out);
 Datum laplace_box4d_out(PG_FUNCTION_ARGS){
     const Box4 *b = (const Box4 *)PG_GETARG_POINTER(0);
-    PG_RETURN_CSTRING(psprintf("BOX4D(%.17g %.17g %.17g %.17g,%.17g %.17g %.17g %.17g)",
-                               b->lo[0], b->lo[1], b->lo[2], b->lo[3], b->hi[0], b->hi[1], b->hi[2], b->hi[3]));
+    PG_RETURN_CSTRING(psprintf("BOX4D(%.9g %.9g %.9g %.9g,%.9g %.9g %.9g %.9g)",
+                               (double)b->lo[0], (double)b->lo[1], (double)b->lo[2], (double)b->lo[3],
+                               (double)b->hi[0], (double)b->hi[1], (double)b->hi[2], (double)b->hi[3]));
 }
 
 /* ---------------------------------------------------------------- the operator */
@@ -101,7 +114,7 @@ Datum laplace_direction4d_ewkb(PG_FUNCTION_ARGS){
 
 /* ---------------------------------------------------------------- box arithmetic */
 static inline bool box_is_nan(const Box4 *b){ return isnan(b->lo[0]) || isnan(b->hi[0]); }
-static inline void box_of_point(Box4 *b, const double p[4]){ for (int d = 0; d < 4; d++) b->lo[d] = b->hi[d] = p[d]; }
+static inline void box_of_point(Box4 *b, const double p[4]){ for (int d = 0; d < 4; d++) { b->lo[d] = f32_lo(p[d]); b->hi[d] = f32_hi(p[d]); } }
 static inline void box_join(Box4 *a, const Box4 *b){
     if (box_is_nan(b)) return;
     if (box_is_nan(a)) { *a = *b; return; }
@@ -109,19 +122,23 @@ static inline void box_join(Box4 *a, const Box4 *b){
 }
 static inline double box_edges(const Box4 *b){
     if (box_is_nan(b)) return 0.0;
-    return ((b->hi[0] - b->lo[0]) + (b->hi[1] - b->lo[1])) + (b->hi[2] - b->lo[2]) + (b->hi[3] - b->lo[3]);
+    return (((double)b->hi[0] - (double)b->lo[0]) + ((double)b->hi[1] - (double)b->lo[1]))
+         + ((double)b->hi[2] - (double)b->lo[2]) + ((double)b->hi[3] - (double)b->lo[3]);
 }
-/* The query's distance to the box, in lp_distance4's order of operations (header). */
+/* The query's distance to the outward-rounded box: guaranteed lower bound on exact lp_distance4. */
 static inline double box4_distance(const Box4 *b, const double q[4]){
     if (box_is_nan(b)) return NAN;
     double g[4];
-    for (int d = 0; d < 4; d++) g[d] = q[d] < b->lo[d] ? b->lo[d] - q[d] : q[d] > b->hi[d] ? q[d] - b->hi[d] : 0.0;
+    for (int d = 0; d < 4; d++) {
+        double lo = (double)b->lo[d], hi = (double)b->hi[d];
+        g[d] = q[d] < lo ? lo - q[d] : q[d] > hi ? q[d] - hi : 0.0;
+    }
     return sqrt(((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3]);
 }
 static inline uint64 box_hilbert(const Box4 *b){
     uint32_t g[4];
     for (int d = 0; d < 4; d++) {
-        double c = (b->lo[d] + b->hi[d]) / 2.0, v = (c + 1.0) / 2.0 * 65536.0;
+        double c = ((double)b->lo[d] + (double)b->hi[d]) / 2.0, v = (c + 1.0) / 2.0 * 65536.0;
         g[d] = !(v >= 0) ? 0 : v > 65535.0 ? 65535u : (uint32_t)v;   /* NaN and below the ball: 0 */
     }
     return lp_hilbert4_grid(g);
@@ -172,8 +189,8 @@ Datum laplace_point4d_gist_consistent(PG_FUNCTION_ARGS){
 /* An inner key: the box, and for a path key (below) its ends marked absent. Every key starts with its Box4, so the
  * box functions serve both key sizes. */
 static void *inner_key(const Box4 *b, size_t size){
-    double *k = palloc(size); memcpy(k, b, sizeof *b);
-    for (size_t i = sizeof *b / sizeof(double); i < size / sizeof(double); i++) k[i] = NAN;
+    float *k = palloc(size); memcpy(k, b, sizeof *b);
+    for (size_t i = sizeof *b / sizeof(float); i < size / sizeof(float); i++) k[i] = NAN;
     return k;
 }
 static Datum keys_union(GistEntryVector *v, int *size, size_t keysize){
@@ -272,15 +289,24 @@ Datum laplace_point4d_gist_distance(PG_FUNCTION_ARGS){
  * exact distance; the leaf is rechecked, which puts the rows in exact Fréchet order. The class also orders by <%%>,
  * the discrete Hausdorff distance (lp_hausdorff4): it too pairs each query vertex with some vertex of the path, so the
  * box term bounds it (the ends do not pair up under it). */
-typedef struct { Box4 box; double first[4], last[4]; } PathKey;
+typedef struct { Box4 box; float first[4], last[4]; } PathKey;
 
-static inline double d2_of(const double *a, const double *b){
-    double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2], dm = a[3] - b[3];
-    return ((dx * dx + dy * dy) + dz * dz) + dm * dm;
+static inline double d2_of_f32(const double *q, const float *p){
+    double g[4];
+    for (int d = 0; d < 4; d++) {
+        double d0 = fabs(q[d] - (double)p[d]);
+        float up = nextafterf(p[d], INFINITY);
+        double eps = fabs((double)up - (double)p[d]);
+        g[d] = d0 > eps ? d0 - eps : 0.0;
+    }
+    return ((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3];
 }
 static inline double box_gap2(const Box4 *b, const double q[4]){
     double g[4];
-    for (int d = 0; d < 4; d++) g[d] = q[d] < b->lo[d] ? b->lo[d] - q[d] : q[d] > b->hi[d] ? q[d] - b->hi[d] : 0.0;
+    for (int d = 0; d < 4; d++) {
+        double lo = (double)b->lo[d], hi = (double)b->hi[d];
+        g[d] = q[d] < lo ? lo - q[d] : q[d] > hi ? q[d] - hi : 0.0;
+    }
     return ((g[0] * g[0] + g[1] * g[1]) + g[2] * g[2]) + g[3] * g[3];
 }
 static Geo path_of(Datum d){
@@ -306,7 +332,7 @@ Datum laplace_path4d_gist_compress(PG_FUNCTION_ARGS){
     GISTENTRY *r = palloc(sizeof *r); PathKey *k = palloc(sizeof *k);
     box_of_point(&k->box, x);
     for (size_t i = 1; i < n; i++) { Box4 v; box_of_point(&v, x + 4 * i); box_join(&k->box, &v); }
-    memcpy(k->first, x, sizeof k->first); memcpy(k->last, x + 4 * (n - 1), sizeof k->last);
+    for (int d = 0; d < 4; d++) { k->first[d] = (float)x[d]; k->last[d] = (float)x[4 * (n - 1) + d]; }
     gistentryinit(*r, PointerGetDatum(k), e->rel, e->page, e->offset, false);
     PG_RETURN_POINTER(r);
 }
@@ -336,7 +362,7 @@ Datum laplace_path4d_gist_distance(PG_FUNCTION_ARGS){
     double b2 = 0;
     for (size_t i = 0; i < n; i++) { double g = box_gap2(&k->box, x + 4 * i); if (g > b2) b2 = g; }
     if (strategy == LAPLACE_KNN && GIST_LEAF(e)) {   /* the ends pair up under Fréchet only */
-        double f = d2_of(x, k->first), l = d2_of(x + 4 * (n - 1), k->last);
+        double f = d2_of_f32(x, k->first), l = d2_of_f32(x + 4 * (n - 1), k->last);
         if (f > b2) b2 = f;
         if (l > b2) b2 = l;
     }

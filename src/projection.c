@@ -95,8 +95,8 @@ enum { RECOORD_HAS_PATH = 1u, RECOORD_FORCE_EDRIFT = 2u };
 typedef struct {
     lp_id id;
     lp_coord c;
-    int64 e_hilbert, p_hilbert;
-    ItemPointerData e_tid, p_tid;
+    int64 e_hilbert;
+    ItemPointerData e_tid;
     uint32 first_edge, n_edges;
     uint16 part_idx;
     int16 tier;
@@ -113,11 +113,6 @@ typedef struct {
     int64 hilbert;
     lp_coord c;
 } RecoordEUpd;
-
-typedef struct {
-    uint32 node_idx;
-    int64 hilbert;
-} RecoordPUpd;
 
 typedef lp_vec(lp_ref) LpRefVec;
 
@@ -161,17 +156,17 @@ static bool recoord_coord_ok(Datum coord_d, lp_coord *out_c)
     return true;
 }
 
-static void recoord_update_partition(Oid part_oid, Snapshot snap, bool is_entity,
+static void recoord_update_partition(Oid part_oid, Snapshot snap,
                                      const RecoordNode *nodes,
-                                     const void *upds, size_t nupds)
+                                     const RecoordEUpd *eu, size_t nupds)
 {
     if (!nupds)
         return;
     Relation part = table_open(part_oid, NoLock);
     TupleDesc td = RelationGetDescr(part);
     AttrNumber a_hilbert = get_attnum(part_oid, "hilbert");
-    AttrNumber a_coord = is_entity ? get_attnum(part_oid, "coord") : InvalidAttrNumber;
-    if (a_hilbert <= 0 || (is_entity && a_coord <= 0))
+    AttrNumber a_coord = get_attnum(part_oid, "coord");
+    if (a_hilbert <= 0 || a_coord <= 0)
         ereport(ERROR, (errmsg("laplace_recoordinate: canonical partition columns are missing")));
 
     EState *estate = CreateExecutorState();
@@ -184,25 +179,19 @@ static void recoord_update_partition(Oid part_oid, Snapshot snap, bool is_entity
     MemoryContext rowctx = AllocSetContextCreate(CurrentMemoryContext, "recoord row", ALLOCSET_DEFAULT_SIZES);
     CommandId cid = GetCurrentCommandId(true);
 
-    const RecoordEUpd *eu = is_entity ? (const RecoordEUpd *)upds : NULL;
-    const RecoordPUpd *pu = is_entity ? NULL : (const RecoordPUpd *)upds;
-
     for (size_t i = 0; i < nupds; i++) {
         if ((i & 1023u) == 0)
             CHECK_FOR_INTERRUPTS();
         MemoryContextReset(rowctx);
         MemoryContext oldctx = MemoryContextSwitchTo(rowctx);
-        uint32 nidx = is_entity ? eu[i].node_idx : pu[i].node_idx;
-        int64 new_hilbert = is_entity ? eu[i].hilbert : pu[i].hilbert;
-        Datum coord_val = (Datum)0;
-        if (is_entity) {
-            uint8 ewkb[64];
-            if (lp_ewkb_coord(&eu[i].c, ewkb, sizeof ewkb) != 37)
-                ereport(ERROR, (errmsg("laplace_recoordinate: canonical coordinate encoding failed")));
-            coord_val = lp_pg_geom_from_ewkb(ewkb, 37, 0);
-        }
+        uint32 nidx = eu[i].node_idx;
+        int64 new_hilbert = eu[i].hilbert;
+        uint8 ewkb[64];
+        if (lp_ewkb_coord(&eu[i].c, ewkb, sizeof ewkb) != 37)
+            ereport(ERROR, (errmsg("laplace_recoordinate: canonical coordinate encoding failed")));
+        Datum coord_val = lp_pg_geom_from_ewkb(ewkb, 37, 0);
 
-        ItemPointerData tid = is_entity ? nodes[nidx].e_tid : nodes[nidx].p_tid;
+        ItemPointerData tid = nodes[nidx].e_tid;
         ExecClearTuple(old_slot);
         if (!table_tuple_fetch_row_version(part, &tid, snap, old_slot)) {
             if (IsolationUsesXactSnapshot())
@@ -220,10 +209,8 @@ static void recoord_update_partition(Oid part_oid, Snapshot snap, bool is_entity
             }
             new_slot->tts_values[a_hilbert - 1] = Int64GetDatum(new_hilbert);
             new_slot->tts_isnull[a_hilbert - 1] = false;
-            if (is_entity) {
-                new_slot->tts_values[a_coord - 1] = coord_val;
-                new_slot->tts_isnull[a_coord - 1] = false;
-            }
+            new_slot->tts_values[a_coord - 1] = coord_val;
+            new_slot->tts_isnull[a_coord - 1] = false;
             ExecStoreVirtualTuple(new_slot);
 
             TM_FailureData tmfd;
@@ -357,7 +344,6 @@ Datum laplace_recoordinate(PG_FUNCTION_ARGS)
             Relation part = table_open(pparts[p], lmode);
             AttrNumber a_ent = get_attnum(pparts[p], "entity");
             AttrNumber a_path = get_attnum(pparts[p], "path");
-            AttrNumber a_hilb = get_attnum(pparts[p], "hilbert");
             TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
             TupleTableSlot *slot = table_slot_create(part, NULL);
 
@@ -377,12 +363,9 @@ Datum laplace_recoordinate(PG_FUNCTION_ARGS)
                     ereport(ERROR, (errcode(ERRCODE_CHECK_VIOLATION), errmsg("laplace_recoordinate: unpaired entity/path or invalid tier")));
 
                 Datum d_path = slot_getattr(slot, a_path, &nl);
-                Datum d_hilb = slot_getattr(slot, a_hilb, &nl);
-                if (nl) ereport(ERROR, (errcode(ERRCODE_CHECK_VIOLATION), errmsg("laplace_recoordinate: null path or hilbert")));
+                if (nl) ereport(ERROR, (errcode(ERRCODE_CHECK_VIOLATION), errmsg("laplace_recoordinate: null path")));
 
                 node->flags |= RECOORD_HAS_PATH;
-                node->p_tid = slot->tts_tid;
-                node->p_hilbert = DatumGetInt64(d_hilb);
 
                 Geo g = geo_of(d_path);
                 if (node->tier == 0) {
@@ -444,9 +427,7 @@ Datum laplace_recoordinate(PG_FUNCTION_ARGS)
             order[tier_off[nodes[i].tier]++] = (uint32)i;
 
         typedef lp_vec(RecoordEUpd) RecoordEUpdVec;
-        typedef lp_vec(RecoordPUpd) RecoordPUpdVec;
         RecoordEUpdVec *e_upds = apply ? palloc0((size_t)neparts * sizeof(RecoordEUpdVec)) : NULL;
-        RecoordPUpdVec *p_upds = apply ? palloc0((size_t)npparts * sizeof(RecoordPUpdVec)) : NULL;
 
         size_t child_cap = 64;
         lp_ref *children = palloc(child_cap * sizeof(lp_ref));
@@ -485,7 +466,6 @@ Datum laplace_recoordinate(PG_FUNCTION_ARGS)
             bool e_drift = (node->flags & RECOORD_FORCE_EDRIFT) != 0
                 || memcmp(node->c.m, res.c.m, sizeof res.c.m) != 0
                 || node->e_hilbert != proj_hilbert;
-            bool p_drift = node->p_hilbert != proj_hilbert;
 
             node->c = res.c;
             if (e_drift) {
@@ -495,20 +475,11 @@ Datum laplace_recoordinate(PG_FUNCTION_ARGS)
                     lp_push(&e_upds[node->part_idx], u);
                 }
             }
-            if (p_drift) {
-                physicality_rows++;
-                if (apply) {
-                    RecoordPUpd u = {.node_idx = idx, .hilbert = proj_hilbert};
-                    lp_push(&p_upds[node->part_idx], u);
-                }
-            }
         }
 
         if (apply) {
             for (int p = 0; p < neparts; p++)
-                recoord_update_partition(eparts[p], snap, true, nodes, e_upds[p].v, e_upds[p].n);
-            for (int p = 0; p < npparts; p++)
-                recoord_update_partition(pparts[p], snap, false, nodes, p_upds[p].v, p_upds[p].n);
+                recoord_update_partition(eparts[p], snap, nodes, e_upds[p].v, e_upds[p].n);
         }
     } PG_FINALLY(); {
         lp_idmap_free(by_id);

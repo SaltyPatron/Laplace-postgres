@@ -13,10 +13,10 @@ INSERT INTO holder_fixture SELECT value,laplace_compose(ARRAY[pg_temp.leaf(ascii
 FROM (VALUES('ab',true),('ac',true),('ad',false),('bb',false),('bc',true)) v(value,claim);
 INSERT INTO entity(id,tier,coord,hilbert)
 SELECT id,laplace_tier(label),laplace_coord(label),laplace_hilbert(label) FROM holder_fixture;
-INSERT INTO physicality(entity,tier,hilbert,path,mask)
-SELECT f.id,e.tier,e.hilbert,laplace_path(ARRAY[
+INSERT INTO physicality(entity,tier,path,mask)
+SELECT f.id,e.tier,laplace_path(ARRAY[
  pg_temp.leaf(ascii(substr(label,1,1))),pg_temp.leaf(ascii(substr(label,2,1)))]),
- CASE WHEN claim THEN laplace_mask_slot('kind','claim') ELSE B'0'::bit(64) END
+ CASE WHEN claim THEN laplace_mask_slot('kind','claim') ELSE 0::bigint END
 FROM holder_fixture f JOIN entity e ON e.id=f.id;
 INSERT INTO consensus SELECT id,1550,60,0.06,7 FROM holder_fixture WHERE claim;
 DO $$
