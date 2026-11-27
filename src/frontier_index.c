@@ -137,17 +137,19 @@ static void refresh_part_dir(CanonicalPartDir *dir)
                             dir->aux2[i] = ioid;
                         if (opfname) pfree(opfname);
                     } else if (is_attestation && idx->rd_rel->relam == BTREE_AM_OID) {
+                        List *pred = RelationGetIndexPredicate(idx);
                         if (!OidIsValid(dir->pks[i]) && idx->rd_index->indisunique &&
+                            pred == NIL &&
                             idx->rd_index->indnkeyatts >= 3 && pc != InvalidAttrNumber &&
                             pw != InvalidAttrNumber && pl != InvalidAttrNumber &&
                             idx->rd_index->indkey.values[0] == pc &&
                             idx->rd_index->indkey.values[1] == pw &&
                             idx->rd_index->indkey.values[2] == pl)
                             dir->pks[i] = ioid;
-                        else if (!OidIsValid(dir->aux[i]) && idx->rd_index->indnkeyatts >= 2 &&
-                                 pw != InvalidAttrNumber && pl != InvalidAttrNumber &&
-                                 idx->rd_index->indkey.values[0] == pw &&
-                                 idx->rd_index->indkey.values[1] == pl)
+                        else if (!OidIsValid(dir->aux[i]) && idx->rd_index->indisunique &&
+                                 pred != NIL &&
+                                 idx->rd_index->indnkeyatts == 1 && pc != InvalidAttrNumber &&
+                                 idx->rd_index->indkey.values[0] == pc)
                             dir->aux[i] = ioid;
                     }
                 }
@@ -606,23 +608,15 @@ static int cmp_lp_id(const void *a, const void *b)
     return memcmp(((const lp_id *)a)->b, ((const lp_id *)b)->b, sizeof(lp_id));
 }
 
-static int witness_pick_better(const WitnessPick *a, const WitnessPick *b)
+static bool witness_read_slot(TupleTableSlot *slot, AttrNumber ac, AttrNumber al, AttrNumber at, WitnessPick *out)
 {
-    if (!b->present) return 1;
-    if (a->has_lineage != b->has_lineage) return !a->has_lineage ? 1 : -1;
-    if (!a->has_lineage) return 0;
-    return memcmp(a->lineage.b, b->lineage.b, sizeof(lp_id)) < 0 ? 1 : 0;
-}
-
-static bool witness_read_slot(TupleTableSlot *slot, AttrNumber aw, AttrNumber al, AttrNumber at, WitnessPick *out)
-{
-    bool nw = true, nl = true, nt = true;
-    Datum dw = slot_getattr(slot, aw, &nw);
+    bool nc = true, nl = true, nt = true;
+    Datum dc = slot_getattr(slot, ac, &nc);
     Datum dl = slot_getattr(slot, al, &nl);
     Datum dt = slot_getattr(slot, at, &nt);
-    if (nw || nt)
+    if (nc || nt)
         ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("Native witness frontier: null witness metadata")));
-    memcpy(out->id.b, DatumGetPointer(dw), sizeof(lp_id));
+    memcpy(out->id.b, DatumGetPointer(dc), sizeof(lp_id));
     out->has_lineage = !nl;
     if (!nl) memcpy(out->lineage.b, DatumGetPointer(dl), sizeof(lp_id));
     else memset(out->lineage.b, 0, sizeof(lp_id));
@@ -635,56 +629,73 @@ void lp_pg_lookup_witnesses(const lp_id *ids,size_t count,bool lineage,lp_pg_wit
 {
     if(!count)return;
     Oid target=lp_pg_relation("attestation");
-    const char *selected[]={"witness","trust","lineage"};
+    const char *selected[]={"claim","witness","trust","lineage"};
     const char *column;
-    Relation parent=lp_pg_read_parent(target,&column,selected,lineage?3:2);
-    Oid native_id=get_atttype(target,get_attnum(target,"witness"));
+    Relation parent=lp_pg_read_parent(target,&column,selected,lineage?4:3);
+    Oid native_id=get_atttype(target,get_attnum(target,"claim"));
+    PartitionKey pkey=RelationGetPartitionKey(parent);
+    PartitionDesc pdesc=pkey?RelationGetPartitionDesc(parent,true):NULL;
+
+    if(count>MaxAllocHugeSize/sizeof(PresenceKey))
+        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native witness frontier exceeds addressable memory")));
+    PresenceKey *keys=palloc_extended(count*sizeof(*keys),MCXT_ALLOC_HUGE);
+    for(size_t i=0;i<count;i++)
+        keys[i]=(PresenceKey){
+            .partition=lp_pg_enrichment_partition(target,pkey,pdesc,PointerGetDatum(&ids[i])),
+            .id=ids[i],.ordinal=0
+        };
     table_close(parent,NoLock);
 
-    if(count>MaxAllocHugeSize/sizeof(lp_id))
-        ereport(ERROR,(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),errmsg("Native witness frontier exceeds addressable memory")));
-    lp_id *uniq=palloc_extended(count*sizeof(lp_id),MCXT_ALLOC_HUGE);
-    memcpy(uniq,ids,count*sizeof(lp_id));
-    lp_sort(uniq,count,sizeof(lp_id),cmp_lp_id);
+    lp_sort(keys,count,sizeof(*keys),presence_order);
     size_t nuniq=0;
     for(size_t i=0;i<count;i++)
-        if(nuniq==0||!lp_id_eq(&uniq[nuniq-1],&uniq[i]))
-            uniq[nuniq++]=uniq[i];
-    WitnessPick *best=palloc_extended(nuniq*sizeof(WitnessPick),MCXT_ALLOC_HUGE|MCXT_ALLOC_ZERO);
+        if(nuniq==0||!lp_id_eq(&keys[nuniq-1].id,&keys[i].id))
+            keys[nuniq++]=keys[i];
 
     const Oid *parts=NULL,*aux=NULL;
     int nparts=lp_pg_canonical_partitions("attestation",&parts,NULL,&aux,NULL);
     Snapshot snap=GetActiveSnapshot();
-    for(int p=0;p<nparts;p++){
-        if(!OidIsValid(aux[p]))
-            ereport(ERROR,(errmsg("Native witness frontier: attestation partition missing attestation_witness_lineage index")));
-        Relation part=table_open(parts[p],AccessShareLock);
-        Relation idx=index_open(aux[p],AccessShareLock);
-        AttrNumber aw=get_attnum(parts[p],"witness"),al=get_attnum(parts[p],"lineage"),at=get_attnum(parts[p],"trust");
-        Oid eq_op=get_opfamily_member(idx->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
-        RegProcedure eq_proc=get_opcode(eq_op);
-        IndexScanDesc scan=index_beginscan(part,idx,snap,NULL,1,0);
-        TupleTableSlot *slot=table_slot_create(part,NULL);
-        ScanKeyData sk;
-        for(size_t i=0;i<nuniq;i++){
-            if((i&255)==0)CHECK_FOR_INTERRUPTS();
-            ScanKeyEntryInitialize(&sk,0,1,BTEqualStrategyNumber,native_id,idx->rd_indcollation[0],eq_proc,PointerGetDatum(&uniq[i]));
-            index_rescan(scan,&sk,1,NULL,0);
-            if(index_getnext_slot(scan,ForwardScanDirection,slot)){
-                WitnessPick cand;
-                witness_read_slot(slot,aw,al,at,&cand);
-                if(witness_pick_better(&cand,&best[i])>0)best[i]=cand;
-                ExecClearTuple(slot);
-            }
-        }
-        ExecDropSingleTupleTableSlot(slot);index_endscan(scan);
-        index_close(idx,NoLock);table_close(part,NoLock);
-    }
+    size_t array_ids=(MaxAllocSize-ARR_OVERHEAD_NONULLS(1))/sizeof(lp_id);
 
-    for(size_t i=0;i<nuniq;i++)
-        if(best[i].present)
-            visit(&uniq[i],(lineage&&best[i].has_lineage)?&best[i].lineage:NULL,best[i].trust,context);
-    pfree(best);pfree(uniq);
+    for(size_t begin=0;begin<nuniq;){
+        CHECK_FOR_INTERRUPTS();
+        size_t end=begin+1;
+        while(end<nuniq&&keys[end].partition==keys[begin].partition)end++;
+        if(end-begin>array_ids)end=begin+array_ids;
+
+        Oid partOid=keys[begin].partition;
+        Oid auxOid=InvalidOid;
+        for(int p=0;p<nparts;p++)if(parts[p]==partOid){auxOid=aux[p];break;}
+        if(!OidIsValid(auxOid))
+            ereport(ERROR,(errmsg("Native witness frontier: attestation partition missing attestation_witness_reg index")));
+        Relation part=table_open(partOid,AccessShareLock);
+        Relation idx=index_open(auxOid,AccessShareLock);
+        AttrNumber ac=get_attnum(partOid,"claim"),al=get_attnum(partOid,"lineage"),at=get_attnum(partOid,"trust");
+
+        Datum *vals=palloc((Size)(end-begin)*sizeof(Datum));
+        for(size_t i=begin;i<end;i++)vals[i-begin]=PointerGetDatum(&keys[i].id);
+        ArrayType *wanted=construct_array(vals,(int)(end-begin),native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
+        pfree(vals);
+
+        Oid eq_op=get_opfamily_member(idx->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
+        ScanKeyData sk;
+        ScanKeyEntryInitialize(&sk,SK_SEARCHARRAY,1,BTEqualStrategyNumber,native_id,
+            idx->rd_indcollation[0],get_opcode(eq_op),PointerGetDatum(wanted));
+        IndexScanDesc scan=index_beginscan(part,idx,snap,NULL,1,0);
+        index_rescan(scan,&sk,1,NULL,0);
+        TupleTableSlot *slot=table_slot_create(part,NULL);
+        while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+            CHECK_FOR_INTERRUPTS();
+            WitnessPick reg;
+            witness_read_slot(slot,ac,al,at,&reg);
+            visit(&reg.id,(lineage&&reg.has_lineage)?&reg.lineage:NULL,reg.trust,context);
+            ExecClearTuple(slot);
+        }
+        ExecDropSingleTupleTableSlot(slot);index_endscan(scan);pfree(wanted);
+        index_close(idx,NoLock);table_close(part,NoLock);
+        begin=end;
+    }
+    pfree(keys);
 }
 
 static void present_bitmap_row(TupleTableSlot *slot,const PresenceKey *key,void *context)
@@ -730,91 +741,42 @@ static void witness_trust_emit(const lp_id *id,const lp_id *lineage,double trust
     if(lineage)pfree(DatumGetPointer(v[1]));
 }
 
-typedef struct {
-    Relation part,idx;
-    TupleTableSlot *slot;
-    IndexScanDesc scan;
-    RegProcedure gt_proc;
-    AttrNumber aw,al,at;
-    bool active;
-    WitnessPick cur;
-} WitnessSkipPart;
-
 void lp_pg_scan_all_witnesses(lp_pg_witness_visit visit,void *context)
 {
     if(!visit)return;
     Oid target=lp_pg_relation("attestation");
-    const char *selected[]={"witness","lineage","trust"};
+    const char *selected[]={"claim","witness","lineage","trust"};
     const char *column;
-    Relation parent=lp_pg_read_parent(target,&column,selected,3);
-    Oid native_id=get_atttype(target,get_attnum(target,"witness"));
+    Relation parent=lp_pg_read_parent(target,&column,selected,4);
     table_close(parent,NoLock);
 
     const Oid *parts=NULL,*aux=NULL;
     int nparts=lp_pg_canonical_partitions("attestation",&parts,NULL,&aux,NULL);
-    WitnessSkipPart *skips=palloc0((Size)nparts*sizeof(*skips));
     Snapshot snap=GetActiveSnapshot();
-    int active_count=0;
     for(int p=0;p<nparts;p++){
-        WitnessSkipPart *sp=&skips[p];
-        if(!OidIsValid(aux[p]))
-            ereport(ERROR,(errmsg("laplace_witness_trust: missing attestation_witness_lineage index")));
-        sp->part=table_open(parts[p],AccessShareLock);
-        sp->idx=index_open(aux[p],AccessShareLock);
-        sp->aw=get_attnum(parts[p],"witness");
-        sp->al=get_attnum(parts[p],"lineage");
-        sp->at=get_attnum(parts[p],"trust");
-        Oid gt_op=get_opfamily_member(sp->idx->rd_opfamily[0],native_id,native_id,BTGreaterStrategyNumber);
-        sp->gt_proc=get_opcode(gt_op);
-        sp->slot=table_slot_create(sp->part,NULL);
-        IndexScanDesc seed=index_beginscan(sp->part,sp->idx,snap,NULL,0,0);
-        index_rescan(seed,NULL,0,NULL,0);
-        if(index_getnext_slot(seed,ForwardScanDirection,sp->slot)){
-            witness_read_slot(sp->slot,sp->aw,sp->al,sp->at,&sp->cur);
-            ExecClearTuple(sp->slot);
-            sp->scan=index_beginscan(sp->part,sp->idx,snap,NULL,1,0);
-            sp->active=true;
-            active_count++;
-        }
-        index_endscan(seed);
-    }
-
-    while(active_count>0){
         CHECK_FOR_INTERRUPTS();
-        lp_id min_w;bool have_min=false;
-        for(int p=0;p<nparts;p++){
-            if(!skips[p].active)continue;
-            if(!have_min||memcmp(skips[p].cur.id.b,min_w.b,sizeof(lp_id))<0){
-                min_w=skips[p].cur.id;have_min=true;
-            }
+        if(!OidIsValid(aux[p]))
+            ereport(ERROR,(errmsg("laplace_witness_trust: missing attestation_witness_reg index")));
+        Relation part=table_open(parts[p],AccessShareLock);
+        Relation idx=index_open(aux[p],AccessShareLock);
+        AttrNumber ac=get_attnum(parts[p],"claim");
+        AttrNumber al=get_attnum(parts[p],"lineage");
+        AttrNumber at=get_attnum(parts[p],"trust");
+        TupleTableSlot *slot=table_slot_create(part,NULL);
+        IndexScanDesc scan=index_beginscan(part,idx,snap,NULL,0,0);
+        index_rescan(scan,NULL,0,NULL,0);
+        while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+            CHECK_FOR_INTERRUPTS();
+            WitnessPick reg;
+            witness_read_slot(slot,ac,al,at,&reg);
+            visit(&reg.id,reg.has_lineage?&reg.lineage:NULL,reg.trust,context);
+            ExecClearTuple(slot);
         }
-        if(!have_min)break;
-        WitnessPick best={0};
-        for(int p=0;p<nparts;p++){
-            if(!skips[p].active||!lp_id_eq(&skips[p].cur.id,&min_w))continue;
-            if(witness_pick_better(&skips[p].cur,&best)>0)best=skips[p].cur;
-            ScanKeyData sk;
-            ScanKeyEntryInitialize(&sk,0,1,BTGreaterStrategyNumber,native_id,
-                skips[p].idx->rd_indcollation[0],skips[p].gt_proc,PointerGetDatum(&min_w));
-            index_rescan(skips[p].scan,&sk,1,NULL,0);
-            if(index_getnext_slot(skips[p].scan,ForwardScanDirection,skips[p].slot)){
-                witness_read_slot(skips[p].slot,skips[p].aw,skips[p].al,skips[p].at,&skips[p].cur);
-                ExecClearTuple(skips[p].slot);
-            }else{
-                skips[p].active=false;
-                active_count--;
-            }
-        }
-        visit(&min_w,best.has_lineage?&best.lineage:NULL,best.trust,context);
+        index_endscan(scan);
+        ExecDropSingleTupleTableSlot(slot);
+        index_close(idx,NoLock);
+        table_close(part,NoLock);
     }
-
-    for(int p=0;p<nparts;p++){
-        if(skips[p].scan)index_endscan(skips[p].scan);
-        if(skips[p].slot)ExecDropSingleTupleTableSlot(skips[p].slot);
-        if(skips[p].idx)index_close(skips[p].idx,NoLock);
-        if(skips[p].part)table_close(skips[p].part,NoLock);
-    }
-    pfree(skips);
 }
 
 PG_FUNCTION_INFO_V1(laplace_witness_trust);
@@ -953,82 +915,116 @@ void lp_pg_read_attestation_pk(const lp_id *claims,int n,const lp_idmap *roots,P
     Snapshot snap=GetActiveSnapshot();
     size_t array_ids=(MaxAllocSize-ARR_OVERHEAD_NONULLS(1))/sizeof(lp_id);
 
-    for(size_t begin=0;begin<nuniq;){
-        CHECK_FOR_INTERRUPTS();
-        size_t end=begin+1;
-        while(end<nuniq&&keys[end].partition==keys[begin].partition)end++;
-        if(end-begin>array_ids)end=begin+array_ids;
+    size_t start_n=out->n;
+    lp_idmap *seen_wits=lp_idmap_new();
+    lp_vec(uint8_t) trust_null={0};
 
-        Oid partOid=keys[begin].partition;
-        Relation part=table_open(partOid,AccessShareLock);
-        Oid pkOid=InvalidOid;
-        for(int p=0;p<nparts;p++)if(parts[p]==partOid){pkOid=pks[p];break;}
-        if(!OidIsValid(pkOid))pkOid=RelationGetPrimaryKeyIndex(part,false);
-        if(!OidIsValid(pkOid))ereport(ERROR,(errmsg("Native attestation reader: partition has no primary index")));
-        Relation idx=index_open(pkOid,AccessShareLock);
-
-        Datum *vals=palloc((Size)(end-begin)*sizeof(Datum));
-        for(size_t i=begin;i<end;i++)vals[i-begin]=PointerGetDatum(&keys[i].id);
-        ArrayType *wanted=construct_array(vals,(int)(end-begin),native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
-        pfree(vals);
-
-        Oid eq_op=get_opfamily_member(idx->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
-        ScanKeyData sk;
-        ScanKeyEntryInitialize(&sk,SK_SEARCHARRAY,1,BTEqualStrategyNumber,native_id,
-            idx->rd_indcollation[0],get_opcode(eq_op),PointerGetDatum(wanted));
-        IndexScanDesc scan=index_beginscan(part,idx,snap,NULL,1,0);
-        index_rescan(scan,&sk,1,NULL,0);
-
-        AttrNumber ac=get_attnum(partOid,"claim"),aw=get_attnum(partOid,"witness"),
-                   al=get_attnum(partOid,"lineage"),ag=get_attnum(partOid,"games"),
-                   atk=get_attnum(partOid,"tokens"),asc=get_attnum(partOid,"score"),
-                   ap=get_attnum(partOid,"position"),at=get_attnum(partOid,"trust");
-        TupleTableSlot *slot=table_slot_create(part,NULL);
-        while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+    PG_TRY();{
+        for(size_t begin=0;begin<nuniq;){
             CHECK_FOR_INTERRUPTS();
-            bool missing;Datum val;
-            PgAttrRow row={.witness=1};
-            val=slot_getattr(slot,ac,&missing);
-            if(missing)ereport(ERROR,(errmsg("laplace attestation: null claim")));
-            memcpy(row.claim.b,DatumGetPointer(val),16);
-            val=slot_getattr(slot,aw,&missing);
-            if(missing)ereport(ERROR,(errmsg("laplace attestation: null witness")));
-            memcpy(row.trunk.b,DatumGetPointer(val),16);
-            if(roots&&lp_idmap_find(roots,&row.trunk)<0){ExecClearTuple(slot);continue;}
-            val=slot_getattr(slot,al,&missing);
-            row.has_dependence=!missing;
-            if(!missing)memcpy(row.dependence.b,DatumGetPointer(val),16);
-            val=slot_getattr(slot,ag,&missing);
-            int64 games=missing?0:DatumGetInt64(val);
-            val=slot_getattr(slot,atk,&missing);
-            int64 tokens=missing?games:DatumGetInt64(val);
-            val=slot_getattr(slot,asc,&missing);
-            double mean_score=missing?0.0:DatumGetFloat8(val);
-            val=slot_getattr(slot,ap,&missing);
-            row.position=missing?0:(uint32_t)DatumGetInt32(val);
-            val=slot_getattr(slot,at,&missing);
-            row.trust=missing?0.0:DatumGetFloat8(val);
-            row.source_trust=row.trust;
-            row.games=(double)games;
-            row.tokens=(double)(tokens>=games?tokens:games);
-            row.score=(double)games*mean_score;
-            if(witnesses){
-                bool fresh;
-                PgSeriesWitness *w=lp_idmap_get(witnesses,&row.trunk,&fresh);
-                if(fresh||!row.has_dependence){
-                    w->trust=row.trust;
-                    w->has_lineage=row.has_dependence;
-                    if(row.has_dependence)w->lineage=row.dependence;
-                }
+            size_t end=begin+1;
+            while(end<nuniq&&keys[end].partition==keys[begin].partition)end++;
+            if(end-begin>array_ids)end=begin+array_ids;
+
+            Oid partOid=keys[begin].partition;
+            Relation part=table_open(partOid,AccessShareLock);
+            Oid pkOid=InvalidOid;
+            for(int p=0;p<nparts;p++)if(parts[p]==partOid){pkOid=pks[p];break;}
+            if(!OidIsValid(pkOid))pkOid=RelationGetPrimaryKeyIndex(part,false);
+            if(!OidIsValid(pkOid))ereport(ERROR,(errmsg("Native attestation reader: partition has no primary index")));
+            Relation idx=index_open(pkOid,AccessShareLock);
+
+            Datum *vals=palloc((Size)(end-begin)*sizeof(Datum));
+            for(size_t i=begin;i<end;i++)vals[i-begin]=PointerGetDatum(&keys[i].id);
+            ArrayType *wanted=construct_array(vals,(int)(end-begin),native_id,sizeof(lp_id),false,TYPALIGN_CHAR);
+            pfree(vals);
+
+            Oid eq_op=get_opfamily_member(idx->rd_opfamily[0],native_id,native_id,BTEqualStrategyNumber);
+            ScanKeyData sk;
+            ScanKeyEntryInitialize(&sk,SK_SEARCHARRAY,1,BTEqualStrategyNumber,native_id,
+                idx->rd_indcollation[0],get_opcode(eq_op),PointerGetDatum(wanted));
+            IndexScanDesc scan=index_beginscan(part,idx,snap,NULL,1,0);
+            index_rescan(scan,&sk,1,NULL,0);
+
+            AttrNumber ac=get_attnum(partOid,"claim"),aw=get_attnum(partOid,"witness"),
+                       al=get_attnum(partOid,"lineage"),ag=get_attnum(partOid,"games"),
+                       atk=get_attnum(partOid,"tokens"),asc=get_attnum(partOid,"score"),
+                       ap=get_attnum(partOid,"position"),at=get_attnum(partOid,"trust");
+            TupleTableSlot *slot=table_slot_create(part,NULL);
+            while(index_getnext_slot(scan,ForwardScanDirection,slot)){
+                CHECK_FOR_INTERRUPTS();
+                bool missing;Datum val;
+                PgAttrRow row={.witness=1};
+                val=slot_getattr(slot,ac,&missing);
+                if(missing)ereport(ERROR,(errmsg("laplace attestation: null claim")));
+                memcpy(row.claim.b,DatumGetPointer(val),16);
+                val=slot_getattr(slot,aw,&missing);
+                if(missing)ereport(ERROR,(errmsg("laplace attestation: null witness")));
+                memcpy(row.trunk.b,DatumGetPointer(val),16);
+                if(lp_id_eq(&row.claim,&row.trunk)){ExecClearTuple(slot);continue;}
+                if(roots&&lp_idmap_find(roots,&row.trunk)<0){ExecClearTuple(slot);continue;}
+                val=slot_getattr(slot,al,&missing);
+                row.has_dependence=!missing;
+                if(!missing)memcpy(row.dependence.b,DatumGetPointer(val),16);
+                val=slot_getattr(slot,ag,&missing);
+                int64 games=missing?0:DatumGetInt64(val);
+                val=slot_getattr(slot,atk,&missing);
+                int64 tokens=missing?games:DatumGetInt64(val);
+                val=slot_getattr(slot,asc,&missing);
+                double mean_score=missing?0.0:DatumGetFloat8(val);
+                val=slot_getattr(slot,ap,&missing);
+                row.position=missing?0:(uint32_t)DatumGetInt32(val);
+                val=slot_getattr(slot,at,&missing);
+                row.trust=missing?0.0:DatumGetFloat8(val);
+                row.source_trust=row.trust;
+                row.games=(double)games;
+                row.tokens=(double)(tokens>=games?tokens:games);
+                row.score=(double)games*mean_score;
+                lp_idmap_put(seen_wits,&row.trunk,NULL);
+                lp_push(&trust_null,(uint8_t)(missing?1:0));
+                lp_push(out,row);
+                ExecClearTuple(slot);
             }
-            lp_push(out,row);
-            ExecClearTuple(slot);
+            ExecDropSingleTupleTableSlot(slot);index_endscan(scan);pfree(wanted);
+            index_close(idx,NoLock);table_close(part,NoLock);
+            begin=end;
         }
-        ExecDropSingleTupleTableSlot(slot);index_endscan(scan);pfree(wanted);
-        index_close(idx,NoLock);table_close(part,NoLock);
-        begin=end;
-    }
-    pfree(keys);
+
+        if(lp_idmap_count(seen_wits)>0){
+            lp_idmap *reg=lp_idmap_sized(sizeof(PgSeriesWitness));
+            PG_TRY();{
+                lp_pg_lookup_witnesses(lp_idmap_keys(seen_wits),lp_idmap_count(seen_wits),true,lp_pg_witness_metadata,reg);
+                for(size_t k=start_n;k<out->n;k++){
+                    PgAttrRow *r=&out->v[k];
+                    const PgSeriesWitness *rw=lp_idmap_lookup(reg,&r->trunk);
+                    uint8_t tn=trust_null.v[k-start_n];
+                    if(rw){
+                        r->source_trust=rw->trust;
+                        if(tn)r->trust=rw->trust;
+                    }else if(tn){
+                        ereport(ERROR,(errcode(ERRCODE_DATA_EXCEPTION),errmsg("laplace attestation: unregistered witness for NULL-trust row")));
+                    }
+                    if(witnesses){
+                        bool fresh=false;
+                        PgSeriesWitness *w=lp_idmap_get(witnesses,&r->trunk,&fresh);
+                        if(rw){
+                            if(fresh)*w=*rw;
+                        }else if(fresh||!r->has_dependence){
+                            w->trust=r->trust;
+                            w->has_lineage=r->has_dependence;
+                            if(r->has_dependence)w->lineage=r->dependence;
+                        }
+                    }
+                }
+            }PG_FINALLY();{
+                lp_idmap_free(reg);
+            }PG_END_TRY();
+        }
+    }PG_FINALLY();{
+        lp_vec_free(&trust_null);
+        lp_idmap_free(seen_wits);
+        pfree(keys);
+    }PG_END_TRY();
 }
 
 typedef lp_vec(lp_id) FiIdVec;
@@ -1469,18 +1465,17 @@ Datum laplace_standing_counts(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), vals, nulls)));
 }
 
-/* Direct-AM attestation count: total rows when NULL, or distinct claims for one witness. */
+/* Direct-AM attestation count: total testimony rows when NULL, or distinct claims for one witness. */
 PG_FUNCTION_INFO_V1(laplace_attestation_count);
 Datum laplace_attestation_count(PG_FUNCTION_ARGS)
 {
     Oid target = lp_pg_relation("attestation");
     const char *selected[] = { "claim", "witness" }, *column = NULL;
     Relation parent = lp_pg_read_parent(target, &column, selected, 2);
-    Oid native_id = get_atttype(target, get_attnum(target, "witness"));
     table_close(parent, NoLock);
 
-    const Oid *parts = NULL, *aux = NULL;
-    int nparts = lp_pg_canonical_partitions("attestation", &parts, NULL, &aux, NULL);
+    const Oid *parts = NULL;
+    int nparts = lp_pg_canonical_partitions("attestation", &parts, NULL, NULL, NULL);
     Snapshot snap = GetActiveSnapshot();
     bool by_witness = (PG_NARGS() > 0 && !PG_ARGISNULL(0));
     int64 total = 0;
@@ -1489,11 +1484,17 @@ Datum laplace_attestation_count(PG_FUNCTION_ARGS)
         for (int p = 0; p < nparts; p++) {
             CHECK_FOR_INTERRUPTS();
             Relation part = table_open(parts[p], AccessShareLock);
+            AttrNumber ac = get_attnum(parts[p], "claim");
+            AttrNumber aw = get_attnum(parts[p], "witness");
             TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
             TupleTableSlot *slot = table_slot_create(part, NULL);
             while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
                 CHECK_FOR_INTERRUPTS();
-                total++;
+                bool nc = true, nw = true;
+                Datum dc = slot_getattr(slot, ac, &nc);
+                Datum dw = slot_getattr(slot, aw, &nw);
+                if (!nc && !nw && !lp_id_eq((const lp_id *)DatumGetPointer(dc), (const lp_id *)DatumGetPointer(dw)))
+                    total++;
                 ExecClearTuple(slot);
             }
             ExecDropSingleTupleTableSlot(slot);
@@ -1510,28 +1511,24 @@ Datum laplace_attestation_count(PG_FUNCTION_ARGS)
     {
         for (int p = 0; p < nparts; p++) {
             CHECK_FOR_INTERRUPTS();
-            if (!OidIsValid(aux[p]))
-                ereport(ERROR, (errmsg("laplace_attestation_count: missing attestation_witness_lineage index")));
             Relation part = table_open(parts[p], AccessShareLock);
-            Relation idx = index_open(aux[p], AccessShareLock);
             AttrNumber ac = get_attnum(parts[p], "claim");
-            Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
-            ScanKeyData sk;
-            ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, native_id,
-                                   idx->rd_indcollation[0], get_opcode(eq_op), PointerGetDatum(&witness));
-            IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 1, 0);
-            index_rescan(scan, &sk, 1, NULL, 0);
+            AttrNumber aw = get_attnum(parts[p], "witness");
+            TableScanDesc scan = table_beginscan(part, snap, 0, NULL);
             TupleTableSlot *slot = table_slot_create(part, NULL);
-            while (index_getnext_slot(scan, ForwardScanDirection, slot)) {
+            while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
                 CHECK_FOR_INTERRUPTS();
-                bool isnull = true;
-                Datum dc = slot_getattr(slot, ac, &isnull);
-                if (!isnull) lp_idmap_put(claims, (const lp_id *)DatumGetPointer(dc), NULL);
+                bool nc = true, nw = true;
+                Datum dw = slot_getattr(slot, aw, &nw);
+                if (!nw && lp_id_eq((const lp_id *)DatumGetPointer(dw), &witness)) {
+                    Datum dc = slot_getattr(slot, ac, &nc);
+                    if (!nc && !lp_id_eq((const lp_id *)DatumGetPointer(dc), &witness))
+                        lp_idmap_put(claims, (const lp_id *)DatumGetPointer(dc), NULL);
+                }
                 ExecClearTuple(slot);
             }
             ExecDropSingleTupleTableSlot(slot);
-            index_endscan(scan);
-            index_close(idx, NoLock);
+            table_endscan(scan);
             table_close(part, NoLock);
         }
         total = (int64)lp_idmap_count(claims);

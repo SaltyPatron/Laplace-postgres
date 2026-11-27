@@ -173,6 +173,7 @@ laplace_present_trunks	false
 laplace_project_path	false
 laplace_pull	false
 laplace_recoordinate	false
+laplace_register_witnesses	false
 laplace_replay_export	false
 laplace_replay_verify	false
 laplace_resolve_ref	false

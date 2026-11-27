@@ -413,7 +413,7 @@ BEGIN
   floor_claim:=pg_temp.series_node(ARRAY[floor_id,laplace_id('lpcheckxis'),laplace_id('lpcheckxnoun')],'claim');
   root:=pg_temp.series_node(ARRAY[floor_claim,laplace_id('lpcheckxthree')],'record',ARRAY[2147483648,0]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-    VALUES(md5('attestation-witness-'||root::text)::blake3,root,NULL,1,1,1,NULL,0.85);
+    VALUES(root,root,NULL,0,0,0,NULL,0.85);
   INSERT INTO stage.attestation_test VALUES(floor_claim,root,NULL,1,1,0.85);
   PERFORM laplace_attest_series('stage.attestation_test',ARRAY[floor_claim]);
   IF EXISTS(SELECT FROM entity WHERE id=floor_id)
@@ -479,12 +479,17 @@ BEGIN
     RAISE EXCEPTION 'staging order changed the standing';
   END IF;
 END $$;
--- Publish the real sources' attestations, as the loader records them: each
--- source's record says claim a 1000 times and claim b 3 times; three derives
--- from one. Pending rows overlay that same evidence and must not double its games.
+-- Publish the real sources' registrations and attestations, as the loader records them:
+-- each source registers once on (w, w) with its lineage/trust, and each normal claim row
+-- inherits that metadata (lineage=NULL, trust=NULL). Pending rows overlay that same evidence
+-- and must not double its games.
 INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-  SELECT c.id, w.id, CASE WHEN w.name = 'three' THEN (SELECT id FROM series_sources WHERE name = 'one') END,
-         CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, 1, NULL, 0.85
+  SELECT w.id, w.id, CASE WHEN w.name = 'three' THEN (SELECT id FROM series_sources WHERE name = 'one') END,
+         0, 0, 0, NULL, 0.85
+  FROM series_sources w;
+INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+  SELECT c.id, w.id, NULL,
+         CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, CASE c.name WHEN 'a' THEN 1000 ELSE 3 END, 1, NULL, NULL
   FROM series_claims c, series_sources w;
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE;
@@ -543,17 +548,17 @@ BEGIN
     RAISE EXCEPTION 'source scope was applied after solving, or empty/missing selection acquired evidence';
   END IF;
   SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) INTO shares FROM laplace_source_attribution(ARRAY[a]) r;
-  UPDATE attestation SET trust=-0.85 WHERE witness IN (SELECT id FROM series_sources);
+  UPDATE attestation SET trust=-0.85 WHERE claim=witness AND witness IN (SELECT id FROM series_sources);
   IF (SELECT jsonb_agg(to_jsonb(r) ORDER BY source_id) FROM laplace_source_attribution(ARRAY[a]) r) IS DISTINCT FROM shares THEN
     RAISE EXCEPTION 'signed trust lost attribution or changed symmetric information';
   END IF;
-  UPDATE attestation SET trust=0 WHERE witness IN (SELECT id FROM series_sources);
+  UPDATE attestation SET trust=0 WHERE claim=witness AND witness IN (SELECT id FROM series_sources);
   IF (SELECT count(*) FROM laplace_source_attribution(ARRAY[a]) WHERE share_bp=0 AND fisher_weight=0 AND games=1000)<>3
      OR (SELECT count(*) FROM laplace_attribution(ARRAY[a]) WHERE share_bp=0 AND games=1000)<>3 THEN
     RAISE EXCEPTION 'uninformative sources lost testimony or acquired royalties';
   END IF;
   UPDATE attestation SET lineage=CASE WHEN witness=one_root THEN two_root ELSE one_root END
-    WHERE witness IN (one_root,two_root);
+    WHERE claim=witness AND witness IN (one_root,two_root);
   BEGIN
     PERFORM laplace_source_attribution(ARRAY[a]);
     RAISE EXCEPTION 'attribution accepted cyclic lineage';
@@ -562,8 +567,8 @@ END $$;
 ROLLBACK TO fisher_attribution;
 RELEASE fisher_attribution;
 -- Two-hop lineage, then a cycle: transitive copies fold; cycles fail atomically.
-UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE witness = (SELECT id FROM series_sources WHERE name = 'two');
-UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE witness = (SELECT id FROM series_sources WHERE name = 'three');
+UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'one') WHERE claim = witness AND witness = (SELECT id FROM series_sources WHERE name = 'two');
+UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'two') WHERE claim = witness AND witness = (SELECT id FROM series_sources WHERE name = 'three');
 DO $$
 DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a'); result consensus%ROWTYPE; expected record; before_cycle consensus%ROWTYPE;
 BEGIN
@@ -574,14 +579,14 @@ BEGIN
      (expected.rating, expected.deviation, expected.volatility, expected.matches) THEN RAISE EXCEPTION 'transitive lineage did not fold'; END IF;
   before_cycle := result;
   BEGIN
-    UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'three') WHERE witness = (SELECT id FROM series_sources WHERE name = 'one');
+    UPDATE attestation SET lineage = (SELECT id FROM series_sources WHERE name = 'three') WHERE claim = witness AND witness = (SELECT id FROM series_sources WHERE name = 'one');
     PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
     RAISE EXCEPTION 'cyclic lineage was accepted';
   EXCEPTION WHEN null_value_not_allowed THEN NULL;
   END;
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF result IS DISTINCT FROM before_cycle THEN RAISE EXCEPTION 'cyclic lineage partially updated consensus'; END IF;
-  UPDATE attestation SET trust = -0.85 WHERE witness IN (SELECT id FROM series_sources);
+  UPDATE attestation SET trust = -0.85 WHERE claim = witness AND witness IN (SELECT id FROM series_sources);
   PERFORM laplace_attest_series('stage.attestation_test', ARRAY[a]);
   SELECT * INTO result FROM consensus WHERE claim = a;
   IF abs(result.rating + before_cycle.rating - 3000) > 1e-8 OR abs(result.deviation - before_cycle.deviation) > 1e-8 THEN
@@ -619,9 +624,9 @@ DECLARE a blake3 := (SELECT id FROM series_claims WHERE name = 'a');
         inner_source blake3 := (SELECT id FROM series_sources WHERE name = 'one');
         outer_source blake3; deep_source blake3; found integer;
 BEGIN
-  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||inner_source::text)::blake3,inner_source,NULL,1,1,1,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (inner_source,inner_source,NULL,0,0,0,NULL,0.85);
   outer_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxthree'),inner_source], 'file', ARRAY[4294967296,0]::bigint[]);
-  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||outer_source::text)::blake3,outer_source,NULL,1,1,1,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (outer_source,outer_source,NULL,0,0,0,NULL,0.85);
   UPDATE entity SET tier=1 WHERE id=outer_source;
   UPDATE physicality SET tier=1 WHERE entity=outer_source;
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a,a])
@@ -631,7 +636,7 @@ BEGIN
   FOR i IN 1..70 LOOP
     deep_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxone'),deep_source], 'file', ARRAY[4294967296,0]::bigint[]);
   END LOOP;
-  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||deep_source::text)::blake3,deep_source,NULL,1,1,1,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (deep_source,deep_source,NULL,0,0,0,NULL,0.85);
   SELECT count(*) INTO found FROM laplace_attested(ARRAY[a])
     WHERE witness AND trunk IN (inner_source,outer_source,deep_source) AND games=1000 AND score=1000;
   IF found<>3 THEN RAISE EXCEPTION 'deep containment truncated a registered witness'; END IF;
@@ -661,7 +666,7 @@ BEGIN
   negative:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxnoun'),a],'record',ARRAY[0,18253611008]::bigint[]);
   source_id:=pg_temp.series_node(ARRAY[laplace_id('lpcheckxone'),positive,positive,neutral,negative],
     'file',ARRAY[4294967296,0,0,0]::bigint[]);
-  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (md5('attestation-witness-'||source_id::text)::blake3,source_id,NULL,1,1,1,NULL,0);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES (source_id,source_id,NULL,0,0,0,NULL,0);
   SELECT array_agg(outcome ORDER BY outcome),array_agg(occurrences ORDER BY outcome)
     INTO outcomes,counts FROM laplace_testimony(ARRAY[a,a],ARRAY[source_id]);
   IF outcomes IS DISTINCT FROM ARRAY[0,1,2]::smallint[] OR counts IS DISTINCT FROM ARRAY[1,1,2]::bigint[] THEN
@@ -707,7 +712,7 @@ BEGIN
   first_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),calculated,curated],'file',ARRAY[4294967296,5368709120,5368709120]::bigint[]);
   second_source := pg_temp.series_node(ARRAY[laplace_id('lpcheckxthree'),calculated],'file',ARRAY[4294967296,5368709120]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-    SELECT md5('attestation-witness-'||w::text)::blake3,w,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[first_source,second_source]) w;
+    SELECT w,w,NULL,0,0,0,NULL,0.85 FROM unnest(ARRAY[first_source,second_source]) w;
   SELECT count(*) INTO found FROM laplace_attested_series(ARRAY[c])
     WHERE witness AND dependence_root=cls AND trust=0.70 AND games=1 AND score=1;
   IF found<>2 THEN RAISE EXCEPTION 'contained calculation did not retain its class root and trust'; END IF;
@@ -772,7 +777,9 @@ BEGIN
   source_node := pg_temp.series_node(ARRAY[laplace_id('lpcheckxsource'),record_node],'file',
                                      ARRAY[4294967296,5368709120]::bigint[]);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-    SELECT id,source_node,NULL,1,1,1,NULL,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
+    VALUES (source_node,source_node,NULL,0,0,0,NULL,0.85);
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
+    SELECT id,source_node,NULL,1,1,1,NULL,NULL FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
   CREATE UNLOGGED TABLE stage.attestation_arity_test (LIKE stage.attestation_test INCLUDING DEFAULTS);
   INSERT INTO stage.attestation_arity_test
     SELECT id,source_node,NULL,1,1,0.85 FROM unnest(ARRAY[binary_claim,joint_claim,repeated_claim]) id;
@@ -919,30 +926,35 @@ END $$;
 
 SELECT 'attestation: large frontier preserves exact witness attribution';
 
--- A witness's declared trust is its first lineage row (NULL lineage first), read by index,
--- for the asked IDs that are witnesses or, given NULL, every witness exactly once.
+-- A witness's declared metadata lives on its single canonical self-registration row
+-- (claim = witness, games = 0) indexed by the partial unique index attestation_witness_reg.
 DO $$
 DECLARE w1 blake3 := md5('Laplace check regression attestation witness-trust-one')::blake3; w2 blake3 := md5('Laplace check regression attestation witness-trust-two')::blake3;
         derived blake3 := md5('Laplace check regression attestation witness-trust-lineage')::blake3; stranger blake3 := md5('Laplace check regression attestation witness-trust-none')::blake3;
         got double precision; n bigint;
 BEGIN
+  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust) VALUES
+    (w1, w1, NULL, 0, 0, 0, NULL, 0.9),
+    (w2, w2, derived, 0, 0, 0, NULL, 0.4);
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
   SELECT md5('Laplace check regression attestation witness-trust-claim-'||g)::blake3, w1, CASE WHEN g % 2 = 0 THEN derived END, 1, 1, 1, NULL,
-         CASE WHEN g % 2 = 0 THEN 0.25 ELSE 0.9 END
+         CASE WHEN g % 2 = 0 THEN 0.25 ELSE NULL END
   FROM generate_series(1, 200) g;
   INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-  VALUES (md5('Laplace check regression attestation witness-trust-claim-x')::blake3, w2, derived, 1, 1, 1, NULL, 0.4);
+  VALUES (md5('Laplace check regression attestation witness-trust-claim-x')::blake3, w2, NULL, 1, 1, 1, NULL, NULL);
   SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w1, stranger]) WHERE witness = w1;
-  IF got IS DISTINCT FROM 0.9 THEN RAISE EXCEPTION 'witness trust did not come from the NULL-lineage row: %', got; END IF;
+  IF got IS DISTINCT FROM 0.9 THEN RAISE EXCEPTION 'witness trust did not come from self-registration row: %', got; END IF;
   IF EXISTS (SELECT FROM laplace_witness_trust(ARRAY[stranger])) THEN
-    RAISE EXCEPTION 'an ID with no testimony was reported as a witness';
+    RAISE EXCEPTION 'an ID with no registration was reported as a witness';
   END IF;
   SELECT trust INTO got FROM laplace_witness_trust(ARRAY[w2]);
-  IF got IS DISTINCT FROM 0.4 THEN RAISE EXCEPTION 'a witness with only a derived lineage lost its trust: %', got; END IF;
-  -- The every-witness form (NULL) reads every deployed witness; the check asks
-  -- for its own witnesses, repeated, and each is still listed once.
+  IF got IS DISTINCT FROM 0.4 THEN RAISE EXCEPTION 'a witness with derived lineage lost its trust: %', got; END IF;
   SELECT count(*) INTO n FROM laplace_witness_trust(ARRAY[w1, w2, w1, stranger]);
   IF n <> 2 THEN RAISE EXCEPTION 'asked-witness form did not list each witness once: %', n; END IF;
+  IF laplace_attestation_count(w1) <> 200 OR laplace_attestation_count(w2) <> 1 THEN
+    RAISE EXCEPTION 'laplace_attestation_count included self-registration rows: w1=%, w2=%',
+      laplace_attestation_count(w1), laplace_attestation_count(w2);
+  END IF;
 END $$;
 DO $$
 DECLARE

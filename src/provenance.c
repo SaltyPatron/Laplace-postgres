@@ -1017,6 +1017,7 @@ Datum laplace_highway_audit(PG_FUNCTION_ARGS)
                 if (!c_null && !w_null) {
                     const lp_id claim_id = *(const lp_id *)DatumGetPointer(dc);
                     lp_id term = *(const lp_id *)DatumGetPointer(dw);
+                    if (lp_id_eq(&claim_id, &term)) { ExecClearTuple(slot); continue; }
                     int64 widx = lp_idmap_find(wgraph.by_id, &term);
                     bool cyclic = false;
                     if (widx >= 0) {
@@ -1257,19 +1258,8 @@ static void try_downward_witness_closure(const lp_id *witnesses, int nwitnesses,
     *complete = false;
     if (!witnesses || nwitnesses <= 0 || !closure) return;
 
-    Oid target = lp_pg_relation("attestation");
-    const char *selected[] = { "claim", "witness" };
-    const char *column = NULL;
-    Relation parent = lp_pg_read_parent(target, &column, selected, 2);
-    Oid native_id = get_atttype(target, get_attnum(target, "witness"));
-    table_close(parent, NoLock);
-
-    const Oid *parts = NULL, *aux = NULL;
-    int nparts = lp_pg_canonical_partitions("attestation", &parts, NULL, &aux, NULL);
-    Snapshot snap = GetActiveSnapshot();
-
     lp_idmap *front = lp_idmap_new();
-    lp_vec(lp_id) uniq_w = { 0 };
+    size_t seed_count = 0;
     bool ok = true;
 
     PG_TRY(); {
@@ -1278,60 +1268,15 @@ static void try_downward_witness_closure(const lp_id *witnesses, int nwitnesses,
             lp_idmap_put(closure, witnesses + i, &fresh);
             if (fresh) {
                 lp_idmap_put(front, witnesses + i, NULL);
-                lp_push(&uniq_w, witnesses[i]);
+                seed_count++;
             }
-        }
-
-        for (int p = 0; p < nparts && ok; p++) {
-            CHECK_FOR_INTERRUPTS();
-            if (!OidIsValid(aux[p])) { ok = false; break; }
-            Relation part = table_open(parts[p], AccessShareLock);
-            Relation idx = index_open(aux[p], AccessShareLock);
-            AttrNumber ac = get_attnum(parts[p], "claim");
-            Oid eq_op = get_opfamily_member(idx->rd_opfamily[0], native_id, native_id, BTEqualStrategyNumber);
-            if (!OidIsValid(eq_op)) {
-                index_close(idx, NoLock);
-                table_close(part, NoLock);
-                ok = false;
-                break;
-            }
-            RegProcedure eq_proc = get_opcode(eq_op);
-            IndexScanDesc scan = index_beginscan(part, idx, snap, NULL, 1, 0);
-            TupleTableSlot *slot = table_slot_create(part, NULL);
-
-            for (size_t wi = 0; wi < uniq_w.n && ok; wi++) {
-                ScanKeyData sk;
-                ScanKeyEntryInitialize(&sk, 0, 1, BTEqualStrategyNumber, native_id,
-                                       idx->rd_indcollation[0], eq_proc, PointerGetDatum(&uniq_w.v[wi]));
-                index_rescan(scan, &sk, 1, NULL, 0);
-                while (ok && index_getnext_slot(scan, ForwardScanDirection, slot)) {
-                    CHECK_FOR_INTERRUPTS();
-                    bool isnull = true;
-                    Datum dc = slot_getattr(slot, ac, &isnull);
-                    if (!isnull) {
-                        const lp_id *cid = (const lp_id *)DatumGetPointer(dc);
-                        bool fresh = false;
-                        lp_idmap_put(closure, cid, &fresh);
-                        if (fresh) {
-                            lp_idmap_put(front, cid, NULL);
-                            if (lp_idmap_count(closure) > 512) ok = false;
-                        }
-                    }
-                    ExecClearTuple(slot);
-                }
-            }
-
-            ExecDropSingleTupleTableSlot(slot);
-            index_endscan(scan);
-            index_close(idx, NoLock);
-            table_close(part, NoLock);
         }
 
         DownwardWitnessCtx dctx = {
             .closure = closure,
             .next_front = NULL,
             .limit = 2048,
-            .complete = ok
+            .complete = true
         };
         for (int depth = 0; depth < 16 && lp_idmap_count(front) > 0 && dctx.complete; depth++) {
             CHECK_FOR_INTERRUPTS();
@@ -1342,9 +1287,8 @@ static void try_downward_witness_closure(const lp_id *witnesses, int nwitnesses,
             dctx.next_front = NULL;
         }
         lp_vec_free(&dctx.vertices);
-        ok = dctx.complete;
+        ok = dctx.complete && lp_idmap_count(closure) > seed_count;
     } PG_FINALLY(); {
-        lp_vec_free(&uniq_w);
         lp_idmap_free(front);
     } PG_END_TRY();
 

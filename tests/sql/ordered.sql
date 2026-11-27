@@ -42,7 +42,7 @@ BEGIN
    RAISE EXCEPTION 'unregistered root admitted';
  END IF;
  INSERT INTO attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-   SELECT md5('ordered-witness-'||w::text)::blake3,w,NULL,1,1,1,NULL,1 FROM unnest(ARRAY[root,other]) w;
+   SELECT w,w,NULL,0,0,0,NULL,1 FROM unnest(ARRAY[root,other]) w;
  SELECT array_agg(n ORDER BY gap,subject,object) INTO counts FROM (
    SELECT gap,subject,object,sum(occurrences)::bigint n
    FROM laplace_ordered_pair_counts(ARRAY[a,b,a],1,2,ARRAY[root,other,root])

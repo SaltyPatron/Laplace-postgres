@@ -215,11 +215,15 @@ BEGIN
   -- PostgreSQL owns this canonical index's visibility, updates, WAL and rebuild.
   CREATE INDEX IF NOT EXISTS physicality_assertions ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops)
     WITH (gin_pending_list_limit = 32768) WHERE @extschema@.laplace_path_has_roles(path,6::smallint);
-  -- A witness's declared trust is its first lineage row. A few witnesses hold millions of
-  -- rows each, so a (witness) index alone sorted all of them per question; this key
-  -- answers "first lineage of witness w" with one probe.
-  CREATE INDEX IF NOT EXISTS attestation_witness_lineage ON @extschema@.attestation (witness, lineage NULLS FIRST) INCLUDE (trust);
+  -- Witness metadata (declared trust and optional lineage) lives on one canonical
+  -- self-registration row per witness (claim = witness, games = 0). This partial
+  -- unique index indexes only those registration rows (~16 KB) instead of every
+  -- (claim, witness) testimony row.
+  DROP INDEX IF EXISTS @extschema@.attestation_witness_lineage;
   DROP INDEX IF EXISTS @extschema@.attestation_witness;
+  CREATE UNIQUE INDEX IF NOT EXISTS attestation_witness_reg
+    ON @extschema@.attestation (claim) INCLUDE (lineage, trust)
+    WHERE claim OPERATOR(@extschema@.=) witness;
   CREATE INDEX IF NOT EXISTS consensus_standing ON @extschema@.consensus
     (@extschema@.laplace_confidence(rating, deviation, 2::double precision) DESC, matches DESC, claim)
     WHERE matches > 0;

@@ -1001,11 +1001,16 @@ CREATE TABLE @extschema@.attestation (
     claim @extschema@.blake3 NOT NULL,
     witness @extschema@.blake3 NOT NULL,
     lineage @extschema@.blake3,
-    games bigint NOT NULL CHECK (games > 0),
-    tokens bigint NOT NULL CHECK (tokens >= games),
+    games bigint NOT NULL,
+    tokens bigint NOT NULL,
     score double precision NOT NULL CHECK (score BETWEEN 0 AND 1),
     "position" integer,
-    trust double precision NOT NULL CHECK (trust BETWEEN -1 AND 1)
+    trust double precision CHECK (trust IS NULL OR trust BETWEEN -1 AND 1),
+    CONSTRAINT attestation_row_shape CHECK (
+        (claim OPERATOR(@extschema@.=) witness AND games = 0 AND tokens = 0 AND score = 0 AND "position" IS NULL AND trust IS NOT NULL)
+        OR
+        (claim OPERATOR(@extschema@.<>) witness AND games > 0 AND tokens >= games)
+    )
 )
 PARTITION BY RANGE (claim);
 

@@ -106,6 +106,10 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_witness_trust(ids @extschema@.bla
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_witness_trust';
 
+CREATE OR REPLACE FUNCTION @extschema@.laplace_register_witnesses(witnesses regclass) RETURNS bigint
+    LANGUAGE c VOLATILE STRICT
+    AS 'MODULE_PATHNAME', 'laplace_register_witnesses';
+
 CREATE OR REPLACE FUNCTION @extschema@.laplace_measure_witness(witness @extschema@.blake3) RETURNS bigint
     LANGUAGE c VOLATILE STRICT
     AS 'MODULE_PATHNAME', 'laplace_measure_witness';

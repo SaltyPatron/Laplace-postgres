@@ -71,7 +71,7 @@ BEGIN
   RAISE EXCEPTION 'installed Native holders/standings binding changed';
  END IF;
  INSERT INTO public.attestation(claim,witness,lineage,games,tokens,score,"position",trust)
-   VALUES(pg_catalog.md5('schema-witness-'||pair::text)::public.blake3,pair,NULL,1,1,1,NULL,1);
+   VALUES(pair,pair,NULL,0,0,0,NULL,1);
  -- Large-set GIN membership in the backend that wrote the rows.
  UPDATE public.physicality SET path=public.ST_SetPoint(path,0,
    public.ST_MakePoint(
