@@ -159,7 +159,7 @@ string(CONCAT _verify_storage_sql
   "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'physicality') = 'r:9'\n"
   "    AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY a.attnum)\n"
   "         FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid\n"
-  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'physicality' AND a.attnum > 0 AND NOT a.attisdropped) = 'entity,tier,hilbert,path,mask'\n"
+  "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'physicality' AND a.attnum > 0 AND NOT a.attisdropped) = 'entity,tier,path,mask'\n"
   "    AND (SELECT p.partstrat::text || ':' || (SELECT count(*) FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)\n"
   "         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_partitioned_table p ON p.partrelid = c.oid\n"
   "         WHERE c.relnamespace = ext.nsoid AND c.relname = 'attestation') = 'r:16'\n"
