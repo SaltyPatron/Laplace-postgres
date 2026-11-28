@@ -899,7 +899,7 @@ ALTER OPERATOR FAMILY @extschema@.laplace_mask_ops USING gin ADD
     OPERATOR 1 @extschema@.?(bigint,smallint) ,
     OPERATOR 2 @extschema@.?&(bigint,smallint[]) ,
     OPERATOR 3 @extschema@.?|(bigint,smallint[]) ,
-    FUNCTION 1 (bigint, bigint) btint2cmp(smallint,smallint) ,
+    FUNCTION 1 (bigint, bigint) pg_catalog.btint2cmp(smallint,smallint) ,
     FUNCTION 4 (bigint, bigint) @extschema@.laplace_mask_consistent(internal,smallint,internal,integer,internal,internal,internal,internal) ,
     FUNCTION 6 (bigint, bigint) @extschema@.laplace_mask_triconsistent(internal,smallint,internal,integer,internal,internal,internal);
 
@@ -932,7 +932,7 @@ ALTER OPERATOR FAMILY @extschema@.laplace_path_ops USING gin ADD
     OPERATOR 7 @extschema@.@>(@extschema:postgis@.geometry,@extschema@.blake3[]) ,
     OPERATOR 8 @extschema@.^@(@extschema:postgis@.geometry,@extschema@.blake3) ,
     OPERATOR 9 @extschema@.@^(@extschema:postgis@.geometry,@extschema@.blake3) ,
-    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) byteacmp(bytea,bytea) ,
+    FUNCTION 1 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) pg_catalog.byteacmp(bytea,bytea) ,
     FUNCTION 4 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_consistent(internal,smallint,@extschema@.blake3[],integer,internal,internal,internal,internal) ,
     FUNCTION 6 (@extschema:postgis@.geometry, @extschema:postgis@.geometry) @extschema@.laplace_gin_triconsistent(internal,smallint,@extschema@.blake3[],integer,internal,internal,internal);
 

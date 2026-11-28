@@ -171,11 +171,11 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_ensure_stage() RETURNS void
     LANGUAGE plpgsql
     AS $$
 BEGIN
-  IF to_regclass('stage.entity') IS NOT NULL
-     AND to_regclass('stage.physicality') IS NOT NULL
-     AND to_regclass('stage.attestation') IS NOT NULL
-     AND EXISTS (SELECT FROM pg_attribute WHERE attrelid = to_regclass('stage.attestation') AND attname = 'tokens' AND NOT attisdropped) THEN RETURN; END IF;
-  PERFORM pg_advisory_xact_lock(1279348803, -1);
+  IF pg_catalog.to_regclass('stage.entity') IS NOT NULL
+     AND pg_catalog.to_regclass('stage.physicality') IS NOT NULL
+     AND pg_catalog.to_regclass('stage.attestation') IS NOT NULL
+     AND EXISTS (SELECT FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass('stage.attestation') AND attname = 'tokens' AND NOT attisdropped) THEN RETURN; END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock(1279348803, -1);
   CREATE SCHEMA IF NOT EXISTS stage;
   CREATE UNLOGGED TABLE IF NOT EXISTS stage.entity (LIKE @extschema@.entity INCLUDING DEFAULTS);
   CREATE UNLOGGED TABLE IF NOT EXISTS stage.physicality (LIKE @extschema@.physicality INCLUDING DEFAULTS);
