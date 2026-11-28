@@ -10,8 +10,10 @@ CREATE ROLE :"writer";
 SET LOCAL work_mem = '64kB';
 SELECT laplace_ensure_stage();
 CREATE TEMP TABLE routing_words AS
-SELECT 'lpcheckstageenrich' || chr(97+i%26) || chr(97+(i/26)%26) || chr(97+(i/676)%26) AS content
+SELECT 'lpcheckstageenrich' || chr(97+i%26) || chr(97+(i/26)%26) || chr(97+(i/676)%26) AS content,
+       laplace_id('lpcheckstageenrich' || chr(97+i%26) || chr(97+(i/26)%26) || chr(97+(i/676)%26)) AS id
 FROM generate_series(0,2048) i;
+ANALYZE routing_words;
 CREATE UNLOGGED TABLE stage.check_routing_entities (LIKE stage.entity INCLUDING DEFAULTS);
 CREATE UNLOGGED TABLE stage.check_routing_paths (LIKE stage.physicality INCLUDING DEFAULTS);
 CREATE FUNCTION pg_temp.routing_batch() RETURNS void LANGUAGE SQL AS $$
@@ -46,8 +48,8 @@ DO $$ BEGIN
 END $$;
 RESET SESSION AUTHORIZATION;
 DO $$ BEGIN
-  IF EXISTS (SELECT FROM routing_words w JOIN public.entity e ON e.id=laplace_id(w.content)
-             JOIN public.physicality p ON p.entity=e.id
+  IF EXISTS (SELECT FROM routing_words w JOIN public.entity e ON e.id=w.id
+             JOIN public.physicality p ON p.entity=w.id
              WHERE NOT laplace_mask_has_value(e.mask,'kind','record')
                 OR NOT laplace_mask_has_value(p.mask,'kind','tuple')
                 OR ST_AsEWKB(p.path)<>ST_AsEWKB(laplace_path(ARRAY(
