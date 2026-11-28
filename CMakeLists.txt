@@ -67,6 +67,7 @@ add_library(laplace_pg MODULE
   src/walk.c
   src/sequences.c
   src/read_ops.c
+  src/lexical_ops.c
   src/function_bindings.c
   src/binding.c
 )

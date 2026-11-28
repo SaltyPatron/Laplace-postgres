@@ -1095,6 +1095,26 @@ Datum laplace_srf_support(PG_FUNCTION_ARGS) {
                                 k = (double)DatumGetInt32(((Const *)a1)->constvalue);
                         }
                         est = est * k * 2.0;
+                    } else if (strcmp(fn, "laplace_lexical_resolve") == 0) {
+                        if (list_length(fe->args) >= 3) {
+                            Node *a2 = (Node *)lthird(fe->args);
+                            if (IsA(a2, Const) && !((Const *)a2)->constisnull)
+                                est = (double)DatumGetInt32(((Const *)a2)->constvalue);
+                            else
+                                est = 20.0;
+                        } else {
+                            est = 20.0;
+                        }
+                    } else if (strcmp(fn, "laplace_taxonomy_tree") == 0) {
+                        if (list_length(fe->args) >= 5) {
+                            Node *a4 = (Node *)list_nth(fe->args, 4);
+                            if (IsA(a4, Const) && !((Const *)a4)->constisnull)
+                                est = (double)DatumGetInt32(((Const *)a4)->constvalue);
+                            else
+                                est = 64.0;
+                        } else {
+                            est = 64.0;
+                        }
                     }
                 }
                 if (est < 1.0) est = 1.0;

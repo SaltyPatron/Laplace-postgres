@@ -427,3 +427,47 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_browse_entities(
     OUT total_count bigint) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 50 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_browse_entities';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_lexical_resolve(
+    term bytea,
+    relation_names text[],
+    lim integer DEFAULT 20,
+    max_text integer DEFAULT 0,
+    OUT hop integer,
+    OUT subject bytea,
+    OUT subject_label text,
+    OUT relation bytea,
+    OUT relation_label text,
+    OUT target bytea,
+    OUT target_label text,
+    OUT claim bytea,
+    OUT via_claim bytea,
+    OUT rating double precision,
+    OUT deviation double precision,
+    OUT confidence double precision,
+    OUT matches bigint,
+    OUT witnesses bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 20 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_lexical_resolve';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_taxonomy_tree(
+    root bytea,
+    up_relations text[],
+    down_relations text[],
+    max_depth integer DEFAULT 3,
+    max_nodes integer DEFAULT 64,
+    max_text integer DEFAULT 160,
+    OUT direction text,
+    OUT depth integer,
+    OUT parent bytea,
+    OUT child bytea,
+    OUT child_label text,
+    OUT relation bytea,
+    OUT relation_label text,
+    OUT claim bytea,
+    OUT rating double precision,
+    OUT deviation double precision,
+    OUT confidence double precision,
+    OUT matches bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_taxonomy_tree';

@@ -65,6 +65,36 @@ DECLARE
   n_var integer;
   n_mask integer;
   max_lbl_len integer;
+  -- Phase-2 lexical & taxonomy fixtures
+  w_lex_sense blake3;
+  w_syn_rel blake3 := pg_temp.put_text('synonym');
+  w_hyponym blake3 := pg_temp.put_text('hyponym');
+  w_en blake3 := pg_temp.put_text('en');
+  w_lex_word blake3 := pg_temp.put_text(tag || 'canine');
+  w_lex_synset blake3 := pg_temp.put_text(tag || 'syn01');
+  w_lex_sense_node blake3;
+  w_def_direct blake3 := pg_temp.put_text(tag || 'directdef');
+  w_def_syn blake3 := pg_temp.put_text(tag || 'synsetdef');
+  w_syn_peer blake3 := pg_temp.put_text(tag || 'hound');
+  cl_lex_direct blake3;
+  cl_lex_bridge blake3;
+  cl_lex_syn_def blake3;
+  cl_lex_sense_syn blake3;
+  n_hop1 integer;
+  n_hop2 integer;
+  lex_wits bigint;
+  lex_max_len integer;
+  w_tax_root blake3 := pg_temp.put_text(tag || 'dog');
+  w_tax_up1 blake3 := pg_temp.put_text(tag || 'canid');
+  w_tax_up2 blake3 := pg_temp.put_text(tag || 'mammal');
+  w_tax_dn1 blake3 := pg_temp.put_text(tag || 'terrier');
+  w_tax_dn2 blake3 := pg_temp.put_text(tag || 'beagle');
+  w_tax_dn_inv blake3 := pg_temp.put_text(tag || 'poodle');
+  n_tax_self integer;
+  n_tax_up integer;
+  n_tax_down integer;
+  n_tax_max_d integer;
+  n_tax_capped integer;
 BEGIN
   -- Seed w_a with 20 Round-1 claims (crowding test) + 1 Round-2 hop from w_bridge
   FOR i IN 1..20 LOOP
@@ -160,7 +190,113 @@ BEGIN
     PERFORM * FROM public.laplace_browse_entities(NULL, ARRAY[99], NULL, 10, 0, 160);
     RAISE EXCEPTION 'laplace_browse_entities failed to reject out-of-range mask bit 99';
   EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+
+  -- 4. laplace_lexical_resolve: 1-hop direct + 2-hop sense/synset-bridged claims, witnesses, labels & validation
+  w_lex_sense := pg_temp.put_node(ARRAY[pg_temp.put_text('lexical'), laplace_cp_id(32), pg_temp.put_text('sense')]);
+  IF w_lex_sense IS DISTINCT FROM laplace_text_id('lexical sense') THEN
+    RAISE EXCEPTION 'test setup mismatch for lexical sense ID';
+  END IF;
+  w_lex_sense_node := pg_temp.put_node(ARRAY[w_lex_word, w_en, w_lex_synset]);
+
+  cl_lex_direct := pg_temp.put_node(ARRAY[w_lex_word, w_def, w_def_direct], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl_lex_direct, 2080.0, 40.0, 0.06, 5) ON CONFLICT DO NOTHING;
+  INSERT INTO attestation(claim, witness, lineage, games, tokens, score, "position", trust)
+    VALUES (cl_lex_direct, w_w1, NULL, 2, 2, 1.0, 1, NULL),
+           (cl_lex_direct, w_w2, NULL, 3, 3, 1.0, 1, NULL)
+    ON CONFLICT DO NOTHING;
+
+  cl_lex_bridge := pg_temp.put_node(ARRAY[w_lex_word, w_lex_sense, w_lex_sense_node], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl_lex_bridge, 2000.0, 45.0, 0.06, 3) ON CONFLICT DO NOTHING;
+
+  cl_lex_syn_def := pg_temp.put_node(ARRAY[w_lex_synset, w_def, w_def_syn], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl_lex_syn_def, 2040.0, 42.0, 0.06, 4) ON CONFLICT DO NOTHING;
+
+  cl_lex_sense_syn := pg_temp.put_node(ARRAY[w_lex_sense_node, w_syn_rel, w_syn_peer], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl_lex_sense_syn, 1960.0, 50.0, 0.06, 2) ON CONFLICT DO NOTHING;
+
+  SELECT count(*) FILTER (WHERE hop = 1 AND via_claim IS NULL AND claim = blake3_send(cl_lex_direct)
+                            AND relation_label = 'definition' AND target_label = tag || 'directdef'),
+         count(*) FILTER (WHERE hop = 2 AND via_claim = blake3_send(cl_lex_bridge)
+                            AND ((claim = blake3_send(cl_lex_syn_def) AND target_label = tag || 'synsetdef')
+                              OR (claim = blake3_send(cl_lex_sense_syn) AND relation_label = 'synonym' AND target_label = tag || 'hound')))
+    INTO n_hop1, n_hop2
+    FROM public.laplace_lexical_resolve(blake3_send(w_lex_word), ARRAY['definition', 'synonym'], 20, 0);
+  IF n_hop1 <> 1 OR n_hop2 <> 2 THEN
+    RAISE EXCEPTION 'laplace_lexical_resolve failed 1-hop/2-hop resolution (hop1=%, hop2=%)', n_hop1, n_hop2;
+  END IF;
+
+  SELECT witnesses INTO lex_wits
+    FROM public.laplace_lexical_resolve(blake3_send(w_lex_word), ARRAY['definition'], 20, 0)
+   WHERE claim = blake3_send(cl_lex_direct) LIMIT 1;
+  IF lex_wits IS DISTINCT FROM 2 THEN
+    RAISE EXCEPTION 'laplace_lexical_resolve expected 2 distinct witnesses, got %', lex_wits;
+  END IF;
+
+  SELECT max(octet_length(target_label)) INTO lex_max_len
+    FROM public.laplace_lexical_resolve(blake3_send(w_lex_word), ARRAY['definition'], 20, 6);
+  IF lex_max_len > 6 THEN
+    RAISE EXCEPTION 'laplace_lexical_resolve exceeded max_text=6 (got %)', lex_max_len;
+  END IF;
+
+  BEGIN
+    PERFORM * FROM public.laplace_lexical_resolve(E'\\x0102'::bytea, ARRAY['definition'], 10, 0);
+    RAISE EXCEPTION 'laplace_lexical_resolve failed to reject short term bytea';
+  EXCEPTION WHEN invalid_binary_representation THEN NULL; END;
+
+  BEGIN
+    PERFORM * FROM public.laplace_lexical_resolve(blake3_send(w_lex_word), ARRAY['definition'], -1, 0);
+    RAISE EXCEPTION 'laplace_lexical_resolve failed to reject negative lim';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+
+  -- 5. laplace_taxonomy_tree: multi-depth up & down (explicit hyponym + inverse hypernym), caps & validation
+  cl := pg_temp.put_node(ARRAY[w_tax_root, w_hyp, w_tax_up1], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl, 2050.0, 40.0, 0.06, 4) ON CONFLICT DO NOTHING;
+  cl := pg_temp.put_node(ARRAY[w_tax_up1, w_hyp, w_tax_up2], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl, 2020.0, 45.0, 0.06, 3) ON CONFLICT DO NOTHING;
+  cl := pg_temp.put_node(ARRAY[w_tax_root, w_hyponym, w_tax_dn1], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl, 1980.0, 45.0, 0.06, 3) ON CONFLICT DO NOTHING;
+  cl := pg_temp.put_node(ARRAY[w_tax_dn1, w_hyponym, w_tax_dn2], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl, 1940.0, 50.0, 0.06, 2) ON CONFLICT DO NOTHING;
+  cl := pg_temp.put_node(ARRAY[w_tax_dn_inv, w_hyp, w_tax_root], c_mask);
+  INSERT INTO consensus(claim, rating, deviation, volatility, matches)
+    VALUES (cl, 1960.0, 48.0, 0.06, 2) ON CONFLICT DO NOTHING;
+
+  SELECT count(*) FILTER (WHERE direction = 'self' AND depth = 0 AND parent IS NULL AND child = blake3_send(w_tax_root)),
+         count(*) FILTER (WHERE direction = 'up' AND ((depth = 1 AND parent = blake3_send(w_tax_root) AND child_label = tag || 'canid')
+                                                   OR (depth = 2 AND parent = blake3_send(w_tax_up1) AND child_label = tag || 'mammal'))),
+         count(*) FILTER (WHERE direction = 'down' AND ((depth = 1 AND child_label = tag || 'terrier')
+                                                     OR (depth = 1 AND child_label = tag || 'poodle')
+                                                     OR (depth = 2 AND parent = blake3_send(w_tax_dn1) AND child_label = tag || 'beagle')))
+    INTO n_tax_self, n_tax_up, n_tax_down
+    FROM public.laplace_taxonomy_tree(blake3_send(w_tax_root), ARRAY['hypernym'], ARRAY['hyponym'], 3, 64, 160);
+  IF n_tax_self <> 1 OR n_tax_up <> 2 OR n_tax_down <> 3 THEN
+    RAISE EXCEPTION 'laplace_taxonomy_tree mismatch (self=%, up=%, down=%)', n_tax_self, n_tax_up, n_tax_down;
+  END IF;
+
+  SELECT max(depth), count(*) INTO n_tax_max_d, n_tax_capped
+    FROM public.laplace_taxonomy_tree(blake3_send(w_tax_root), ARRAY['hypernym'], ARRAY['hyponym'], 1, 3, 160);
+  IF n_tax_max_d > 1 OR n_tax_capped > 3 THEN
+    RAISE EXCEPTION 'laplace_taxonomy_tree failed depth/node bounds (max_d=%, count=%)', n_tax_max_d, n_tax_capped;
+  END IF;
+
+  BEGIN
+    PERFORM * FROM public.laplace_taxonomy_tree(blake3_send(w_tax_root), ARRAY['hypernym'], ARRAY['hyponym'], 7, 64, 160);
+    RAISE EXCEPTION 'laplace_taxonomy_tree failed to reject max_depth=7';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
+
+  BEGIN
+    PERFORM * FROM public.laplace_taxonomy_tree(blake3_send(w_tax_root), ARRAY['hypernym'], ARRAY['hyponym'], 2, 0, 160);
+    RAISE EXCEPTION 'laplace_taxonomy_tree failed to reject max_nodes=0';
+  EXCEPTION WHEN invalid_parameter_value THEN NULL; END;
 END $$;
 
 ROLLBACK;
-SELECT 'read_ops: laplace_response_field, laplace_leaderboard, and laplace_browse_entities verified';
+SELECT 'read_ops: laplace_response_field, laplace_leaderboard, laplace_browse_entities, laplace_lexical_resolve, and laplace_taxonomy_tree verified';

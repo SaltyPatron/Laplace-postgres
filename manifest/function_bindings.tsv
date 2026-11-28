@@ -112,6 +112,7 @@ laplace_label_array	false
 laplace_label_text	false
 laplace_labels	false
 laplace_leaderboard	false
+laplace_lexical_resolve	false
 laplace_library_page	false
 laplace_mask_consistent	false
 laplace_mask_extract_query	false
@@ -204,6 +205,7 @@ laplace_standing_counts	false
 laplace_standings	false
 laplace_standings_scoped	false
 laplace_sweep_orphans	false
+laplace_taxonomy_tree	false
 laplace_testimony	false
 laplace_text	false
 laplace_text_batch	false
