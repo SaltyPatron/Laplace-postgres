@@ -68,9 +68,10 @@ trap 'rm -rf "$work"' EXIT
   { echo 'deployed.sh: extension laplace is not installed in schema public' >&2; exit 1; }
 sql <<'SQL'
 DO $$ BEGIN
-  -- The build names the module by its content (cmake/PackageModule.cmake: $libdir/laplace_<20 hex>).
+  -- The build names the module by its content (cmake/PackageModule.cmake: $libdir/laplace_<20 hex>
+  -- or basename laplace_<20 hex> when dynamic_library_path OVERRIDE is used).
   IF NOT (SELECT count(*) > 0 AND count(DISTINCT p.probin) = 1
-                 AND bool_and(p.probin ~ '^\$libdir/laplace(_[0-9a-f]{20})?$')
+                 AND bool_and(p.probin ~ '^(\$libdir/)?laplace(_[0-9a-f]{20})?$')
           FROM pg_proc p JOIN pg_depend d ON d.classid='pg_proc'::regclass AND d.objid=p.oid
           JOIN pg_extension e ON e.oid=d.refobjid AND d.refclassid='pg_extension'::regclass
           WHERE e.extname='laplace' AND d.deptype='e' AND p.probin IS NOT NULL) THEN
