@@ -860,6 +860,75 @@ void lp_pg_lookup_entity_tiers(const lp_id *ids,size_t count,int16 *tiers)
     pfree(keys);table_close(parent,NoLock);
 }
 
+typedef struct { AttrNumber a_tier, a_mask; lp_idmap *out_map; } EntityMetaCtx;
+static void entity_meta_visit(TupleTableSlot *slot, const PresenceKey *key, void *context)
+{
+    EntityMetaCtx *c = context;
+    bool nt = true, nm = true;
+    Datum dt = slot_getattr(slot, c->a_tier, &nt);
+    Datum dm = slot_getattr(slot, c->a_mask, &nm);
+    PgEntityMeta *m = lp_idmap_get(c->out_map, &key->id, NULL);
+    m->tier = nt ? 0 : DatumGetInt16(dt);
+    m->mask = nm ? 0 : DatumGetInt64(dm);
+    m->present = !nt;
+}
+
+void lp_pg_lookup_entity_meta(const lp_id *ids, size_t count, lp_idmap *out_map)
+{
+    if (!count || !out_map) return;
+    if (count > MaxAllocHugeSize / sizeof(PresenceKey))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("Native entity meta lookup exceeds addressable memory")));
+    Oid target = lp_pg_relation("entity");
+    const char *selected[] = { "id", "tier", "mask" };
+    const char *column = NULL;
+    Relation parent = lp_pg_read_parent(target, &column, selected, 3);
+    PresenceKey *keys = palloc_extended(count * sizeof(*keys), MCXT_ALLOC_HUGE);
+    for (size_t i = 0; i < count; i++) keys[i] = (PresenceKey){ .id = ids[i], .ordinal = (int64)i + 1 };
+    EntityMetaCtx ctx = { get_attnum(target, "tier"), get_attnum(target, "mask"), out_map };
+    lp_pg_indexed_keys(parent, column, keys, count, entity_meta_visit, &ctx);
+    pfree(keys);
+    table_close(parent, NoLock);
+}
+
+typedef struct { AttrNumber a_rating, a_dev, a_vol, a_matches; lp_idmap *out_map; } StandingMapCtx;
+static void standing_map_visit(TupleTableSlot *slot, const PresenceKey *key, void *context)
+{
+    StandingMapCtx *c = context;
+    bool nr = true, nd = true, nv = true, nm = true;
+    Datum dr = slot_getattr(slot, c->a_rating, &nr);
+    Datum dd = slot_getattr(slot, c->a_dev, &nd);
+    Datum dv = slot_getattr(slot, c->a_vol, &nv);
+    Datum dm = slot_getattr(slot, c->a_matches, &nm);
+    if (nr || nd || nv || nm) return;
+    PgStandingEntry *e = lp_idmap_get(c->out_map, &key->id, NULL);
+    e->rating = DatumGetFloat8(dr);
+    e->deviation = DatumGetFloat8(dd);
+    e->volatility = DatumGetFloat8(dv);
+    e->matches = DatumGetInt64(dm);
+    e->present = true;
+}
+
+void lp_pg_lookup_standings(const lp_id *ids, size_t count, lp_idmap *out_map)
+{
+    if (!count || !out_map) return;
+    if (count > MaxAllocHugeSize / sizeof(PresenceKey))
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("Native standing lookup exceeds addressable memory")));
+    Oid target = lp_pg_relation("consensus");
+    const char *selected[] = { "claim", "rating", "deviation", "volatility", "matches" };
+    const char *column = NULL;
+    Relation parent = lp_pg_read_parent(target, &column, selected, 5);
+    PresenceKey *keys = palloc_extended(count * sizeof(*keys), MCXT_ALLOC_HUGE);
+    for (size_t i = 0; i < count; i++) keys[i] = (PresenceKey){ .id = ids[i], .ordinal = (int64)i + 1 };
+    StandingMapCtx ctx = {
+        get_attnum(target, "rating"), get_attnum(target, "deviation"),
+        get_attnum(target, "volatility"), get_attnum(target, "matches"),
+        out_map
+    };
+    lp_pg_indexed_keys(parent, column, keys, count, standing_map_visit, &ctx);
+    pfree(keys);
+    table_close(parent, NoLock);
+}
+
 static void sql_entity_coord_emit(int64 ordinal,const lp_id *id,int16 tier,Datum coord,int64 hilbert,void *context)
 {
     PresenceOutput *out=context;

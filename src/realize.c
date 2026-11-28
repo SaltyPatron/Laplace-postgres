@@ -100,6 +100,62 @@ static void render_mode(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo
 static void render(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo out){render_mode(walk,t,id,out,LP_REALIZE_TEXT);}
 static void render_label(lp_realizer *walk,lp_idmap *t,const lp_id *id,StringInfo out){render_mode(walk,t,id,out,LP_REALIZE_LABELS);}
 
+static int utf8_truncate_bytes(const char *s, int len, int32 max_bytes)
+{
+    if (max_bytes <= 0 || len <= max_bytes) return len;
+    int cut = (int)max_bytes;
+    while (cut > 0 && (((unsigned char)s[cut] & 0xC0u) == 0x80u)) cut--;
+    return cut;
+}
+
+void lp_pg_realize_labels_map(const lp_id *ids, size_t count, int32 max_text,
+                              bool exact_text, MemoryContext ctx, lp_idmap *out_map)
+{
+    if (!count || !out_map) return;
+    MemoryContext keep = AllocSetContextCreate(CurrentMemoryContext, "lp_pg_realize_labels_map", ALLOCSET_DEFAULT_SIZES);
+    lp_idmap *t = lp_idmap_sized(sizeof(TNode));
+    lp_realizer *walk = lp_realizer_new();
+    PG_TRY();
+    {
+        for (size_t i = 0; i < count; i++) {
+            if (lp_idmap_find(out_map, &ids[i]) < 0) tnode(t, &ids[i]);
+        }
+        if (lp_idmap_count(t) > 0) {
+            read_levels(t, keep, !exact_text, NULL);
+            for (size_t i = 0; i < count; i++) {
+                bool fresh = false;
+                PgLabelEntry *ent = lp_idmap_get(out_map, &ids[i], &fresh);
+                if (!fresh) continue;
+                StringInfoData out;
+                initStringInfo(&out);
+                if (exact_text) render(walk, t, &ids[i], &out);
+                else render_label(walk, t, &ids[i], &out);
+                bool is_hex = false;
+                if (out.len == 32) {
+                    char hex[33];
+                    lp_id_hex(&ids[i], hex);
+                    if (memcmp(out.data, hex, 32) == 0) is_hex = true;
+                }
+                int cut = utf8_truncate_bytes(out.data, out.len, max_text);
+                char *copy = MemoryContextAlloc(ctx, (Size)cut + 1);
+                if (cut > 0) memcpy(copy, out.data, (size_t)cut);
+                copy[cut] = '\0';
+                ent->text = copy;
+                ent->len = cut;
+                ent->is_hex = is_hex;
+                pfree(out.data);
+            }
+        }
+    }
+    PG_FINALLY();
+    {
+        lp_idmap_free(t);
+        lp_realizer_free(walk);
+        MemoryContextDelete(keep);
+    }
+    PG_END_TRY();
+}
+
 PG_FUNCTION_INFO_V1(laplace_text);
 Datum laplace_text(PG_FUNCTION_ARGS){
     StringInfoData out; initStringInfo(&out); MemoryContext keep = CurrentMemoryContext;

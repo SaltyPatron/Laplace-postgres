@@ -257,4 +257,28 @@ typedef struct PgSalience {
 } PgSalience;
 
 void lp_pg_salience(const lp_id *occ, int nocc, const lp_id *scope, int nscope, PgSalience *out);
+
+typedef struct {
+    char *text;
+    int len;
+    bool is_hex;
+} PgLabelEntry;
+void lp_pg_realize_labels_map(const lp_id *ids, size_t count, int32 max_text,
+                              bool exact_text, MemoryContext ctx, lp_idmap *out_map);
+
+typedef struct {
+    int16 tier;
+    int64 mask;
+    bool present;
+} PgEntityMeta;
+void lp_pg_lookup_entity_meta(const lp_id *ids, size_t count, lp_idmap *out_map);
+
+typedef struct {
+    double rating;
+    double deviation;
+    double volatility;
+    int64 matches;
+    bool present;
+} PgStandingEntry;
+void lp_pg_lookup_standings(const lp_id *ids, size_t count, lp_idmap *out_map);
 #endif

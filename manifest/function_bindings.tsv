@@ -32,6 +32,7 @@ laplace_bank_of	false
 laplace_below	false
 laplace_box4d_in	false
 laplace_box4d_out	false
+laplace_browse_entities	false
 laplace_centroid4d_final	false
 laplace_centroid4d_step	false
 laplace_chains	false
@@ -110,6 +111,7 @@ laplace_knn4d	false
 laplace_label_array	false
 laplace_label_text	false
 laplace_labels	false
+laplace_leaderboard	false
 laplace_library_page	false
 laplace_mask_consistent	false
 laplace_mask_extract_query	false
@@ -178,6 +180,7 @@ laplace_replay_export	false
 laplace_replay_verify	false
 laplace_resolve_ref	false
 laplace_resolve_refs	false
+laplace_response_field	false
 laplace_restore_function_bindings	true
 laplace_roles_of	false
 laplace_said	false

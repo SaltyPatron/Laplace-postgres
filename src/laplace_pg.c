@@ -1067,6 +1067,34 @@ Datum laplace_srf_support(PG_FUNCTION_ARGS) {
                             est = (double)DatumGetInt32(((Const *)a0)->constvalue);
                         else
                             est = 64.0;
+                    } else if (strcmp(fn, "laplace_leaderboard") == 0) {
+                        if (list_length(fe->args) >= 2) {
+                            Node *a1 = (Node *)lsecond(fe->args);
+                            if (IsA(a1, Const) && !((Const *)a1)->constisnull)
+                                est = (double)DatumGetInt32(((Const *)a1)->constvalue);
+                            else
+                                est = 50.0;
+                        } else {
+                            est = 50.0;
+                        }
+                    } else if (strcmp(fn, "laplace_browse_entities") == 0) {
+                        if (list_length(fe->args) >= 4) {
+                            Node *a3 = (Node *)lfourth(fe->args);
+                            if (IsA(a3, Const) && !((Const *)a3)->constisnull)
+                                est = (double)DatumGetInt32(((Const *)a3)->constvalue);
+                            else
+                                est = 50.0;
+                        } else {
+                            est = 50.0;
+                        }
+                    } else if (strcmp(fn, "laplace_response_field") == 0) {
+                        double k = 32.0;
+                        if (list_length(fe->args) >= 2) {
+                            Node *a1 = (Node *)lsecond(fe->args);
+                            if (IsA(a1, Const) && !((Const *)a1)->constisnull)
+                                k = (double)DatumGetInt32(((Const *)a1)->constvalue);
+                        }
+                        est = est * k * 2.0;
                     }
                 }
                 if (est < 1.0) est = 1.0;

@@ -21,5 +21,6 @@ held_files
 frontier_runtime
 function_bindings
 salience
+read_ops
 walks
 chess

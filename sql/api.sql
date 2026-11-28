@@ -356,3 +356,74 @@ CREATE OR REPLACE FUNCTION @extschema@.laplace_salience(occ @extschema@.blake3[]
     OUT loss_contrast double precision, OUT salience double precision) RETURNS SETOF record
     LANGUAGE c STABLE ROWS 64 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
     AS 'MODULE_PATHNAME', 'laplace_salience';
+
+-- High-level zero-SPI Native read operators retiring C# inline SQL CTE pyramids.
+CREATE OR REPLACE FUNCTION @extschema@.laplace_response_field(
+    seeds bytea[],
+    keep integer DEFAULT 32,
+    max_rounds integer DEFAULT 2,
+    nearest integer DEFAULT 0,
+    max_text integer DEFAULT 160,
+    OUT round integer,
+    OUT occ integer,
+    OUT source bytea,
+    OUT source_label text,
+    OUT target bytea,
+    OUT target_label text,
+    OUT route smallint,
+    OUT claim bytea,
+    OUT relation bytea,
+    OUT relation_label text,
+    OUT rating double precision,
+    OUT deviation double precision,
+    OUT volatility double precision,
+    OUT matches bigint,
+    OUT witnesses bigint,
+    OUT tier smallint,
+    OUT distance double precision,
+    OUT outbound boolean,
+    OUT origins integer[],
+    OUT targets integer[],
+    OUT binding_claims bytea[]) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 256 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_response_field';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_leaderboard(
+    bands integer[] DEFAULT NULL,
+    lim integer DEFAULT 50,
+    off integer DEFAULT 0,
+    min_matches bigint DEFAULT 1,
+    max_text integer DEFAULT 160,
+    OUT id bytea,
+    OUT tier smallint,
+    OUT mask bigint,
+    OUT rating double precision,
+    OUT deviation double precision,
+    OUT matches bigint,
+    OUT label text,
+    OUT band integer,
+    OUT band_name text,
+    OUT confidence double precision,
+    OUT parts_json text) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 50 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_leaderboard';
+
+CREATE OR REPLACE FUNCTION @extschema@.laplace_browse_entities(
+    tiers smallint[] DEFAULT NULL,
+    mask_bits integer[] DEFAULT NULL,
+    prefix text DEFAULT NULL,
+    lim integer DEFAULT 50,
+    off integer DEFAULT 0,
+    max_text integer DEFAULT 160,
+    OUT id bytea,
+    OUT tier smallint,
+    OUT mask bigint,
+    OUT rating double precision,
+    OUT deviation double precision,
+    OUT confidence double precision,
+    OUT matches bigint,
+    OUT label text,
+    OUT match_kind text,
+    OUT total_count bigint) RETURNS SETOF record
+    LANGUAGE c STABLE ROWS 50 SUPPORT @extschema@.laplace_srf_support PARALLEL SAFE
+    AS 'MODULE_PATHNAME', 'laplace_browse_entities';
