@@ -208,6 +208,7 @@ BEGIN
   DROP INDEX IF EXISTS @extschema@.entity_angular;
   CREATE INDEX IF NOT EXISTS entity_tier_hilbert ON @extschema@.entity (tier, hilbert, id);
   CREATE INDEX IF NOT EXISTS entity_coord ON @extschema@.entity USING gist (coord @extschema@.laplace_point4d_ops);
+  CREATE INDEX IF NOT EXISTS entity_mask ON @extschema@.entity USING gin (mask @extschema@.laplace_mask_ops) WITH (gin_pending_list_limit = 32768) WHERE mask <> 0;
   -- 32 MB a partition: a search scans the pending list, so it spills around a batch instead of holding a source.
   -- 4 MB spilled every few thousand paths (full-page images). 256 MB held the list until the source ended.
   CREATE INDEX IF NOT EXISTS physicality_paths ON @extschema@.physicality USING gin (path @extschema@.laplace_path_ops, mask @extschema@.laplace_mask_ops) WITH (gin_pending_list_limit = 32768);

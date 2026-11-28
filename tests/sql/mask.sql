@@ -7,15 +7,24 @@ BEGIN;
 DO $$
 DECLARE
   noun bigint := laplace_mask_slot('upos', 'NOUN');
+  verb bigint := laplace_mask_slot('upos', 'VERB');
   number bigint := laplace_mask_slot('upos', 'NUM');
   animal bigint := laplace_mask_slot('lexfile', 'noun.animal');
+  motion bigint := laplace_mask_slot('lexfile', 'verb.motion');
   subject bigint := laplace_mask_slot('deprel', 'nsubj');
   agent bigint := laplace_mask_slot('vnrole', 'Agent');
   claim bigint := laplace_mask_slot('kind', 'claim');
   record bigint := laplace_mask_slot('kind', 'record');
+  upos_flags boolean := false;
   combined bigint;
 BEGIN
   IF pg_column_size(noun) <> 8 THEN RAISE EXCEPTION 'not a fixed 8-byte carrier'; END IF;
+  BEGIN
+    PERFORM laplace_bank_bit('upos', 'NOUN');
+    upos_flags := true;
+  EXCEPTION WHEN invalid_parameter_value THEN
+    upos_flags := false;
+  END;
   combined := laplace_mask_merge(laplace_mask_merge(noun, animal), laplace_mask_merge(subject, agent));
   combined := laplace_mask_merge(combined, claim);
   IF NOT laplace_mask_valid(combined)
@@ -28,7 +37,15 @@ BEGIN
   END IF;
   IF laplace_mask_has_value(number, 'upos', 'NOUN')
      OR (number & laplace_mask_field('upos')) = noun THEN
-    RAISE EXCEPTION 'NUM must not match the NOUN enum field';
+    RAISE EXCEPTION 'NUM must not match the NOUN field';
+  END IF;
+  IF upos_flags THEN
+    IF laplace_mask_merge(noun, verb) <> (noun | verb)
+       OR NOT laplace_mask_has_value(noun | verb, 'upos', 'NOUN')
+       OR NOT laplace_mask_has_value(noun | verb, 'upos', 'VERB')
+       OR laplace_mask_value(noun | verb, 'upos') <> -2 THEN
+      RAISE EXCEPTION 'upos flag union failed for polysemous noun+verb';
+    END IF;
   END IF;
   IF EXISTS (
     SELECT FROM (VALUES
@@ -56,7 +73,7 @@ BEGIN
     RAISE EXCEPTION 'missing values, empty queries, or bit 63 failed';
   END IF;
   BEGIN
-    PERFORM laplace_mask_merge(noun, number);
+    PERFORM laplace_mask_merge(animal, motion);
     RAISE EXCEPTION 'a conflicting enum was silently ORed into a third value';
   EXCEPTION WHEN data_exception THEN NULL;
   END;
@@ -114,6 +131,16 @@ BEGIN
   EXECUTE 'EXPLAIN (FORMAT JSON) SELECT entity FROM public.physicality WHERE path @> ARRAY[pg_temp.leaf(97)] AND mask ? 0::smallint'
     INTO query_plan;
   IF query_plan::text NOT LIKE '%Bitmap Index Scan%' THEN RAISE EXCEPTION 'the query did not use its GIN index'; END IF;
+  BEGIN
+    PERFORM laplace_bank_bit('upos', 'NOUN');
+    IF (SELECT count(*) FROM public.entity WHERE id = laplace_compose(ARRAY[pg_temp.leaf(97), pg_temp.leaf(98)]) AND mask ? laplace_bank_bit('upos', 'NOUN')) <> 1 THEN
+      RAISE EXCEPTION 'entity.mask bit-flag query failed for upos NOUN';
+    END IF;
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT id FROM public.entity WHERE mask ? laplace_bank_bit(''upos'', ''NOUN'')'
+      INTO query_plan;
+    IF query_plan::text NOT LIKE '%Bitmap Index Scan%' THEN RAISE EXCEPTION 'entity.mask query did not use its entity_mask GIN index'; END IF;
+  EXCEPTION WHEN invalid_parameter_value THEN NULL;
+  END;
 END $$;
 RESET enable_seqscan;
 
